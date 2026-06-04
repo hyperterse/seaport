@@ -2,7 +2,7 @@
 
 ## Rust-Native Agent Evaluation Platform
 
-This document is the master specification for building Runtime.
+This document is the master specification for building Seaport.
 
 
 ---

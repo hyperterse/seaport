@@ -1,4 +1,4 @@
-# Runtime Observability Dashboard
+# Seaport Observability Dashboard
 
 ## Core Signals
 
@@ -19,6 +19,6 @@
 
 ## Alert Candidates
 
-- Any `runtime.config.invalid` event in automated runs.
-- A sudden increase in `runtime.agent.failed`.
+- Any `seaport.config.invalid` event in automated runs.
+- A sudden increase in `seaport.agent.failed`.
 - A mean run score below the release threshold chosen by the owning team.

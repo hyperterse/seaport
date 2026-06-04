@@ -13,7 +13,7 @@ shape of the core evaluation loop.
 
 ## Decision
 
-Runtime evaluates cases in sorted case-ID order, rejects duplicate IDs, emits
+Seaport evaluates cases in sorted case-ID order, rejects duplicate IDs, emits
 sequence-based telemetry, and derives run IDs from stable FNV-1a hashing over
 agent name, scorer name, and ordered case content.
 

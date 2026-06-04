@@ -1,424 +1,235 @@
-# Runtime
+# Seaport
 
-Runtime is a Rust-native agent evaluation platform. It provides a small,
-deterministic core for defining eval cases, running an agent against those cases,
-scoring the answers, and inspecting structured reports, errors, and telemetry.
+Seaport is a CLI-first framework for agent evals. The project goal is to let
+users create task directories, run agents against those tasks, and inspect job
+results from the terminal with the `seaport` command.
 
-The project is built from the requirements in [`seaport.md`](seaport.md):
-deterministic execution, structured errors, full telemetry, tests, examples,
-benchmarks, Rustdoc, ADRs, migration notes, CI, and operational documentation.
+The Rust crate is implementation detail. Users should not need to write Rust to
+create or run evals.
 
-## What Runtime Does
+## Current Status
 
-Runtime evaluates an `Agent` against a list of `TestCase` values.
+Seaport currently includes:
 
-For each run, it:
+- the `seaport` CLI entry point
+- `seaport --help`
+- `seaport run --help`
+- `seaport dataset list`
+- `seaport datasets list`
+- `seaport init --task <org/name>`
+- `seaport view --help`
+- a deterministic in-memory evaluation core
+- structured errors, telemetry, unit tests, integration tests, examples, and CI
 
-- validates agent and case metadata
-- sorts cases by stable case ID
-- sends each prompt to the agent
-- scores each answer with a `Scorer`
-- emits deterministic telemetry events
-- returns an `EvaluationReport`
-- exposes structured `RuntimeError` values when something fails
-
-The default scorer is exact match: an answer receives `1.0` only when it exactly
-equals the expected string.
-
-## Design Goals
-
-- Deterministic reports: case ordering, run IDs, scores, and telemetry ordering
-  are stable for the same inputs.
-- Explicit public API: important behavior is represented by named Rust types,
-  not hidden framework conventions.
-- Structured failure handling: errors expose both a broad `ErrorKind` and a
-  stable machine-readable error code.
-- Lightweight integration: the current crate uses only the Rust standard
-  library.
-- Testable eval logic: examples, unit tests, integration tests, and a benchmark
-  are included.
-
-## Project Layout
-
-```text
-.
-|-- src/
-|   |-- agent.rs          # Agent trait and simple built-in agents
-|   |-- error.rs          # RuntimeError and ErrorKind
-|   |-- evaluation.rs     # TestCase, Evaluator, Scorer, reports, summaries
-|   |-- lib.rs            # Public crate exports
-|   `-- telemetry.rs      # Deterministic telemetry recorder and events
-|-- tests/
-|   `-- evaluation_flow.rs
-|-- examples/
-|   `-- basic_evaluation.rs
-|-- benches/
-|   `-- evaluation.rs
-|-- docs/
-|   |-- adr/
-|   |-- migrations/
-|   |-- observability/
-|   |-- operations/
-|   `-- code-explanations.md
-|-- .github/workflows/ci.yml
-|-- Cargo.toml
-|-- CHANGELOG.md
-`-- seaport.md
-```
-
-## Requirements
-
-- Rust stable toolchain
-- Cargo
-
-Install Rust with `rustup` if it is not already available:
-
-```sh
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-rustup default stable
-```
-
-Check your local toolchain:
-
-```sh
-rustc --version
-cargo --version
-```
+The next required milestone is sandboxed task execution for `seaport run -p`.
+The command surface exists now, but full Docker task execution, verifier log
+collection, registry datasets, and the results viewer still need to be wired.
 
 ## Installation
 
-Runtime is currently a local crate in this repository.
-
-Use it from this repository by running Cargo commands at the project root:
+Install from this repository:
 
 ```sh
-cargo test
-cargo run --example basic_evaluation
+cargo install --path .
 ```
 
-Use it from another local Rust project with a path dependency:
-
-```toml
-[dependencies]
-runtime = { path = "../seaport" }
-```
-
-If this repository is published or hosted as a dependency later, replace the
-path dependency with the appropriate crates.io version or Git dependency.
-
-## Quick Start
-
-This example evaluates the built-in `EchoAgent`, which returns the prompt
-unchanged.
-
-```rust
-use runtime::{EchoAgent, Evaluator, TestCase};
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let evaluator = Evaluator::default();
-    let agent = EchoAgent::new("echo");
-    let cases = vec![
-        TestCase::new("copy.short", "hello", "hello"),
-        TestCase::new("copy.question", "what is runtime?", "what is runtime?"),
-    ];
-
-    let report = evaluator.evaluate(&agent, &cases)?;
-
-    println!("run_id: {}", report.run_id);
-    println!("score: {:.3}", report.summary.score);
-    println!("passed: {}", report.summary.passed_cases);
-    println!("failed: {}", report.summary.failed_cases);
-
-    Ok(())
-}
-```
-
-Run the included version:
+Confirm the CLI is available:
 
 ```sh
-cargo run --example basic_evaluation
+seaport --help
 ```
 
-Example output:
+For local development without installing:
+
+```sh
+cargo run -- --help
+```
+
+## CLI Overview
 
 ```text
-run_id: 2b504c9d2149464b
-score: 1.000
-passed: 2
-failed: 0
+seaport <command> [options]
 ```
 
-## Core Concepts
+Commands:
 
-`Agent` is the system being evaluated. It has a stable name and returns one
-answer per prompt.
+- `seaport run`: run a local or registered eval dataset
+- `seaport dataset list`: list registered datasets
+- `seaport datasets list`: alias for `dataset list`
+- `seaport init --task <org/name>`: create a task skeleton
+- `seaport view [jobs-dir]`: view job results
 
-`TestCase` is one eval case. It contains a stable ID, prompt, expected answer,
-and optional tags.
+## Create an Eval Task
 
-`Scorer` compares an expected answer with an actual answer and returns a score
-from `0.0` through `1.0`.
+Create a task skeleton:
 
-`Evaluator` runs the agent against the test cases using a scorer and
-configuration.
-
-`EvaluationReport` contains the deterministic run ID, case results, aggregate
-summary, and telemetry events for a successful run.
-
-`RuntimeError` represents validation, agent, scoring, and configuration
-failures with stable error codes.
-
-## Creating Evals
-
-An eval is a vector of `TestCase` values.
-
-```rust
-use runtime::TestCase;
-
-let cases = vec![
-    TestCase::new("math.addition", "What is 2 + 2?", "4")
-        .with_tags(["math", "smoke"]),
-    TestCase::new("copy.greeting", "hello", "hello")
-        .with_tags(["copy"]),
-];
+```sh
+seaport init --task acme/hello-world
 ```
 
-Case IDs matter. Runtime sorts cases by ID before evaluating them, rejects empty
-IDs, and rejects duplicate IDs. Stable IDs make reports and run IDs stable.
+This creates:
 
-Good case IDs:
+```text
+hello-world/
+|-- instruction.md
+|-- task.toml
+|-- environment/
+|   `-- Dockerfile
+|-- solution/
+|   `-- solve.sh
+`-- tests/
+    `-- test.sh
+```
 
-- `math.addition.basic`
-- `support.refund.policy`
-- `tool.weather.current`
+`instruction.md` contains the instruction the agent should complete.
 
-Avoid IDs that depend on timestamps, random numbers, or local file ordering.
+`task.toml` contains task metadata, timeouts, agent settings, verifier settings,
+and environment settings.
 
-## Implementing an Agent
+`environment/Dockerfile` defines the container image used for the task.
 
-Implement `Agent` for the system you want to evaluate.
+`solution/solve.sh` is an optional oracle solution.
 
-```rust
-use runtime::{Agent, RuntimeError};
+`tests/test.sh` verifies whether the agent completed the task. The verifier
+should write a reward file under `/logs/verifier/`.
 
-struct MyAgent;
+## Task Configuration
 
-impl Agent for MyAgent {
-    fn name(&self) -> &str {
-        "my-agent"
-    }
+The generated `task.toml` starts with this shape:
 
-    fn respond(&self, prompt: &str) -> Result<String, RuntimeError> {
-        Ok(format!("answer for: {prompt}"))
-    }
+```toml
+schema_version = "1.0"
+
+[task]
+name = "acme/hello-world"
+description = "Describe this task."
+
+[agent]
+timeout_sec = 120.0
+user = "agent"
+
+[verifier]
+timeout_sec = 120.0
+
+[environment]
+docker_image = "ubuntu:24.04"
+network_mode = "no-network"
+```
+
+Future task execution work should extend this format with resource settings,
+environment variables, network policy, separate verifier environments, artifacts,
+and multi-step tasks.
+
+## Write a Verifier
+
+The verifier is a shell script in `tests/test.sh`.
+
+For pass/fail tasks, write `1` or `0` to `/logs/verifier/reward.txt`:
+
+```sh
+#!/bin/bash
+set -euo pipefail
+
+mkdir -p /logs/verifier
+
+if test -f /app/output.txt; then
+  echo 1 > /logs/verifier/reward.txt
+else
+  echo 0 > /logs/verifier/reward.txt
+fi
+```
+
+For richer metrics, the planned format is `/logs/verifier/reward.json`:
+
+```json
+{
+  "accuracy": 1.0,
+  "style": 0.75
 }
 ```
 
-If your agent fails, return a structured `RuntimeError`:
+## Run an Eval
 
-```rust
-use runtime::{Agent, RuntimeError};
+The intended local-task command is:
 
-struct FailingAgent;
-
-impl Agent for FailingAgent {
-    fn name(&self) -> &str {
-        "failing-agent"
-    }
-
-    fn respond(&self, _prompt: &str) -> Result<String, RuntimeError> {
-        Err(RuntimeError::AgentFailed {
-            agent: self.name().to_owned(),
-            case_id: None,
-            message: "upstream model call failed".to_owned(),
-        })
-    }
-}
+```sh
+seaport run -p hello-world -a codex -m openai/gpt-5
 ```
 
-Runtime adds the concrete case ID when an agent error occurs during evaluation.
+The intended registered-dataset command is:
 
-## Running Evals
-
-Use the default evaluator for exact-match scoring:
-
-```rust
-use runtime::{Evaluator, StaticAgent, TestCase};
-
-let evaluator = Evaluator::default();
-let agent = StaticAgent::new("static", "yes");
-let cases = vec![
-    TestCase::new("approval.simple", "Should this pass?", "yes"),
-    TestCase::new("approval.other", "Should this also pass?", "yes"),
-];
-
-let report = evaluator.evaluate(&agent, &cases).expect("report");
-
-assert_eq!(report.summary.total_cases, 2);
-assert_eq!(report.summary.passed_cases, 2);
-assert_eq!(report.summary.failed_cases, 0);
-assert_eq!(report.summary.score, 1.0);
+```sh
+seaport run -d acme/hello-world@1.0 -a codex -m openai/gpt-5
 ```
 
-Inspect failed cases:
+The CLI currently parses these flags and fails with a clear not-implemented
+message. The next implementation stage should make `seaport run -p <task>` build
+or pull the task environment, run the agent phase, run the verifier phase, and
+write a job directory.
 
-```rust
-for failure in report.failed_cases() {
-    eprintln!(
-        "{} expected {:?}, got {:?}",
-        failure.case_id,
-        failure.expected,
-        failure.actual
-    );
-}
+## Expected Job Output
+
+Seaport should write runs under `jobs/<job-name>/`:
+
+```text
+jobs/job-name/
+|-- config.json
+|-- result.json
+|-- trial-name/
+|   |-- config.json
+|   |-- result.json
+|   |-- agent/
+|   |   |-- trajectory.json
+|   |   `-- recording.cast
+|   `-- verifier/
+|       |-- reward.txt
+|       |-- reward.json
+|       |-- test-stdout.txt
+|       `-- test-stderr.txt
+`-- ...
 ```
 
-## Configuring a Run
+This layout is the compatibility target for `seaport view`.
 
-`RunConfig` controls evaluator behavior.
+## View Results
 
-```rust
-use runtime::{Evaluator, ExactMatchScorer, RunConfig};
+The intended command is:
 
-let evaluator = Evaluator::new(
-    RunConfig {
-        stop_on_failure: true,
-        max_output_chars: Some(4_000),
-    },
-    ExactMatchScorer,
-)
-.expect("evaluator");
+```sh
+seaport view jobs
 ```
 
-Available options:
+The viewer should eventually start a local web server for browsing jobs, trials,
+rewards, trajectories, verifier output, and artifacts. The command currently has
+help text and an explicit not-implemented response.
 
-- `stop_on_failure`: stops after the first case that scores below `1.0`
-- `max_output_chars`: rejects agent answers longer than the configured number
-  of Unicode scalar values
+## Dataset Registry
 
-`max_output_chars: Some(0)` is rejected as invalid configuration.
+List configured datasets:
 
-## Custom Scorers
-
-Implement `Scorer` when exact match is too strict.
-
-```rust
-use runtime::Scorer;
-
-struct ContainsScorer;
-
-impl Scorer for ContainsScorer {
-    fn name(&self) -> &str {
-        "contains"
-    }
-
-    fn score(&self, expected: &str, actual: &str) -> f64 {
-        if actual.contains(expected) {
-            1.0
-        } else {
-            0.0
-        }
-    }
-}
+```sh
+seaport dataset list
 ```
 
-Use it with `Evaluator::new`:
+The current implementation reports that no registry is configured. The next
+registry stage should add local registry files, remote registry resolution,
+dataset artifact downloads, and cache management.
 
-```rust
-use runtime::{Evaluator, RunConfig};
+## Internal Library
 
-let evaluator = Evaluator::new(RunConfig::default(), ContainsScorer)
-    .expect("evaluator");
-```
+The repository also contains a Rust library used by the CLI implementation. It
+currently provides:
 
-Scorers must return values in the inclusive `0.0..=1.0` range. Runtime rejects
-NaN, negative scores, and scores above `1.0`.
+- `Agent`
+- `TestCase`
+- `Evaluator`
+- `Scorer`
+- `EvaluationReport`
+- `SeaportError`
+- deterministic telemetry events
 
-## Telemetry
-
-Successful reports include telemetry events:
-
-```rust
-let report = evaluator.evaluate(&agent, &cases).expect("report");
-
-for event in &report.telemetry {
-    println!("{} {:?}", event.name, event.attributes);
-}
-```
-
-Telemetry is deterministic:
-
-- events use monotonic sequence numbers instead of timestamps
-- attributes are sorted by key and value
-- event names are stable strings
-
-Current evaluator event names:
-
-- `run.started`
-- `case.started`
-- `case.completed`
-- `case.failed`
-- `run.stopped`
-- `run.completed`
-
-Use `evaluate_with_telemetry` when you need telemetry even if evaluation returns
-an error:
-
-```rust
-use runtime::TelemetryRecorder;
-
-let mut telemetry = TelemetryRecorder::new();
-let result = evaluator.evaluate_with_telemetry(&agent, &cases, &mut telemetry);
-
-if let Err(error) = result {
-    eprintln!("{}: {}", error.code(), error);
-    eprintln!("events captured: {}", telemetry.events().len());
-}
-```
-
-## Error Handling
-
-Runtime errors expose both a broad kind and a stable code.
-
-```rust
-match evaluator.evaluate(&agent, &cases) {
-    Ok(report) => println!("score: {:.3}", report.summary.score),
-    Err(error) => {
-        eprintln!("kind: {:?}", error.kind());
-        eprintln!("code: {}", error.code());
-        eprintln!("message: {}", error);
-    }
-}
-```
-
-Current error codes:
-
-- `runtime.validation.empty_case_id`
-- `runtime.validation.duplicate_case_id`
-- `runtime.validation.empty_agent_name`
-- `runtime.agent.failed`
-- `runtime.agent.output_too_long`
-- `runtime.scoring.invalid_score`
-- `runtime.config.invalid`
-
-## Determinism Rules
-
-Runtime is designed so equivalent inputs produce equivalent reports.
-
-- Cases are evaluated in sorted case-ID order.
-- Duplicate and empty case IDs are rejected.
-- Run IDs are derived from the agent name, scorer name, and ordered case
-  content.
-- Telemetry uses sequence numbers, not wall-clock timestamps.
-- Standard-library randomized hashing is not used for run IDs.
-
-To preserve determinism in your own evals:
-
-- keep agent names stable
-- keep scorer names stable
-- keep case IDs stable
-- avoid agent behavior that depends on random state unless that state is seeded
-- avoid expected answers that include timestamps or environment-specific values
+This API is useful for internal tests and future engine code, but it is not the
+primary user interface.
 
 ## Development
 
@@ -429,32 +240,24 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 cargo test --doc
+cargo run -- --help
 cargo run --example basic_evaluation
 cargo bench --bench evaluation
 ```
 
-Run only the tests:
+Run only tests:
 
 ```sh
 cargo test
 ```
 
-Run integration tests:
+Run the CLI locally:
 
 ```sh
-cargo test --test evaluation_flow
+cargo run -- --help
+cargo run -- init --task acme/example
+cargo run -- run -p example -a codex -m openai/gpt-5
 ```
-
-Run the benchmark harness:
-
-```sh
-cargo bench --bench evaluation
-```
-
-## CI
-
-The GitHub Actions workflow in [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
-runs formatting, clippy, tests, doc tests, the example, and the benchmark.
 
 ## Documentation
 
@@ -462,14 +265,7 @@ Additional project documentation:
 
 - [Code explanations](docs/code-explanations.md)
 - [ADR 0001: Deterministic Evaluation Core](docs/adr/0001-deterministic-evaluation.md)
-- [Initial migration guide](docs/migrations/0001-initial-runtime.md)
-- [Runtime observability dashboard](docs/observability/runtime-dashboard.md)
-- [Runtime ownership](docs/operations/ownership.md)
+- [Initial migration guide](docs/migrations/0001-initial-seaport.md)
+- [Seaport observability dashboard](docs/observability/seaport-dashboard.md)
+- [Seaport ownership](docs/operations/ownership.md)
 - [Changelog](CHANGELOG.md)
-
-## Current Scope
-
-Runtime `0.1.0` is intentionally focused on the in-memory evaluation core. It
-does not yet provide persistence, external model clients, dataset loading,
-distributed execution, or dashboard rendering. Those pieces can be added around
-the current deterministic core without changing the basic eval flow.

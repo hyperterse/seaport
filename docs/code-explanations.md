@@ -2,7 +2,7 @@
 
 This document explains the lines that carry behavior or design intent. Straight
 Rust struct literals, field assignments, imports, and obvious test assertions are
-left to the code unless they hide a Runtime-specific decision.
+left to the code unless they hide a Seaport-specific decision.
 
 ## `src/lib.rs`
 
@@ -10,13 +10,26 @@ left to the code unless they hide a Runtime-specific decision.
   implementation split by responsibility while preserving one public crate API.
 - The `pub use ...` lines re-export the intended public surface so callers do
   not need to know the internal file layout.
-- `RUNTIME_NAME` gives diagnostics and examples one stable crate identifier.
+- `SEAPORT_NAME` gives diagnostics and examples one stable crate identifier.
+
+## `src/main.rs`
+
+- `main` delegates to `run` and exits with command-specific status codes so the
+  CLI can be tested without terminating the test process.
+- `run` dispatches the top-level `seaport` commands.
+- `run_eval` parses the expected local and registered dataset flags, then
+  returns a clear not-implemented error until sandbox execution is wired.
+- `dataset` supports both `dataset list` and the `datasets list` alias.
+- `init` creates the first task skeleton format users can edit without writing
+  Rust.
+- `CliError` carries an exit code alongside the message so usage errors and
+  unimplemented commands are distinguishable.
 
 ## `src/agent.rs`
 
 - `Agent::name` is required because reports, run IDs, and telemetry need a
   stable agent identity.
-- `Agent::respond` returns `Result<String, RuntimeError>` so agent failures stay
+- `Agent::respond` returns `Result<String, SeaportError>` so agent failures stay
   structured instead of becoming plain strings.
 - `EchoAgent` and `StaticAgent` are intentionally simple test agents. They make
   examples and tests deterministic without adding mock frameworks.
@@ -24,11 +37,11 @@ left to the code unless they hide a Runtime-specific decision.
 ## `src/error.rs`
 
 - `ErrorKind` separates routing-level categories from exact error codes.
-- `RuntimeError` variants carry the data needed to debug each failure without
+- `SeaportError` variants carry the data needed to debug each failure without
   parsing formatted text.
-- `RuntimeError::kind` maps variants to stable categories for metrics and alert
+- `SeaportError::kind` maps variants to stable categories for metrics and alert
   grouping.
-- `RuntimeError::code` returns stable machine-readable codes for telemetry,
+- `SeaportError::code` returns stable machine-readable codes for telemetry,
   logs, and external integrations.
 - `Display` is implemented for humans; callers should use `code` and `kind` for
   programmatic decisions.

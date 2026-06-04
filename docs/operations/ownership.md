@@ -1,8 +1,8 @@
-# Runtime Ownership
+# Seaport Ownership
 
 ## Owner
 
-Runtime is owned by the engineering team responsible for agent evaluation
+Seaport is owned by the engineering team responsible for agent evaluation
 quality gates.
 
 ## Responsibilities
@@ -17,7 +17,9 @@ quality gates.
 ## Release Checklist
 
 - `cargo fmt --all -- --check`
+- `cargo clippy --all-targets -- -D warnings`
 - `cargo test --all-targets`
 - `cargo test --doc`
+- `cargo run -- --help`
 - `cargo run --example basic_evaluation`
 - `cargo bench --bench evaluation`

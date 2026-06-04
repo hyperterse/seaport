@@ -1,4 +1,4 @@
-//! Runtime is a Rust-native agent evaluation platform.
+//! Seaport is a Rust-native agent evaluation platform.
 //!
 //! The public API is intentionally explicit: callers provide an [`Agent`],
 //! a list of [`TestCase`] values, and an [`Evaluator`] returns an
@@ -10,7 +10,7 @@ mod evaluation;
 mod telemetry;
 
 pub use agent::{Agent, EchoAgent, StaticAgent};
-pub use error::{ErrorKind, RuntimeError};
+pub use error::{ErrorKind, SeaportError};
 pub use evaluation::{
     CaseResult, EvaluationReport, EvaluationSummary, Evaluator, ExactMatchScorer, RunConfig,
     Scorer, TestCase,
@@ -18,4 +18,4 @@ pub use evaluation::{
 pub use telemetry::{telemetry_attributes, TelemetryEvent, TelemetryLevel, TelemetryRecorder};
 
 /// Stable crate name used by examples, diagnostics, and documentation.
-pub const RUNTIME_NAME: &str = "runtime";
+pub const SEAPORT_NAME: &str = "seaport";

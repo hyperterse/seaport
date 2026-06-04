@@ -19,5 +19,6 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all-targets
       - run: cargo test --doc
+      - run: cargo run -- --help
       - run: cargo run --example basic_evaluation
       - run: cargo bench --bench evaluation

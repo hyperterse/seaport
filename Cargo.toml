@@ -1,13 +1,17 @@
 [package]
-name = "runtime"
+name = "seaport"
 version = "0.1.0"
 edition = "2021"
-description = "Rust-native agent evaluation platform with deterministic execution."
+description = "CLI-first agent evaluation framework."
 license = "MIT"
 
 [lib]
-name = "runtime"
+name = "seaport"
 path = "src/lib.rs"
+
+[[bin]]
+name = "seaport"
+path = "src/main.rs"
 
 [[bench]]
 name = "evaluation"

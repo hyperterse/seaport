@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-/// High-level category for a runtime error.
+/// High-level category for a seaport error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     /// Input data or public API usage failed validation.
@@ -10,13 +10,13 @@ pub enum ErrorKind {
     Agent,
     /// Scoring produced an invalid value.
     Scoring,
-    /// Runtime configuration is not usable.
+    /// Seaport configuration is not usable.
     Configuration,
 }
 
-/// Structured error type used throughout Runtime.
+/// Structured error type used throughout Seaport.
 #[derive(Debug, Clone, PartialEq)]
-pub enum RuntimeError {
+pub enum SeaportError {
     /// A test case ID was empty after trimming whitespace.
     EmptyCaseId,
     /// Two test cases used the same ID.
@@ -45,7 +45,7 @@ pub enum RuntimeError {
     InvalidConfig { message: String },
 }
 
-impl RuntimeError {
+impl SeaportError {
     /// Returns a stable category for routing and metrics.
     pub fn kind(&self) -> ErrorKind {
         match self {
@@ -61,18 +61,18 @@ impl RuntimeError {
     /// Returns a stable machine-readable error code.
     pub fn code(&self) -> &'static str {
         match self {
-            Self::EmptyCaseId => "runtime.validation.empty_case_id",
-            Self::DuplicateCaseId { .. } => "runtime.validation.duplicate_case_id",
-            Self::EmptyAgentName => "runtime.validation.empty_agent_name",
-            Self::AgentFailed { .. } => "runtime.agent.failed",
-            Self::InvalidScore { .. } => "runtime.scoring.invalid_score",
-            Self::OutputTooLong { .. } => "runtime.agent.output_too_long",
-            Self::InvalidConfig { .. } => "runtime.config.invalid",
+            Self::EmptyCaseId => "seaport.validation.empty_case_id",
+            Self::DuplicateCaseId { .. } => "seaport.validation.duplicate_case_id",
+            Self::EmptyAgentName => "seaport.validation.empty_agent_name",
+            Self::AgentFailed { .. } => "seaport.agent.failed",
+            Self::InvalidScore { .. } => "seaport.scoring.invalid_score",
+            Self::OutputTooLong { .. } => "seaport.agent.output_too_long",
+            Self::InvalidConfig { .. } => "seaport.config.invalid",
         }
     }
 }
 
-impl fmt::Display for RuntimeError {
+impl fmt::Display for SeaportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyCaseId => write!(formatter, "test case ID cannot be empty"),
@@ -112,4 +112,4 @@ impl fmt::Display for RuntimeError {
     }
 }
 
-impl Error for RuntimeError {}
+impl Error for SeaportError {}

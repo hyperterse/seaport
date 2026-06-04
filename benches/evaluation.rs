@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use runtime::{Evaluator, StaticAgent, TestCase};
+use seaport::{Evaluator, StaticAgent, TestCase};
 
 fn main() {
     let evaluator = Evaluator::default();

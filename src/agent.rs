@@ -1,4 +1,4 @@
-use crate::RuntimeError;
+use crate::SeaportError;
 
 /// A system that can answer evaluation prompts.
 pub trait Agent {
@@ -6,7 +6,7 @@ pub trait Agent {
     fn name(&self) -> &str;
 
     /// Produces an answer for one prompt.
-    fn respond(&self, prompt: &str) -> Result<String, RuntimeError>;
+    fn respond(&self, prompt: &str) -> Result<String, SeaportError>;
 }
 
 /// Agent implementation that returns the prompt unchanged.
@@ -27,7 +27,7 @@ impl Agent for EchoAgent {
         &self.name
     }
 
-    fn respond(&self, prompt: &str) -> Result<String, RuntimeError> {
+    fn respond(&self, prompt: &str) -> Result<String, SeaportError> {
         Ok(prompt.to_owned())
     }
 }
@@ -54,7 +54,7 @@ impl Agent for StaticAgent {
         &self.name
     }
 
-    fn respond(&self, _prompt: &str) -> Result<String, RuntimeError> {
+    fn respond(&self, _prompt: &str) -> Result<String, SeaportError> {
         Ok(self.response.clone())
     }
 }

@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::{telemetry_attributes, Agent, RuntimeError, TelemetryEvent, TelemetryRecorder};
+use crate::{telemetry_attributes, Agent, SeaportError, TelemetryEvent, TelemetryRecorder};
 
 /// A single prompt and expected answer used to evaluate an agent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,7 +37,7 @@ impl TestCase {
     }
 }
 
-/// Runtime options that affect evaluation behavior.
+/// Seaport options that affect evaluation behavior.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunConfig {
     /// Stops evaluation after the first failed case when enabled.
@@ -47,9 +47,9 @@ pub struct RunConfig {
 }
 
 impl RunConfig {
-    fn validate(&self) -> Result<(), RuntimeError> {
+    fn validate(&self) -> Result<(), SeaportError> {
         if self.max_output_chars == Some(0) {
-            return Err(RuntimeError::InvalidConfig {
+            return Err(SeaportError::InvalidConfig {
                 message: "max_output_chars must be greater than zero".to_owned(),
             });
         }
@@ -175,7 +175,7 @@ impl Default for Evaluator<ExactMatchScorer> {
 
 impl<S: Scorer> Evaluator<S> {
     /// Creates an evaluator after validating its configuration.
-    pub fn new(config: RunConfig, scorer: S) -> Result<Self, RuntimeError> {
+    pub fn new(config: RunConfig, scorer: S) -> Result<Self, SeaportError> {
         config.validate()?;
 
         Ok(Self { config, scorer })
@@ -186,7 +186,7 @@ impl<S: Scorer> Evaluator<S> {
         &self,
         agent: &A,
         cases: &[TestCase],
-    ) -> Result<EvaluationReport, RuntimeError> {
+    ) -> Result<EvaluationReport, SeaportError> {
         let mut telemetry = TelemetryRecorder::new();
 
         self.evaluate_with_telemetry(agent, cases, &mut telemetry)
@@ -198,7 +198,7 @@ impl<S: Scorer> Evaluator<S> {
         agent: &A,
         cases: &[TestCase],
         telemetry: &mut TelemetryRecorder,
-    ) -> Result<EvaluationReport, RuntimeError> {
+    ) -> Result<EvaluationReport, SeaportError> {
         let agent_name = validate_agent_name(agent.name())?;
         let ordered_cases = validate_cases(cases)?;
         let run_id = deterministic_run_id(agent_name, self.scorer.name(), &ordered_cases);
@@ -233,7 +233,7 @@ impl<S: Scorer> Evaluator<S> {
                         ]),
                     );
 
-                    return Err(RuntimeError::AgentFailed {
+                    return Err(SeaportError::AgentFailed {
                         agent: agent_name.to_owned(),
                         case_id: Some(case.id.clone()),
                         message: error.to_string(),
@@ -308,26 +308,26 @@ impl<S: Scorer> Evaluator<S> {
     }
 }
 
-fn validate_agent_name(name: &str) -> Result<&str, RuntimeError> {
+fn validate_agent_name(name: &str) -> Result<&str, SeaportError> {
     let trimmed = name.trim();
 
     if trimmed.is_empty() {
-        Err(RuntimeError::EmptyAgentName)
+        Err(SeaportError::EmptyAgentName)
     } else {
         Ok(trimmed)
     }
 }
 
-fn validate_cases(cases: &[TestCase]) -> Result<Vec<&TestCase>, RuntimeError> {
+fn validate_cases(cases: &[TestCase]) -> Result<Vec<&TestCase>, SeaportError> {
     let mut seen = BTreeSet::new();
 
     for case in cases {
         if case.id.trim().is_empty() {
-            return Err(RuntimeError::EmptyCaseId);
+            return Err(SeaportError::EmptyCaseId);
         }
 
         if !seen.insert(case.id.as_str()) {
-            return Err(RuntimeError::DuplicateCaseId {
+            return Err(SeaportError::DuplicateCaseId {
                 case_id: case.id.clone(),
             });
         }
@@ -343,12 +343,12 @@ fn validate_output_limit(
     config: &RunConfig,
     case: &TestCase,
     actual: &str,
-) -> Result<(), RuntimeError> {
+) -> Result<(), SeaportError> {
     if let Some(limit) = config.max_output_chars {
         let actual_chars = actual.chars().count();
 
         if actual_chars > limit {
-            return Err(RuntimeError::OutputTooLong {
+            return Err(SeaportError::OutputTooLong {
                 case_id: case.id.clone(),
                 limit,
                 actual: actual_chars,
@@ -359,9 +359,9 @@ fn validate_output_limit(
     Ok(())
 }
 
-fn validate_score(scorer: &str, case: &TestCase, score: f64) -> Result<(), RuntimeError> {
+fn validate_score(scorer: &str, case: &TestCase, score: f64) -> Result<(), SeaportError> {
     if score.is_nan() || !(0.0..=1.0).contains(&score) {
-        return Err(RuntimeError::InvalidScore {
+        return Err(SeaportError::InvalidScore {
             scorer: scorer.to_owned(),
             case_id: case.id.clone(),
             score,
@@ -375,7 +375,7 @@ fn record_case_error(
     telemetry: &mut TelemetryRecorder,
     run_id: &str,
     case: &TestCase,
-    error: &RuntimeError,
+    error: &SeaportError,
 ) {
     telemetry.error(
         "case.failed",
@@ -391,7 +391,7 @@ fn record_case_error(
 fn deterministic_run_id(agent: &str, scorer: &str, cases: &[&TestCase]) -> String {
     let mut hash = StableHash::new();
 
-    hash.write_str("runtime.v1");
+    hash.write_str("seaport.v1");
     hash.write_str(agent);
     hash.write_str(scorer);
 
@@ -511,7 +511,7 @@ mod tests {
         let error = evaluator.evaluate(&agent, &cases).expect_err("error");
 
         assert_eq!(error.kind(), ErrorKind::Validation);
-        assert_eq!(error.code(), "runtime.validation.duplicate_case_id");
+        assert_eq!(error.code(), "seaport.validation.duplicate_case_id");
     }
 
     #[test]
@@ -549,7 +549,7 @@ mod tests {
         let error = evaluator.evaluate(&agent, &cases).expect_err("error");
 
         assert_eq!(error.kind(), ErrorKind::Scoring);
-        assert_eq!(error.code(), "runtime.scoring.invalid_score");
+        assert_eq!(error.code(), "seaport.scoring.invalid_score");
     }
 
     #[test]
@@ -570,7 +570,7 @@ mod tests {
             .evaluate_with_telemetry(&agent, &cases, &mut telemetry)
             .expect_err("error");
 
-        assert_eq!(error.code(), "runtime.agent.output_too_long");
+        assert_eq!(error.code(), "seaport.agent.output_too_long");
         assert!(telemetry
             .events()
             .iter()

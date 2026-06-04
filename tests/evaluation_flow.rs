@@ -1,5 +1,5 @@
-use runtime::{
-    Agent, EchoAgent, ErrorKind, EvaluationReport, Evaluator, RuntimeError, StaticAgent,
+use seaport::{
+    Agent, EchoAgent, ErrorKind, EvaluationReport, Evaluator, SeaportError, StaticAgent,
     TelemetryLevel, TelemetryRecorder, TestCase,
 };
 
@@ -10,8 +10,8 @@ impl Agent for FailingAgent {
         "failing"
     }
 
-    fn respond(&self, _prompt: &str) -> Result<String, RuntimeError> {
-        Err(RuntimeError::AgentFailed {
+    fn respond(&self, _prompt: &str) -> Result<String, SeaportError> {
+        Err(SeaportError::AgentFailed {
             agent: "failing".to_owned(),
             case_id: None,
             message: "intentional test failure".to_owned(),
@@ -66,7 +66,7 @@ fn agent_failure_returns_structured_error_and_records_telemetry() {
         .expect_err("error");
 
     assert_eq!(error.kind(), ErrorKind::Agent);
-    assert_eq!(error.code(), "runtime.agent.failed");
+    assert_eq!(error.code(), "seaport.agent.failed");
     assert!(telemetry
         .events()
         .iter()
