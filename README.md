@@ -150,10 +150,24 @@ For richer metrics, the planned format is `/logs/verifier/reward.json`:
 
 ## Run an Eval
 
+The example task in this repository is:
+
+```text
+examples/tasks/basic-evaluation/
+|-- instruction.md
+|-- task.toml
+|-- environment/
+|   `-- Dockerfile
+|-- solution/
+|   `-- solve.sh
+`-- tests/
+    `-- test.sh
+```
+
 The intended local-task command is:
 
 ```sh
-seaport run -p hello-world -a codex -m openai/gpt-5
+seaport run -p examples/tasks/basic-evaluation -a codex -m openai/gpt-5
 ```
 
 The intended registered-dataset command is:
@@ -241,7 +255,6 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 cargo test --doc
 cargo run -- --help
-cargo run --example basic_evaluation
 cargo bench --bench evaluation
 ```
 

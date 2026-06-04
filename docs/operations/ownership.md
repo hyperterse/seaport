@@ -21,5 +21,7 @@ quality gates.
 - `cargo test --all-targets`
 - `cargo test --doc`
 - `cargo run -- --help`
-- `cargo run --example basic_evaluation`
+- `test -f examples/tasks/basic-evaluation/task.toml`
+- `test -x examples/tasks/basic-evaluation/solution/solve.sh`
+- `test -x examples/tasks/basic-evaluation/tests/test.sh`
 - `cargo bench --bench evaluation`

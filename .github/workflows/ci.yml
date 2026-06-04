@@ -20,5 +20,7 @@ jobs:
       - run: cargo test --all-targets
       - run: cargo test --doc
       - run: cargo run -- --help
-      - run: cargo run --example basic_evaluation
+      - run: test -f examples/tasks/basic-evaluation/task.toml
+      - run: test -x examples/tasks/basic-evaluation/solution/solve.sh
+      - run: test -x examples/tasks/basic-evaluation/tests/test.sh
       - run: cargo bench --bench evaluation
