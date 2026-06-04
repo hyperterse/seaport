@@ -38,21 +38,12 @@ impl TestCase {
 }
 
 /// Runtime options that affect evaluation behavior.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunConfig {
     /// Stops evaluation after the first failed case when enabled.
     pub stop_on_failure: bool,
     /// Optional maximum number of Unicode scalar values allowed in an answer.
     pub max_output_chars: Option<usize>,
-}
-
-impl Default for RunConfig {
-    fn default() -> Self {
-        Self {
-            stop_on_failure: false,
-            max_output_chars: None,
-        }
-    }
 }
 
 impl RunConfig {
@@ -227,10 +218,7 @@ impl<S: Scorer> Evaluator<S> {
         for case in ordered_cases {
             telemetry.info(
                 "case.started",
-                telemetry_attributes([
-                    ("case_id", case.id.clone()),
-                    ("run_id", run_id.clone()),
-                ]),
+                telemetry_attributes([("case_id", case.id.clone()), ("run_id", run_id.clone())]),
             );
 
             let actual = match agent.respond(&case.prompt) {
@@ -546,7 +534,10 @@ mod tests {
 
         assert_eq!(report.summary.total_cases, 1);
         assert_eq!(report.summary.failed_cases, 1);
-        assert!(report.telemetry.iter().any(|event| event.name == "run.stopped"));
+        assert!(report
+            .telemetry
+            .iter()
+            .any(|event| event.name == "run.stopped"));
     }
 
     #[test]
@@ -580,8 +571,9 @@ mod tests {
             .expect_err("error");
 
         assert_eq!(error.code(), "runtime.agent.output_too_long");
-        assert!(telemetry.events().iter().any(|event| {
-            event.level == TelemetryLevel::Error && event.name == "case.failed"
-        }));
+        assert!(telemetry
+            .events()
+            .iter()
+            .any(|event| event.level == TelemetryLevel::Error && event.name == "case.failed"));
     }
 }

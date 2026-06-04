@@ -117,10 +117,8 @@ mod tests {
 
     #[test]
     fn telemetry_attributes_are_sorted() {
-        let attributes = telemetry_attributes([
-            ("zeta", "last".to_owned()),
-            ("alpha", "first".to_owned()),
-        ]);
+        let attributes =
+            telemetry_attributes([("zeta", "last".to_owned()), ("alpha", "first".to_owned())]);
 
         assert_eq!(
             attributes,
