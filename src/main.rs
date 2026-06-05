@@ -15,6 +15,7 @@ mod target;
 
 use registry::{
     resolve_git_task_source, resolve_local_registry_dataset, resolve_local_registry_task,
+    resolve_remote_registry_dataset, resolve_remote_registry_task,
 };
 use sandbox::{
     prepare_container_writable_dir, run_task_scripts, AgentStep, ExternalAgent, PhaseEnvs,
@@ -93,12 +94,10 @@ fn resolve_run_target(options: &RunOptions) -> Result<RunTarget, CliError> {
     }
 
     if let Some(task) = options.task.as_deref() {
-        let registry_path = options.registry_path.as_deref().ok_or_else(|| {
-            CliError::unimplemented(
-                "registered package tasks are not implemented yet; pass `--registry-path <registry.json>` for local Harbor registry tasks",
-            )
-        })?;
-        let resolved = resolve_local_registry_task(task, Path::new(registry_path))?;
+        let resolved = match options.registry_path.as_deref() {
+            Some(registry_path) => resolve_local_registry_task(task, Path::new(registry_path))?,
+            None => resolve_remote_registry_task(task, options.registry_url.as_deref())?,
+        };
 
         return RunTarget::from_registry_dataset(resolved, &options.selection);
     }
@@ -107,12 +106,10 @@ fn resolve_run_target(options: &RunOptions) -> Result<RunTarget, CliError> {
         .dataset
         .as_deref()
         .ok_or_else(|| CliError::usage("run requires either `-p <path>` or `-d <dataset>`"))?;
-    let registry_path = options.registry_path.as_deref().ok_or_else(|| {
-        CliError::unimplemented(
-            "registered package datasets are not implemented yet; pass `--registry-path <registry.json>` for local Harbor registry datasets",
-        )
-    })?;
-    let resolved = resolve_local_registry_dataset(dataset, Path::new(registry_path))?;
+    let resolved = match options.registry_path.as_deref() {
+        Some(registry_path) => resolve_local_registry_dataset(dataset, Path::new(registry_path))?,
+        None => resolve_remote_registry_dataset(dataset, options.registry_url.as_deref())?,
+    };
 
     RunTarget::from_registry_dataset(resolved, &options.selection)
 }
@@ -813,7 +810,9 @@ Options:
       --task-git-commit <commit>
                           Git commit for --task-git-url
       --registry-path <path>
-                          Harbor registry JSON for -d datasets and -t tasks
+                          Local registry JSON for -d datasets and -t tasks
+      --registry-url <url>
+                          Remote registry URL; defaults to the package registry
   -a, --agent <agent>     Agent adapter name; defaults to oracle
       --agent-command <shell>
                           Shell command for custom or not-yet-native agents
@@ -877,6 +876,7 @@ struct RunOptions {
     task_git_url: Option<String>,
     task_git_commit: Option<String>,
     registry_path: Option<String>,
+    registry_url: Option<String>,
     agent: Option<String>,
     agent_command: Option<String>,
     agent_env: Vec<(String, String)>,
@@ -898,6 +898,7 @@ impl Default for RunOptions {
             task_git_url: None,
             task_git_commit: None,
             registry_path: None,
+            registry_url: None,
             agent: None,
             agent_command: None,
             agent_env: Vec::new(),
@@ -943,6 +944,10 @@ impl RunOptions {
                 }
                 "--registry-path" => {
                     options.registry_path = Some(required_value(args, index, flag)?);
+                    index += 2;
+                }
+                "--registry-url" => {
+                    options.registry_url = Some(required_value(args, index, flag)?);
                     index += 2;
                 }
                 "-a" | "--agent" => {
@@ -1174,6 +1179,8 @@ mod tests {
             "bench/example@1.0",
             "--registry-path",
             "registry.json",
+            "--registry-url",
+            "https://example.test/registry.json",
             "-a",
             "claude-code",
             "-m",
@@ -1198,6 +1205,10 @@ mod tests {
 
         assert_eq!(options.dataset.as_deref(), Some("bench/example@1.0"));
         assert_eq!(options.registry_path.as_deref(), Some("registry.json"));
+        assert_eq!(
+            options.registry_url.as_deref(),
+            Some("https://example.test/registry.json")
+        );
         assert_eq!(options.concurrency, 8);
         assert_eq!(options.attempts, 2);
         assert_eq!(options.backend, SandboxBackend::Docker);
