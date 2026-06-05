@@ -11,7 +11,9 @@ mod registry;
 mod sandbox;
 mod target;
 
-use registry::resolve_local_registry_dataset;
+use registry::{
+    resolve_git_task_source, resolve_local_registry_dataset, resolve_local_registry_task,
+};
 use sandbox::{
     prepare_container_writable_dir, run_task_scripts, AgentStep, SandboxAgent, SandboxBackend,
 };
@@ -50,11 +52,13 @@ fn run_eval(args: &[String]) -> Result<(), CliError> {
 
     let options = RunOptions::parse(args)?;
 
-    if options.dataset.is_none() && options.path.is_none() {
+    if !options.has_run_source() {
         return Err(CliError::usage(
-            "run requires either `-p <path>` or `-d <dataset>`",
+            "run requires `-p <path>`, `-d <dataset>`, `-t <task>`, or `--task-git-url <url> -p <path>`",
         ));
     }
+
+    options.validate_sources()?;
 
     let agent = options.agent.as_deref().unwrap_or("oracle");
     let agent = AgentKind::parse(agent)?;
@@ -70,8 +74,30 @@ fn run_eval(args: &[String]) -> Result<(), CliError> {
 }
 
 fn resolve_run_target(options: &RunOptions) -> Result<RunTarget, CliError> {
+    if let Some(git_url) = options.task_git_url.as_deref() {
+        let path = options
+            .path
+            .as_deref()
+            .ok_or_else(|| CliError::usage("--task-git-url requires `-p <path-in-repo>`"))?;
+        let task_path =
+            resolve_git_task_source(git_url, options.task_git_commit.as_deref(), Path::new(path))?;
+
+        return RunTarget::from_path(&task_path, &options.selection);
+    }
+
     if let Some(path) = options.path.as_deref() {
         return RunTarget::from_path(Path::new(path), &options.selection);
+    }
+
+    if let Some(task) = options.task.as_deref() {
+        let registry_path = options.registry_path.as_deref().ok_or_else(|| {
+            CliError::unimplemented(
+                "registered package tasks are not implemented yet; pass `--registry-path <registry.json>` for local Harbor registry tasks",
+            )
+        })?;
+        let resolved = resolve_local_registry_task(task, Path::new(registry_path))?;
+
+        return RunTarget::from_registry_dataset(resolved, &options.selection);
     }
 
     let dataset = options
@@ -637,12 +663,19 @@ fn print_run_help() {
 Usage:
   seaport run -p <path> [options]
   seaport run -d <dataset> [options]
+  seaport run -t <task> [options]
+  seaport run --task-git-url <url> -p <path-in-repo> [options]
 
 Options:
   -p, --path <path>       Local task or dataset directory
   -d, --dataset <name>    Registered dataset name
+  -t, --task <name>       Registered task name
+      --task-git-url <url>
+                          Git URL for a task repository
+      --task-git-commit <commit>
+                          Git commit for --task-git-url
       --registry-path <path>
-                          Harbor registry JSON for -d datasets
+                          Harbor registry JSON for -d datasets and -t tasks
   -a, --agent <agent>     Agent adapter name; defaults to oracle
   -m, --model <model>     Model identifier
   -n <count>              Concurrency
@@ -694,6 +727,9 @@ Usage:
 struct RunOptions {
     path: Option<String>,
     dataset: Option<String>,
+    task: Option<String>,
+    task_git_url: Option<String>,
+    task_git_commit: Option<String>,
     registry_path: Option<String>,
     agent: Option<String>,
     model: Option<String>,
@@ -708,6 +744,9 @@ impl Default for RunOptions {
         Self {
             path: None,
             dataset: None,
+            task: None,
+            task_git_url: None,
+            task_git_commit: None,
             registry_path: None,
             agent: None,
             model: None,
@@ -734,6 +773,18 @@ impl RunOptions {
                 }
                 "-d" | "--dataset" => {
                     options.dataset = Some(required_value(args, index, flag)?);
+                    index += 2;
+                }
+                "-t" | "--task" => {
+                    options.task = Some(required_value(args, index, flag)?);
+                    index += 2;
+                }
+                "--task-git-url" => {
+                    options.task_git_url = Some(required_value(args, index, flag)?);
+                    index += 2;
+                }
+                "--task-git-commit" => {
+                    options.task_git_commit = Some(required_value(args, index, flag)?);
                     index += 2;
                 }
                 "--registry-path" => {
@@ -790,6 +841,49 @@ impl RunOptions {
         }
 
         Ok(options)
+    }
+
+    fn has_run_source(&self) -> bool {
+        self.path.is_some()
+            || self.dataset.is_some()
+            || self.task.is_some()
+            || self.task_git_url.is_some()
+    }
+
+    fn validate_sources(&self) -> Result<(), CliError> {
+        if self.task_git_commit.is_some() && self.task_git_url.is_none() {
+            return Err(CliError::usage(
+                "`--task-git-commit` requires `--task-git-url`",
+            ));
+        }
+
+        if self.task_git_url.is_some() {
+            if self.path.is_none() {
+                return Err(CliError::usage(
+                    "`--task-git-url` requires `-p <path-in-repo>`",
+                ));
+            }
+
+            if self.dataset.is_some() || self.task.is_some() {
+                return Err(CliError::usage(
+                    "`--task-git-url` cannot be combined with `-d` or `-t`",
+                ));
+            }
+
+            return Ok(());
+        }
+
+        let source_count = usize::from(self.path.is_some())
+            + usize::from(self.dataset.is_some())
+            + usize::from(self.task.is_some());
+
+        if source_count > 1 {
+            return Err(CliError::usage(
+                "run accepts one task source: `-p`, `-d`, `-t`, or `--task-git-url`",
+            ));
+        }
+
+        Ok(())
     }
 }
 
@@ -907,6 +1001,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_registered_task_options() {
+        let args = strings([
+            "-t",
+            "acme/task",
+            "--registry-path",
+            "registry.json",
+            "-a",
+            "nop",
+        ]);
+
+        let options = RunOptions::parse(&args).expect("options");
+
+        assert_eq!(options.task.as_deref(), Some("acme/task"));
+        assert_eq!(options.registry_path.as_deref(), Some("registry.json"));
+        assert_eq!(options.agent.as_deref(), Some("nop"));
+    }
+
+    #[test]
     fn parses_unsafe_local_backend() {
         let args = strings([
             "-p",
@@ -936,6 +1048,15 @@ mod tests {
         let args = strings(["--wat"]);
 
         let error = RunOptions::parse(&args).expect_err("error");
+
+        assert_eq!(error.exit_code(), EXIT_USAGE);
+    }
+
+    #[test]
+    fn rejects_task_git_commit_without_git_url() {
+        let args = strings(["run", "-p", "tasks/example", "--task-git-commit", "abc123"]);
+
+        let error = run(args).expect_err("error");
 
         assert_eq!(error.exit_code(), EXIT_USAGE);
     }
@@ -1105,6 +1226,105 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn runs_local_registry_task() {
+        let root = temp_test_dir("registry-task");
+        let tasks = root.join("tasks");
+        let jobs = root.join("jobs");
+        let registry = root.join("registry.json");
+
+        write_oracle_task(&tasks.join("one"), "acme/one");
+        write_oracle_task(&tasks.join("two"), "acme/two");
+        fs::write(
+            &registry,
+            format!(
+                "[{{\"name\":\"acme/suite\",\"version\":\"head\",\"tasks\":[{{\"name\":\"acme/one\",\"path\":\"{}\"}},{{\"name\":\"acme/two\",\"path\":\"{}\"}}]}}]\n",
+                tasks.join("one").display(),
+                tasks.join("two").display()
+            ),
+        )
+        .expect("registry");
+
+        let args = vec![
+            "run".to_owned(),
+            "-t".to_owned(),
+            "acme/two".to_owned(),
+            "--registry-path".to_owned(),
+            registry.display().to_string(),
+            "-a".to_owned(),
+            "oracle".to_owned(),
+            "--backend".to_owned(),
+            "unsafe-local".to_owned(),
+            "--jobs-dir".to_owned(),
+            jobs.display().to_string(),
+        ];
+
+        run(args).expect("registry task run");
+
+        let job_dir = single_child_dir(&jobs);
+        let result = fs::read_to_string(job_dir.join("result.json")).expect("job result");
+        let config = fs::read_to_string(job_dir.join("config.json")).expect("job config");
+
+        assert!(result.contains("\"tasks_total\": 1"));
+        assert!(result.contains("\"tasks_passed\": 1"));
+        assert!(config.contains("\"target\": \"acme/two\""));
+        assert!(config.contains("\"acme/two\""));
+        assert!(!config.contains("\"acme/one\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runs_direct_git_task_source() {
+        let root = temp_test_dir("direct-git-task");
+        let repo = root.join("repo");
+        let jobs = root.join("jobs");
+
+        write_oracle_task(&repo.join("tasks").join("one"), "acme/git-one");
+        run_test_git(&repo, ["init", "--quiet"]);
+        run_test_git(&repo, ["add", "."]);
+        run_test_git(
+            &repo,
+            [
+                "-c",
+                "user.name=Seaport Test",
+                "-c",
+                "user.email=seaport@example.com",
+                "commit",
+                "--quiet",
+                "-m",
+                "add task",
+            ],
+        );
+        let commit = git_stdout(&repo, ["rev-parse", "HEAD"]);
+
+        let args = vec![
+            "run".to_owned(),
+            "--task-git-url".to_owned(),
+            repo.display().to_string(),
+            "--task-git-commit".to_owned(),
+            commit,
+            "-p".to_owned(),
+            "tasks/one".to_owned(),
+            "-a".to_owned(),
+            "oracle".to_owned(),
+            "--backend".to_owned(),
+            "unsafe-local".to_owned(),
+            "--jobs-dir".to_owned(),
+            jobs.display().to_string(),
+        ];
+
+        run(args).expect("direct git task run");
+
+        let job_dir = single_child_dir(&jobs);
+        let result = fs::read_to_string(job_dir.join("result.json")).expect("job result");
+
+        assert!(result.contains("\"tasks_total\": 1"));
+        assert!(result.contains("\"tasks_passed\": 1"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn strings<const N: usize>(items: [&str; N]) -> Vec<String> {
         items.into_iter().map(str::to_owned).collect()
     }
@@ -1163,5 +1383,37 @@ mod tests {
 
         assert_eq!(children.len(), 1);
         children.into_iter().next().expect("job dir")
+    }
+
+    fn run_test_git<const N: usize>(cwd: &Path, args: [&str; N]) {
+        let output = process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git");
+
+        assert!(
+            output.status.success(),
+            "git failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_stdout<const N: usize>(cwd: &Path, args: [&str; N]) -> String {
+        let output = process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git");
+
+        assert!(
+            output.status.success(),
+            "git failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 }

@@ -59,6 +59,45 @@ pub(crate) fn resolve_local_registry_dataset(
     })
 }
 
+pub(crate) fn resolve_local_registry_task(
+    task_name: &str,
+    registry_path: &Path,
+) -> Result<ResolvedRegistryDataset, CliError> {
+    let registry_root = registry_path.parent().unwrap_or_else(|| Path::new("."));
+    let registry = RegistryFile::from_path(registry_path)?;
+
+    for dataset in registry.datasets() {
+        for task in &dataset.tasks {
+            if registry_task_matches(task_name, task) {
+                return Ok(ResolvedRegistryDataset {
+                    name: task_name.to_owned(),
+                    task_paths: vec![resolve_registry_task_path(registry_root, task)?],
+                });
+            }
+        }
+    }
+
+    Err(CliError::usage(format!(
+        "task `{task_name}` was not found in {}",
+        registry_path.display()
+    )))
+}
+
+pub(crate) fn resolve_git_task_source(
+    git_url: &str,
+    git_commit_id: Option<&str>,
+    path: &Path,
+) -> Result<PathBuf, CliError> {
+    let task = RegistryTask {
+        name: None,
+        path: path.to_path_buf(),
+        git_url: Some(git_url.to_owned()),
+        git_commit_id: git_commit_id.map(str::to_owned),
+    };
+
+    resolve_git_task_path(Path::new("."), &task, git_url)
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum RegistryFile {
@@ -96,6 +135,8 @@ struct DatasetSpec {
 
 #[derive(Debug, Deserialize)]
 struct RegistryTask {
+    #[serde(default)]
+    name: Option<String>,
     path: PathBuf,
     #[serde(default)]
     git_url: Option<String>,
@@ -136,6 +177,15 @@ fn resolve_registry_task_path(
         Some(git_url) => resolve_git_task_path(registry_root, task, git_url),
         None => Ok(resolve_task_path(registry_root, &task.path)),
     }
+}
+
+fn registry_task_matches(task_name: &str, task: &RegistryTask) -> bool {
+    task.name.as_deref() == Some(task_name)
+        || task
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == task_name.rsplit('/').next().unwrap_or(task_name))
 }
 
 fn resolve_git_task_path(
