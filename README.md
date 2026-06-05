@@ -1,34 +1,30 @@
 # Seaport
 
-Seaport is a CLI-first framework for agent evals. The project goal is to let
-users create task directories, run agents against those tasks, and inspect job
-results from the terminal with the `seaport` command.
+Seaport is a CLI-first evaluation runner for software-agent tasks. It runs task
+directories, local datasets, registry JSON files, and git-backed task sources
+through a sandboxed execution backend, then writes structured job results that
+can be inspected or benchmarked.
 
-The Rust crate is implementation detail. Users should not need to write Rust to
-create or run evals.
+You do not need to write Rust to use Seaport. Tasks are ordinary directories
+with Markdown instructions, shell scripts, and a small TOML config.
 
-## Current Status
+## Features
 
-Seaport currently includes:
+- `seaport` command-line interface
+- local task and local dataset execution
+- registry JSON resolution for datasets and individual tasks
+- git-backed task checkout and caching
+- `oracle`, `nop`, and sandboxed external command agents
+- task filtering with include/exclude glob patterns
+- multiple attempts per task with bounded concurrency
+- Docker sandbox by default, with explicit `unsafe-local` mode for trusted development
+- phase-specific agent and verifier environment variables
+- JSON job, trial, trajectory, verifier, and reward output
+- CI, release builds, installer script, unit tests, integration tests, and benchmarks
 
-- the `seaport` CLI entry point
-- `seaport --help`
-- `seaport run --help`
-- `seaport dataset list`
-- `seaport datasets list`
-- `seaport init --task <org/name>`
-- `seaport view --help`
-- sandboxed Docker execution for oracle tasks
-- Harbor-compatible local dataset execution for task directories
-- a deterministic in-memory evaluation core
-- structured errors, telemetry, unit tests, integration tests, examples, and CI
+## Install
 
-The next required milestone is agent integration beyond `-a oracle`. Registry
-datasets and the results viewer still need to be wired.
-
-## Installation
-
-Install the latest released Seaport CLI:
+Install the latest released CLI:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/hyperterse/seaport/main/install.sh | bash
@@ -40,45 +36,25 @@ Install a specific version:
 VERSION=0.1.0 curl -fsSL https://raw.githubusercontent.com/hyperterse/seaport/main/install.sh | bash
 ```
 
-Installer options:
+Installer environment variables:
 
 - `VERSION`: version to install, without the leading `v`; defaults to latest
-- `INSTALL_DIR`: installation directory; defaults to `~/.local/bin`
+- `INSTALL_DIR`: install directory; defaults to `~/.local/bin`
 - `BASE_URL`: release base URL; defaults to GitHub Releases
 
-Install from this repository during development:
+Install from source during development:
 
 ```sh
 cargo install --path .
 ```
 
-Confirm the CLI is available:
+Confirm the CLI works:
 
 ```sh
 seaport --help
 ```
 
-For local development without installing:
-
-```sh
-cargo run -- --help
-```
-
-## CLI Overview
-
-```text
-seaport <command> [options]
-```
-
-Commands:
-
-- `seaport run`: run a local or registered eval dataset
-- `seaport dataset list`: list registered datasets
-- `seaport datasets list`: alias for `dataset list`
-- `seaport init --task <org/name>`: create a task skeleton
-- `seaport view [jobs-dir]`: view job results
-
-## Create an Eval Task
+## Quick Start
 
 Create a task skeleton:
 
@@ -86,7 +62,27 @@ Create a task skeleton:
 seaport init --task acme/hello-world
 ```
 
-This creates:
+Run the generated task with its oracle solution:
+
+```sh
+seaport run -p hello-world -a oracle
+```
+
+Run the repository example:
+
+```sh
+seaport run -p examples/tasks/basic-evaluation -a oracle
+```
+
+Run without installing the CLI:
+
+```sh
+cargo run -- run -p examples/tasks/basic-evaluation -a oracle
+```
+
+## Task Format
+
+A task is a directory like this:
 
 ```text
 hello-world/
@@ -100,28 +96,16 @@ hello-world/
     `-- test.sh
 ```
 
-`instruction.md` contains the instruction the agent should complete.
+`instruction.md` is the prompt given to the agent.
 
-`task.toml` contains task metadata, timeouts, agent settings, verifier settings,
-and environment settings.
-
-`environment/Dockerfile` defines the container image used for the task.
-
-`solution/solve.sh` is an optional oracle solution.
-
-`tests/test.sh` verifies whether the agent completed the task. The verifier
-should write a reward file under `/logs/verifier/`.
-
-## Task Configuration
-
-The generated `task.toml` starts with this shape:
+`task.toml` describes metadata, timeouts, and the execution environment:
 
 ```toml
 schema_version = "1.0"
 
 [task]
 name = "acme/hello-world"
-description = "Describe this task."
+description = "Create the expected output file."
 
 [agent]
 timeout_sec = 120.0
@@ -133,220 +117,255 @@ timeout_sec = 120.0
 [environment]
 docker_image = "ubuntu:24.04"
 network_mode = "no-network"
+build_timeout_sec = 600.0
 ```
 
-Future task execution work should extend this format with resource settings,
-environment variables, network policy, separate verifier environments, artifacts,
-and multi-step tasks.
+`solution/solve.sh` is used by the `oracle` agent. It is optional for `nop` and
+external agents.
 
-## Execution Backend
-
-Seaport runs local oracle tasks with the Docker backend by default:
-
-```sh
-seaport run -p examples/tasks/basic-evaluation -a oracle
-```
-
-The Docker backend builds `environment/Dockerfile` when it exists, then runs the
-oracle solution and verifier as separate containers. The runtime policy is
-hardened for eval tasks:
-
-- no network by default through `network_mode = "no-network"`
-- all Linux capabilities dropped
-- `no-new-privileges`
-- read-only container root filesystem
-- non-root numeric user
-- CPU, memory, swap, PID, and wall-clock limits
-- writable mounts only for `/app`, `/logs`, `/tmp`, and `/run`
-- task files mounted read-only under `/seaport/task`
-
-Use `network_mode = "bridge"` only for tasks that explicitly need network
-access. For trusted local development only, Seaport also supports:
-
-```sh
-seaport run -p examples/tasks/basic-evaluation -a oracle --backend unsafe-local
-```
-
-`unsafe-local` runs task scripts as host subprocesses. It is faster for local
-debugging but is not a sandbox.
-
-## Write a Verifier
-
-The verifier is a shell script in `tests/test.sh`.
-
-For pass/fail tasks, write `1` or `0` to `/logs/verifier/reward.txt`:
+`tests/test.sh` verifies the workspace after the agent phase. It should write
+`1` or `0` to `$LOGS_DIR/reward.txt`:
 
 ```sh
 #!/bin/bash
 set -euo pipefail
 
-mkdir -p /logs/verifier
+mkdir -p "$LOGS_DIR"
 
-if test -f /app/output.txt; then
-  echo 1 > /logs/verifier/reward.txt
+if test -f "$APP_DIR/output.txt"; then
+  echo 1 > "$LOGS_DIR/reward.txt"
 else
-  echo 0 > /logs/verifier/reward.txt
+  echo 0 > "$LOGS_DIR/reward.txt"
 fi
 ```
 
-For richer metrics, the planned format is `/logs/verifier/reward.json`:
+During execution, Seaport provides:
 
-```json
-{
-  "accuracy": 1.0,
-  "style": 0.75
-}
-```
+- `APP_DIR`: writable application workspace, mounted as `/app` in Docker
+- `LOGS_DIR`: verifier log directory, mounted as `/logs/verifier` in Docker
+- `SEAPORT_TASK_DIR`: read-only task directory
+- `SEAPORT_INSTRUCTION_PATH`: path to `instruction.md`
+- `SEAPORT_AGENT_NAME`: set for external command agents
+- `SEAPORT_MODEL`: set when `-m/--model` is provided
 
-## Run an Eval
+## Run Tasks
 
-The example task in this repository is:
-
-```text
-examples/tasks/basic-evaluation/
-|-- instruction.md
-|-- task.toml
-|-- environment/
-|   `-- Dockerfile
-|-- solution/
-|   `-- solve.sh
-`-- tests/
-    `-- test.sh
-```
-
-Run the oracle solution for a local task:
+Run one local task:
 
 ```sh
-seaport run -p examples/tasks/basic-evaluation -a oracle
+seaport run -p path/to/task -a oracle
 ```
 
-Run every task in a Harbor-compatible local dataset directory:
+Run every immediate task subdirectory in a local dataset:
 
 ```sh
 seaport run -p path/to/dataset -a oracle
 ```
 
-Seaport treats a directory with immediate task subdirectories as a local dataset,
-matching Harbor's local path behavior. Use Harbor-style task selection flags:
+Filter tasks by name:
 
 ```sh
-seaport run -p path/to/dataset -a oracle \
-  -i 'swe-bench/*' \
-  -x 'swe-bench/skip-*' \
+seaport run -p path/to/dataset \
+  -i 'suite/*' \
+  -x 'suite/skip-*' \
   -l 100
 ```
 
-Run a dataset from a Harbor-compatible local registry JSON file:
+Run two attempts per task with two workers:
 
 ```sh
-seaport run -d org/dataset@head --registry-path registry.json -a oracle
+seaport run -p path/to/dataset -a oracle -k 2 -n 2
 ```
 
-Registry task paths are resolved relative to the registry file when they are not
-absolute. Git-backed registry tasks and hosted package datasets are still
-future work.
-
-The intended non-oracle local-task command is:
+Write results somewhere other than `jobs/`:
 
 ```sh
-seaport run -p examples/tasks/basic-evaluation -a codex -m openai/gpt-5
+seaport run -p path/to/task -a oracle --jobs-dir /tmp/seaport-jobs
 ```
 
-The intended registered-dataset command is:
+## Agents
+
+`oracle` runs `solution/solve.sh`, then runs the verifier:
 
 ```sh
-seaport run -d acme/hello-world@1.0 -a codex -m openai/gpt-5
+seaport run -p path/to/task -a oracle
 ```
 
-The CLI currently runs oracle tasks and local oracle datasets, then fails with a
-clear not-implemented message for non-oracle agents. The next implementation
-stage should wire agent adapters into the same sandboxed execution backend.
+`nop` skips the agent phase and runs only the verifier. This is useful for
+baseline checks and tasks where the initial workspace already contains the
+expected state:
 
-## Expected Job Output
+```sh
+seaport run -p path/to/task -a nop
+```
 
-Seaport should write runs under `jobs/<job-name>/`:
+External command agents run a shell command in the same sandboxed task workspace:
+
+```sh
+seaport run -p path/to/task \
+  -a custom \
+  --agent-command 'my-agent --task "$SEAPORT_INSTRUCTION_PATH" --workdir "$APP_DIR"'
+```
+
+Pass phase-specific environment variables with `--ae/--agent-env` and
+`--ve/--verifier-env`:
+
+```sh
+seaport run -p path/to/task \
+  -a custom \
+  --agent-command 'my-agent --model "$SEAPORT_MODEL"' \
+  -m provider/model \
+  --ae API_KEY="$API_KEY" \
+  --ve EXPECTED_OUTPUT=ok
+```
+
+Seaport also includes default external command templates for `codex` and
+`claude-code`. In Docker mode, those CLIs must be available inside the task image:
+
+```sh
+seaport run -p path/to/task -a codex -m openai/gpt-5 --ae OPENAI_API_KEY="$OPENAI_API_KEY"
+seaport run -p path/to/task -a claude-code -m sonnet --ae ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"
+```
+
+## Registry Inputs
+
+Run a dataset from a local registry JSON file:
+
+```sh
+seaport run -d acme/suite@head --registry-path registry.json -a oracle
+```
+
+Run one registered task:
+
+```sh
+seaport run -t acme/task --registry-path registry.json -a oracle
+```
+
+Registry task paths are resolved relative to the registry file unless they are
+absolute. Git-backed task entries are cloned into Seaport's registry cache and
+checked out at `git_commit_id` when provided.
+
+Example registry:
+
+```json
+[
+  {
+    "name": "acme/suite",
+    "version": "head",
+    "tasks": [
+      {
+        "name": "acme/local-task",
+        "path": "tasks/local-task"
+      },
+      {
+        "name": "acme/git-task",
+        "path": "tasks/git-task",
+        "git_url": "https://example.com/acme/tasks.git",
+        "git_commit_id": "0123456789abcdef"
+      }
+    ]
+  }
+]
+```
+
+Run a task directly from git without a registry file:
+
+```sh
+seaport run \
+  --task-git-url https://example.com/acme/tasks.git \
+  --task-git-commit 0123456789abcdef \
+  -p tasks/git-task \
+  -a oracle
+```
+
+Set `SEAPORT_REGISTRY_CACHE` to control where git-backed task checkouts are
+stored. By default Seaport uses the system temporary directory.
+
+## Sandboxing
+
+The Docker backend is the default:
+
+```sh
+seaport run -p path/to/task -a oracle --backend docker
+```
+
+Docker execution uses:
+
+- separate containers for agent and verifier phases
+- read-only task mount at `/seaport/task`
+- writable `/app`, `/logs`, `/tmp`, and `/run`
+- dropped Linux capabilities
+- `no-new-privileges`
+- read-only container root filesystem
+- non-root numeric user
+- CPU, memory, swap, PID, and wall-clock limits
+- phase-specific network mode from `task.toml`
+
+Use `network_mode = "no-network"` for isolated tasks and `network_mode =
+"public"` when the task explicitly needs network access. Phase-specific
+overrides can be set in `[agent]` or `[verifier]`.
+
+For trusted local development only:
+
+```sh
+seaport run -p path/to/task -a oracle --backend unsafe-local
+```
+
+`unsafe-local` runs task scripts as host subprocesses. It is convenient for
+debugging, but it is not a sandbox.
+
+## Job Output
+
+By default Seaport writes jobs under `jobs/`:
 
 ```text
-jobs/job-name/
+jobs/seaport-<run-id>/
 |-- config.json
 |-- result.json
-|-- trial-name/
-|   |-- config.json
-|   |-- result.json
-|   |-- agent/
-|   |   |-- trajectory.json
-|   |   `-- recording.cast
-|   `-- verifier/
-|       |-- reward.txt
-|       |-- reward.json
-|       |-- test-stdout.txt
-|       `-- test-stderr.txt
-`-- ...
+`-- <task-name>/
+    |-- config.json
+    |-- result.json
+    |-- agent/
+    |   `-- trajectory.json
+    `-- verifier/
+        |-- reward.txt
+        |-- test-stdout.txt
+        `-- test-stderr.txt
 ```
 
-This layout is the compatibility target for `seaport view`.
+With multiple attempts, trial directories include an attempt suffix:
 
-## View Results
-
-The intended command is:
-
-```sh
-seaport view jobs
+```text
+jobs/seaport-<run-id>/
+`-- acme-task-attempt-2/
 ```
 
-The viewer should eventually start a local web server for browsing jobs, trials,
-rewards, trajectories, verifier output, and artifacts. The command currently has
-help text and an explicit not-implemented response.
-
-## Dataset Registry
-
-List configured datasets:
-
-```sh
-seaport dataset list
-```
-
-The current implementation reports that no registry is configured. The next
-registry stage should add local registry files, remote registry resolution,
-dataset artifact downloads, and cache management.
+`result.json` contains aggregate pass/fail counts, average reward, and per-task
+attempt records. `trajectory.json` records the command, exit status, stdout, and
+stderr for the agent phase.
 
 ## Benchmarks
 
-Seaport includes a same-task oracle benchmark against Harbor. By default it uses
-Seaport's sandboxed Docker backend:
+Run the built-in benchmark runner:
 
 ```sh
 python3 benchmarks/run.py --iterations 5
 ```
 
-For trusted local harness overhead only:
+Use the local backend for trusted harness-overhead checks:
 
 ```sh
 python3 benchmarks/run.py --seaport-backend unsafe-local --iterations 5
 ```
 
-The benchmark task lives at `benchmarks/tasks/basic-oracle`. The runner writes
-machine-local output to `benchmarks/results/latest.json` and
-`benchmarks/results/latest.md`.
+The benchmark task is `benchmarks/tasks/basic-oracle`. The runner writes
+machine-local output to:
+
+- `benchmarks/results/latest.json`
+- `benchmarks/results/latest.md`
 
 The latest committed benchmark report is
 [`benchmarks/results/2026-06-05-oracle.md`](benchmarks/results/2026-06-05-oracle.md).
-
-## Internal Library
-
-The repository also contains a Rust library used by the CLI implementation. It
-currently provides:
-
-- `Agent`
-- `TestCase`
-- `Evaluator`
-- `Scorer`
-- `EvaluationReport`
-- `SeaportError`
-- deterministic telemetry events
-
-This API is useful for internal tests and future engine code, but it is not the
-primary user interface.
 
 ## Development
 
@@ -359,8 +378,15 @@ cargo test --all-targets --locked
 cargo test --doc --locked
 bash -n install.sh
 PYTHONPYCACHEPREFIX=/tmp/seaport-pycache python3 -m py_compile benchmarks/run.py
-cargo run -- --help
 cargo bench --bench evaluation
+```
+
+Run the CLI locally:
+
+```sh
+cargo run -- --help
+cargo run -- run --help
+cargo run -- init --task acme/example
 ```
 
 Create a release by pushing a semantic version tag:
@@ -373,28 +399,27 @@ git push origin v0.1.0
 The release workflow builds Linux, macOS, and Windows archives, publishes them
 to GitHub Releases, and uploads `checksums.txt`.
 
-Run only tests:
+## Project Layout
 
-```sh
-cargo test
-```
-
-Run the CLI locally:
-
-```sh
-cargo run -- --help
-cargo run -- init --task acme/example
-cargo run -- run -p example -a codex -m openai/gpt-5
+```text
+src/                  CLI, registry resolution, sandbox runtime, library core
+tests/                integration tests
+benchmarks/           benchmark runner, benchmark tasks, committed reports
+docs/                 ADRs, migration notes, operations notes
+.github/workflows/    CI and release pipelines
+install.sh            release installer
 ```
 
 ## Documentation
 
-Additional project documentation:
-
+- [Changelog](CHANGELOG.md)
 - [Code explanations](docs/code-explanations.md)
 - [ADR 0001: Deterministic Evaluation Core](docs/adr/0001-deterministic-evaluation.md)
 - [ADR 0002: Sandboxed Execution Backend](docs/adr/0002-sandboxed-execution-backend.md)
 - [Initial migration guide](docs/migrations/0001-initial-seaport.md)
 - [Seaport observability dashboard](docs/observability/seaport-dashboard.md)
 - [Seaport ownership](docs/operations/ownership.md)
-- [Changelog](CHANGELOG.md)
+
+## License
+
+MIT
