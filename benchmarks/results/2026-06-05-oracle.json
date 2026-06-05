@@ -11,29 +11,31 @@
   "results": [
     {
       "name": "seaport",
+      "backend": "docker",
       "successes": 3,
       "durations_sec": [
-        0.339991792,
-        0.02079575,
-        0.016870584
+        3.098302958,
+        0.935959125,
+        0.978064875
       ],
-      "mean_sec": 0.125886042
+      "mean_sec": 1.6707756526666664
     },
     {
       "name": "harbor",
+      "backend": "docker-backed oracle execution",
       "successes": 3,
       "durations_sec": [
-        29.716727375,
-        80.327744542,
-        18.260834125
+        17.114082042,
+        15.433449625,
+        15.433827167
       ],
-      "mean_sec": 42.76843534733333
+      "mean_sec": 15.993786278000002
     }
   ],
   "comparison": {
     "comparable": true,
     "seaport_faster": true,
-    "speedup_ratio": 339.73929649272264
+    "speedup_ratio": 9.572671383182344
   },
-  "caveat": "Compares oracle harness overhead on the same task. Seaport uses its local oracle runner; Harbor uses Docker-backed oracle task execution."
+  "caveat": "Compares oracle execution on the same task. Seaport uses its hardened Docker backend; Harbor uses Docker-backed oracle task execution."
 }

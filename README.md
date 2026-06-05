@@ -18,12 +18,12 @@ Seaport currently includes:
 - `seaport datasets list`
 - `seaport init --task <org/name>`
 - `seaport view --help`
+- sandboxed Docker execution for oracle tasks
 - a deterministic in-memory evaluation core
 - structured errors, telemetry, unit tests, integration tests, examples, and CI
 
-The next required milestone is sandboxed task execution for `seaport run -p`.
-The command surface exists now, but full Docker task execution, verifier log
-collection, registry datasets, and the results viewer still need to be wired.
+The next required milestone is agent integration beyond `-a oracle`. Registry
+datasets and the results viewer still need to be wired.
 
 ## Installation
 
@@ -138,6 +138,37 @@ Future task execution work should extend this format with resource settings,
 environment variables, network policy, separate verifier environments, artifacts,
 and multi-step tasks.
 
+## Execution Backend
+
+Seaport runs local oracle tasks with the Docker backend by default:
+
+```sh
+seaport run -p examples/tasks/basic-evaluation -a oracle
+```
+
+The Docker backend builds `environment/Dockerfile` when it exists, then runs the
+oracle solution and verifier as separate containers. The runtime policy is
+hardened for eval tasks:
+
+- no network by default through `network_mode = "no-network"`
+- all Linux capabilities dropped
+- `no-new-privileges`
+- read-only container root filesystem
+- non-root numeric user
+- CPU, memory, swap, PID, and wall-clock limits
+- writable mounts only for `/app`, `/logs`, `/tmp`, and `/run`
+- task files mounted read-only under `/seaport/task`
+
+Use `network_mode = "bridge"` only for tasks that explicitly need network
+access. For trusted local development only, Seaport also supports:
+
+```sh
+seaport run -p examples/tasks/basic-evaluation -a oracle --backend unsafe-local
+```
+
+`unsafe-local` runs task scripts as host subprocesses. It is faster for local
+debugging but is not a sandbox.
+
 ## Write a Verifier
 
 The verifier is a shell script in `tests/test.sh`.
@@ -182,7 +213,13 @@ examples/tasks/basic-evaluation/
     `-- test.sh
 ```
 
-The intended local-task command is:
+Run the oracle solution for a local task:
+
+```sh
+seaport run -p examples/tasks/basic-evaluation -a oracle
+```
+
+The intended non-oracle local-task command is:
 
 ```sh
 seaport run -p examples/tasks/basic-evaluation -a codex -m openai/gpt-5
@@ -194,10 +231,9 @@ The intended registered-dataset command is:
 seaport run -d acme/hello-world@1.0 -a codex -m openai/gpt-5
 ```
 
-The CLI currently parses these flags and fails with a clear not-implemented
-message. The next implementation stage should make `seaport run -p <task>` build
-or pull the task environment, run the agent phase, run the verifier phase, and
-write a job directory.
+The CLI currently runs oracle tasks and fails with a clear not-implemented
+message for non-oracle agents. The next implementation stage should wire agent
+adapters into the same sandboxed execution backend.
 
 ## Expected Job Output
 
@@ -249,10 +285,17 @@ dataset artifact downloads, and cache management.
 
 ## Benchmarks
 
-Seaport includes a same-task oracle benchmark against Harbor:
+Seaport includes a same-task oracle benchmark against Harbor. By default it uses
+Seaport's sandboxed Docker backend:
 
 ```sh
 python3 benchmarks/run.py --iterations 5
+```
+
+For trusted local harness overhead only:
+
+```sh
+python3 benchmarks/run.py --seaport-backend unsafe-local --iterations 5
 ```
 
 The benchmark task lives at `benchmarks/tasks/basic-oracle`. The runner writes
@@ -323,6 +366,7 @@ Additional project documentation:
 
 - [Code explanations](docs/code-explanations.md)
 - [ADR 0001: Deterministic Evaluation Core](docs/adr/0001-deterministic-evaluation.md)
+- [ADR 0002: Sandboxed Execution Backend](docs/adr/0002-sandboxed-execution-backend.md)
 - [Initial migration guide](docs/migrations/0001-initial-seaport.md)
 - [Seaport observability dashboard](docs/observability/seaport-dashboard.md)
 - [Seaport ownership](docs/operations/ownership.md)

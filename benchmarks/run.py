@@ -53,7 +53,7 @@ def main() -> int:
     harbor_bin = shutil.which(args.harbor_bin) if args.harbor_bin else None
     results = []
 
-    results.append(run_seaport(seaport_bin, task, iterations))
+    results.append(run_seaport(seaport_bin, task, iterations, args.seaport_backend))
 
     if harbor_bin:
         results.append(run_harbor(harbor_bin, task, iterations))
@@ -86,6 +86,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--iterations", type=int, default=5)
     parser.add_argument("--output", type=Path, default=DEFAULT_RESULTS)
     parser.add_argument("--seaport-bin", type=Path)
+    parser.add_argument("--seaport-backend", choices=["docker", "unsafe-local"], default="docker")
     parser.add_argument("--harbor-bin", default="harbor")
     return parser.parse_args()
 
@@ -100,7 +101,7 @@ def resolve_seaport(explicit: Path | None) -> Path:
     return binary
 
 
-def run_seaport(binary: Path, task: Path, iterations: int) -> CommandResult:
+def run_seaport(binary: Path, task: Path, iterations: int, backend: str) -> CommandResult:
     with tempfile.TemporaryDirectory(prefix="seaport-bench-") as temporary:
         jobs_dir = Path(temporary) / "jobs"
         command = [
@@ -110,6 +111,8 @@ def run_seaport(binary: Path, task: Path, iterations: int) -> CommandResult:
             str(task),
             "-a",
             "oracle",
+            "--backend",
+            backend,
             "--jobs-dir",
             str(jobs_dir),
         ]

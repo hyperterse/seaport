@@ -29,7 +29,7 @@ The scripts support both environments:
 
 ## Run
 
-Build Seaport and run five iterations:
+Build Seaport and run five sandboxed Docker-backend iterations:
 
 ```sh
 python3 benchmarks/run.py --iterations 5
@@ -44,6 +44,12 @@ python3 benchmarks/run.py \
   --iterations 5
 ```
 
+Measure the trusted local harness path instead:
+
+```sh
+python3 benchmarks/run.py --seaport-backend unsafe-local --iterations 5
+```
+
 The runner writes:
 
 - `benchmarks/results/latest.json`
@@ -55,8 +61,11 @@ The latest committed local report is:
 
 ## Interpreting Results
 
-The report only declares Seaport faster when both commands complete at least one
-successful run on the same task.
+The default report only declares Seaport faster when both commands complete at
+least one successful run on the same task.
 
 If Harbor is not installed, Docker is unavailable, or Harbor fails the task, the
 report records that condition instead of fabricating a comparison.
+
+`--seaport-backend unsafe-local` is not a sandboxed comparison. It exists only to
+measure Seaport's trusted local harness overhead.

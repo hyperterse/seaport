@@ -4,8 +4,12 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{self, Command, Output};
+use std::process::{self, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod sandbox;
+
+use sandbox::{prepare_container_writable_dir, run_task_scripts, SandboxBackend};
 
 const EXIT_USAGE: i32 = 2;
 const EXIT_UNIMPLEMENTED: i32 = 3;
@@ -101,24 +105,25 @@ fn run_oracle_task(task_path: &Path, options: &RunOptions) -> Result<(), CliErro
     fs::create_dir_all(&app_dir)?;
     fs::create_dir_all(&logs_dir)?;
 
-    let solution = task_path.join("solution").join("solve.sh");
-    let verifier = task_path.join("tests").join("test.sh");
-    let solution_output = run_script(&solution, &task_path, &app_dir, &logs_dir)?;
-    let verifier_output = run_script(&verifier, &task_path, &app_dir, &logs_dir)?;
+    prepare_container_writable_dir(&app_dir)?;
+    prepare_container_writable_dir(&workspace.join("logs"))?;
+    prepare_container_writable_dir(&logs_dir)?;
+
+    let outputs = run_task_scripts(&task_path, &run_id, &app_dir, &logs_dir, options.backend)?;
     let reward = read_reward(&logs_dir)?;
     let passed = reward.trim() == "1" || reward.trim() == "1.0";
 
     fs::write(
         agent_dir.join("trajectory.json"),
-        trajectory_json(&solution_output),
+        trajectory_json(&outputs.solution),
     )?;
     fs::write(
         verifier_dir.join("test-stdout.txt"),
-        &verifier_output.stdout,
+        &outputs.verifier.stdout,
     )?;
     fs::write(
         verifier_dir.join("test-stderr.txt"),
-        &verifier_output.stderr,
+        &outputs.verifier.stderr,
     )?;
     fs::write(verifier_dir.join("reward.txt"), &reward)?;
     fs::write(
@@ -184,33 +189,6 @@ fn validate_task_path(task_path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-fn run_script(
-    script: &Path,
-    task_path: &Path,
-    app_dir: &Path,
-    logs_dir: &Path,
-) -> Result<Output, CliError> {
-    let output = Command::new("bash")
-        .arg(script)
-        .current_dir(app_dir)
-        .env("APP_DIR", app_dir)
-        .env("LOGS_DIR", logs_dir)
-        .env("SEAPORT_TASK_DIR", task_path)
-        .output()?;
-
-    if !output.status.success() {
-        return Err(CliError::task_failed(format!(
-            "script failed: {} (status: {})\nstdout:\n{}\nstderr:\n{}",
-            script.display(),
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-
-    Ok(output)
-}
-
 fn read_reward(logs_dir: &Path) -> Result<String, CliError> {
     let reward_path = logs_dir.join("reward.txt");
 
@@ -265,7 +243,8 @@ fn sanitize_name(value: &str) -> String {
 
 fn job_config_json(task_name: &str, options: &RunOptions) -> String {
     format!(
-        "{{\n  \"agent\": \"oracle\",\n  \"model\": {},\n  \"task\": \"{}\"\n}}\n",
+        "{{\n  \"agent\": \"oracle\",\n  \"backend\": \"{}\",\n  \"model\": {},\n  \"task\": \"{}\"\n}}\n",
+        options.backend.as_str(),
         json_option(options.model.as_deref()),
         json_escape(task_name)
     )
@@ -493,7 +472,8 @@ Options:
   -m, --model <model>     Model identifier
   -n <count>              Concurrency
       --jobs-dir <path>   Directory where job results are written
-      --env <provider>    Sandbox provider
+      --backend <name>    Execution backend: docker or unsafe-local
+      --env <name>        Alias for --backend
       --help              Show this help"
     );
 }
@@ -530,15 +510,29 @@ Usage:
     );
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct RunOptions {
     path: Option<String>,
     dataset: Option<String>,
     agent: Option<String>,
     model: Option<String>,
     concurrency: Option<String>,
-    environment: Option<String>,
+    backend: SandboxBackend,
     jobs_dir: Option<String>,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            path: None,
+            dataset: None,
+            agent: None,
+            model: None,
+            concurrency: None,
+            backend: SandboxBackend::Docker,
+            jobs_dir: None,
+        }
+    }
 }
 
 impl RunOptions {
@@ -570,8 +564,9 @@ impl RunOptions {
                     options.concurrency = Some(required_value(args, index, flag)?);
                     index += 2;
                 }
-                "--env" => {
-                    options.environment = Some(required_value(args, index, flag)?);
+                "--backend" | "--env" => {
+                    let value = required_value(args, index, flag)?;
+                    options.backend = SandboxBackend::parse(&value)?;
                     index += 2;
                 }
                 "--jobs-dir" => {
@@ -661,6 +656,7 @@ mod tests {
         assert_eq!(options.path.as_deref(), Some("tasks/example"));
         assert_eq!(options.agent.as_deref(), Some("codex"));
         assert_eq!(options.model.as_deref(), Some("openai/gpt-5"));
+        assert_eq!(options.backend, SandboxBackend::Docker);
     }
 
     #[test]
@@ -684,8 +680,33 @@ mod tests {
 
         assert_eq!(options.dataset.as_deref(), Some("bench/example@1.0"));
         assert_eq!(options.concurrency.as_deref(), Some("8"));
-        assert_eq!(options.environment.as_deref(), Some("docker"));
+        assert_eq!(options.backend, SandboxBackend::Docker);
         assert_eq!(options.jobs_dir.as_deref(), Some("jobs/custom"));
+    }
+
+    #[test]
+    fn parses_unsafe_local_backend() {
+        let args = strings([
+            "-p",
+            "tasks/example",
+            "-a",
+            "oracle",
+            "--backend",
+            "unsafe-local",
+        ]);
+
+        let options = RunOptions::parse(&args).expect("options");
+
+        assert_eq!(options.backend, SandboxBackend::UnsafeLocal);
+    }
+
+    #[test]
+    fn rejects_ambiguous_local_backend() {
+        let args = strings(["--backend", "local"]);
+
+        let error = RunOptions::parse(&args).expect_err("error");
+
+        assert_eq!(error.exit_code(), EXIT_USAGE);
     }
 
     #[test]
