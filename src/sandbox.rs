@@ -15,8 +15,41 @@ const CONTAINER_PIDS_LIMIT: &str = "256";
 const DOCKER_BUILD_TIMEOUT: Duration = Duration::from_secs(600);
 
 pub(crate) struct ScriptOutputs {
-    pub(crate) solution: Output,
+    pub(crate) agent: AgentStep,
     pub(crate) verifier: Output,
+}
+
+pub(crate) struct AgentStep {
+    pub(crate) command: String,
+    pub(crate) status: i32,
+    pub(crate) stdout: Vec<u8>,
+    pub(crate) stderr: Vec<u8>,
+}
+
+impl AgentStep {
+    fn from_output(command: impl Into<String>, output: Output) -> Self {
+        Self {
+            command: command.into(),
+            status: output.status.code().unwrap_or_default(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        }
+    }
+
+    fn nop() -> Self {
+        Self {
+            command: "nop".to_owned(),
+            status: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SandboxAgent {
+    Oracle,
+    Nop,
 }
 
 pub(crate) fn run_task_scripts(
@@ -24,16 +57,17 @@ pub(crate) fn run_task_scripts(
     run_id: &str,
     app_dir: &Path,
     logs_dir: &Path,
+    agent: SandboxAgent,
     backend: SandboxBackend,
 ) -> Result<ScriptOutputs, CliError> {
     let environment = task_environment(task_path)?;
 
     match backend {
         SandboxBackend::Docker => {
-            run_scripts_in_docker(task_path, run_id, app_dir, logs_dir, &environment)
+            run_scripts_in_docker(task_path, run_id, app_dir, logs_dir, agent, &environment)
         }
         SandboxBackend::UnsafeLocal => {
-            run_scripts_locally(task_path, app_dir, logs_dir, &environment)
+            run_scripts_locally(task_path, app_dir, logs_dir, agent, &environment)
         }
     }
 }
@@ -59,22 +93,29 @@ fn run_scripts_in_docker(
     run_id: &str,
     app_dir: &Path,
     logs_dir: &Path,
+    agent_kind: SandboxAgent,
     environment: &TaskEnvironment,
 ) -> Result<ScriptOutputs, CliError> {
     ensure_docker_available()?;
 
     let image = prepare_docker_image(task_path, run_id, environment)?;
     let result = (|| {
-        let solution = run_script_in_docker(DockerScriptRun {
-            image: &image.reference,
-            environment,
-            run_id,
-            task_path,
-            app_dir,
-            logs_dir,
-            script: "solution/solve.sh",
-            timeout: environment.agent_timeout,
-        })?;
+        let agent = match agent_kind {
+            SandboxAgent::Oracle => AgentStep::from_output(
+                "solution/solve.sh",
+                run_script_in_docker(DockerScriptRun {
+                    image: &image.reference,
+                    environment,
+                    run_id,
+                    task_path,
+                    app_dir,
+                    logs_dir,
+                    script: "solution/solve.sh",
+                    timeout: environment.agent_timeout,
+                })?,
+            ),
+            SandboxAgent::Nop => AgentStep::nop(),
+        };
         let verifier = run_script_in_docker(DockerScriptRun {
             image: &image.reference,
             environment,
@@ -86,7 +127,7 @@ fn run_scripts_in_docker(
             timeout: environment.verifier_timeout,
         })?;
 
-        Ok(ScriptOutputs { solution, verifier })
+        Ok(ScriptOutputs { agent, verifier })
     })();
 
     if image.remove_after_run {
@@ -455,17 +496,23 @@ fn run_scripts_locally(
     task_path: &Path,
     app_dir: &Path,
     logs_dir: &Path,
+    agent_kind: SandboxAgent,
     environment: &TaskEnvironment,
 ) -> Result<ScriptOutputs, CliError> {
-    let solution = task_path.join("solution").join("solve.sh");
     let verifier = task_path.join("tests").join("test.sh");
-    let solution = run_script_locally(
-        &solution,
-        task_path,
-        app_dir,
-        logs_dir,
-        environment.agent_timeout,
-    )?;
+    let agent = match agent_kind {
+        SandboxAgent::Oracle => AgentStep::from_output(
+            "solution/solve.sh",
+            run_script_locally(
+                &task_path.join("solution").join("solve.sh"),
+                task_path,
+                app_dir,
+                logs_dir,
+                environment.agent_timeout,
+            )?,
+        ),
+        SandboxAgent::Nop => AgentStep::nop(),
+    };
     let verifier = run_script_locally(
         &verifier,
         task_path,
@@ -474,7 +521,7 @@ fn run_scripts_locally(
         environment.verifier_timeout,
     )?;
 
-    Ok(ScriptOutputs { solution, verifier })
+    Ok(ScriptOutputs { agent, verifier })
 }
 
 fn run_script_locally(

@@ -4,7 +4,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{self, Output};
+use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod registry;
@@ -12,7 +12,9 @@ mod sandbox;
 mod target;
 
 use registry::resolve_local_registry_dataset;
-use sandbox::{prepare_container_writable_dir, run_task_scripts, SandboxBackend};
+use sandbox::{
+    prepare_container_writable_dir, run_task_scripts, AgentStep, SandboxAgent, SandboxBackend,
+};
 use target::{RunTarget, TaskRef, TaskSelection};
 
 const EXIT_USAGE: i32 = 2;
@@ -54,25 +56,17 @@ fn run_eval(args: &[String]) -> Result<(), CliError> {
         ));
     }
 
-    let agent = options
-        .agent
-        .as_deref()
-        .ok_or_else(|| CliError::usage("run requires `-a <agent>`"))?;
+    let agent = options.agent.as_deref().unwrap_or("oracle");
+    let agent = AgentKind::parse(agent)?;
 
-    if agent != "oracle" && options.model.is_none() {
+    if agent.requires_model() && options.model.is_none() {
         return Err(CliError::usage(
-            "run requires `-m <model>` unless `-a oracle` is used",
-        ));
-    }
-
-    if agent != "oracle" {
-        return Err(CliError::unimplemented(
-            "only the oracle agent is implemented for local task execution",
+            "run requires `-m <model>` for model-backed agents",
         ));
     }
 
     let target = resolve_run_target(&options)?;
-    run_oracle_target(&target, &options)
+    run_target(&target, &options, agent)
 }
 
 fn resolve_run_target(options: &RunOptions) -> Result<RunTarget, CliError> {
@@ -94,7 +88,7 @@ fn resolve_run_target(options: &RunOptions) -> Result<RunTarget, CliError> {
     RunTarget::from_registry_dataset(resolved, &options.selection)
 }
 
-fn run_oracle_target(target: &RunTarget, options: &RunOptions) -> Result<(), CliError> {
+fn run_target(target: &RunTarget, options: &RunOptions, agent: AgentKind) -> Result<(), CliError> {
     let run_id = timestamp_id()?;
     let job_root = options
         .jobs_dir
@@ -105,12 +99,12 @@ fn run_oracle_target(target: &RunTarget, options: &RunOptions) -> Result<(), Cli
     let mut outcomes = Vec::with_capacity(target.tasks.len());
 
     for task in &target.tasks {
-        outcomes.push(run_oracle_trial(task, &job_dir, &run_id, options)?);
+        outcomes.push(run_trial(task, &job_dir, &run_id, options, agent)?);
     }
 
     fs::write(
         job_dir.join("config.json"),
-        job_config_json(target, options),
+        job_config_json(target, options, agent),
     )?;
     fs::write(job_dir.join("result.json"), job_result_json(&outcomes))?;
 
@@ -133,18 +127,20 @@ fn run_oracle_target(target: &RunTarget, options: &RunOptions) -> Result<(), Cli
     }
 }
 
-fn run_oracle_trial(
+fn run_trial(
     task: &TaskRef,
     job_dir: &Path,
     run_id: &str,
     options: &RunOptions,
+    agent: AgentKind,
 ) -> Result<TrialOutcome, CliError> {
     let task_name = &task.name;
     let trial_dir = job_dir.join(sanitize_name(task_name));
     let agent_dir = trial_dir.join("agent");
     let verifier_dir = trial_dir.join("verifier");
     let workspace = env::temp_dir().join(format!(
-        "seaport-oracle-{run_id}-{}",
+        "seaport-{}-{run_id}-{}",
+        agent.as_str(),
         sanitize_name(&task.name)
     ));
     let app_dir = workspace.join("app");
@@ -159,13 +155,20 @@ fn run_oracle_trial(
     prepare_container_writable_dir(&workspace.join("logs"))?;
     prepare_container_writable_dir(&logs_dir)?;
 
-    let outputs = run_task_scripts(&task.path, run_id, &app_dir, &logs_dir, options.backend)?;
+    let outputs = run_task_scripts(
+        &task.path,
+        run_id,
+        &app_dir,
+        &logs_dir,
+        agent.sandbox_agent(),
+        options.backend,
+    )?;
     let reward = read_reward(&logs_dir)?;
     let passed = reward.trim() == "1" || reward.trim() == "1.0";
 
     fs::write(
         agent_dir.join("trajectory.json"),
-        trajectory_json(&outputs.solution),
+        trajectory_json(&outputs.agent),
     )?;
     fs::write(
         verifier_dir.join("test-stdout.txt"),
@@ -176,7 +179,10 @@ fn run_oracle_trial(
         &outputs.verifier.stderr,
     )?;
     fs::write(verifier_dir.join("reward.txt"), &reward)?;
-    fs::write(trial_dir.join("config.json"), trial_config_json(task_name))?;
+    fs::write(
+        trial_dir.join("config.json"),
+        trial_config_json(task_name, agent),
+    )?;
     fs::write(
         trial_dir.join("result.json"),
         trial_result_json(passed, reward.trim()),
@@ -208,12 +214,7 @@ fn validate_task_path(task_path: &Path) -> Result<(), CliError> {
         )));
     }
 
-    for relative in [
-        "instruction.md",
-        "task.toml",
-        "solution/solve.sh",
-        "tests/test.sh",
-    ] {
+    for relative in ["instruction.md", "task.toml", "tests/test.sh"] {
         let path = task_path.join(relative);
 
         if !path.is_file() {
@@ -227,7 +228,42 @@ fn validate_task_path(task_path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentKind {
+    Oracle,
+    Nop,
+}
+
+impl AgentKind {
+    fn parse(value: &str) -> Result<Self, CliError> {
+        match value {
+            "oracle" => Ok(Self::Oracle),
+            "nop" => Ok(Self::Nop),
+            unsupported => Err(CliError::unimplemented(format!(
+                "agent `{unsupported}` is not implemented yet"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Oracle => "oracle",
+            Self::Nop => "nop",
+        }
+    }
+
+    fn requires_model(self) -> bool {
+        false
+    }
+
+    fn sandbox_agent(self) -> SandboxAgent {
+        match self {
+            Self::Oracle => SandboxAgent::Oracle,
+            Self::Nop => SandboxAgent::Nop,
+        }
+    }
+}
+
 struct TrialOutcome {
     task_name: String,
     reward: String,
@@ -305,9 +341,10 @@ fn sanitize_name(value: &str) -> String {
         .collect()
 }
 
-fn job_config_json(target: &RunTarget, options: &RunOptions) -> String {
+fn job_config_json(target: &RunTarget, options: &RunOptions, agent: AgentKind) -> String {
     format!(
-        "{{\n  \"agent\": \"oracle\",\n  \"backend\": \"{}\",\n  \"model\": {},\n  \"target\": \"{}\",\n  \"tasks\": {}\n}}\n",
+        "{{\n  \"agent\": \"{}\",\n  \"backend\": \"{}\",\n  \"model\": {},\n  \"target\": \"{}\",\n  \"tasks\": {}\n}}\n",
+        agent.as_str(),
         options.backend.as_str(),
         json_option(options.model.as_deref()),
         json_escape(&target.name),
@@ -344,8 +381,12 @@ fn trial_result_json(passed: bool, reward: &str) -> String {
     )
 }
 
-fn trial_config_json(task_name: &str) -> String {
-    format!("{{\n  \"task\": \"{}\"\n}}\n", json_escape(task_name))
+fn trial_config_json(task_name: &str, agent: AgentKind) -> String {
+    format!(
+        "{{\n  \"task\": \"{}\",\n  \"agent\": \"{}\"\n}}\n",
+        json_escape(task_name),
+        agent.as_str()
+    )
 }
 
 fn aggregate_reward(outcomes: &[TrialOutcome]) -> String {
@@ -397,12 +438,13 @@ fn json_array(values: &[&str]) -> String {
     format!("[{items}]")
 }
 
-fn trajectory_json(output: &Output) -> String {
+fn trajectory_json(step: &AgentStep) -> String {
     format!(
-        "{{\n  \"steps\": [\n    {{\n      \"command\": \"solution/solve.sh\",\n      \"status\": {},\n      \"stdout\": \"{}\",\n      \"stderr\": \"{}\"\n    }}\n  ]\n}}\n",
-        output.status.code().unwrap_or_default(),
-        json_escape(&String::from_utf8_lossy(&output.stdout)),
-        json_escape(&String::from_utf8_lossy(&output.stderr))
+        "{{\n  \"steps\": [\n    {{\n      \"command\": \"{}\",\n      \"status\": {},\n      \"stdout\": \"{}\",\n      \"stderr\": \"{}\"\n    }}\n  ]\n}}\n",
+        json_escape(&step.command),
+        step.status,
+        json_escape(&String::from_utf8_lossy(&step.stdout)),
+        json_escape(&String::from_utf8_lossy(&step.stderr))
     )
 }
 
@@ -593,15 +635,15 @@ fn print_run_help() {
     println!(
         "\
 Usage:
-  seaport run -p <path> -a <agent> -m <model> [options]
-  seaport run -d <dataset> -a <agent> -m <model> [options]
+  seaport run -p <path> [options]
+  seaport run -d <dataset> [options]
 
 Options:
   -p, --path <path>       Local task or dataset directory
   -d, --dataset <name>    Registered dataset name
       --registry-path <path>
                           Harbor registry JSON for -d datasets
-  -a, --agent <agent>     Agent adapter name
+  -a, --agent <agent>     Agent adapter name; defaults to oracle
   -m, --model <model>     Model identifier
   -n <count>              Concurrency
       --jobs-dir <path>   Directory where job results are written
@@ -899,12 +941,31 @@ mod tests {
     }
 
     #[test]
-    fn run_requires_agent_and_model() {
-        let args = strings(["run", "-p", "tasks/example"]);
+    fn run_defaults_to_oracle_agent() {
+        let root = temp_test_dir("default-agent");
+        let task = root.join("task");
+        let jobs = root.join("jobs");
 
-        let error = run(args).expect_err("error");
+        write_oracle_task(&task, "acme/default-agent");
 
-        assert_eq!(error.exit_code(), EXIT_USAGE);
+        let args = vec![
+            "run".to_owned(),
+            "-p".to_owned(),
+            task.display().to_string(),
+            "--backend".to_owned(),
+            "unsafe-local".to_owned(),
+            "--jobs-dir".to_owned(),
+            jobs.display().to_string(),
+        ];
+
+        run(args).expect("default oracle run");
+
+        let job_dir = single_child_dir(&jobs);
+        let config = fs::read_to_string(job_dir.join("config.json")).expect("job config");
+
+        assert!(config.contains("\"agent\": \"oracle\""));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -914,6 +975,40 @@ mod tests {
         let error = run(args).expect_err("error");
 
         assert_eq!(error.exit_code(), EXIT_USAGE);
+    }
+
+    #[test]
+    fn runs_nop_agent_without_model_or_solution() {
+        let root = temp_test_dir("nop-agent");
+        let task = root.join("task");
+        let jobs = root.join("jobs");
+
+        write_nop_task(&task, "acme/nop");
+
+        let args = vec![
+            "run".to_owned(),
+            "-p".to_owned(),
+            task.display().to_string(),
+            "-a".to_owned(),
+            "nop".to_owned(),
+            "--backend".to_owned(),
+            "unsafe-local".to_owned(),
+            "--jobs-dir".to_owned(),
+            jobs.display().to_string(),
+        ];
+
+        run(args).expect("nop run");
+
+        let job_dir = single_child_dir(&jobs);
+        let trial_dir = job_dir.join("acme-nop");
+        let result = fs::read_to_string(job_dir.join("result.json")).expect("job result");
+        let trajectory = fs::read_to_string(trial_dir.join("agent").join("trajectory.json"))
+            .expect("trajectory");
+
+        assert!(result.contains("\"tasks_passed\": 1"));
+        assert!(trajectory.contains("\"command\": \"nop\""));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1040,6 +1135,22 @@ mod tests {
         .expect("test");
 
         make_executable(&solve).expect("solve executable");
+        make_executable(&test).expect("test executable");
+    }
+
+    fn write_nop_task(root: &Path, name: &str) {
+        fs::create_dir_all(root.join("tests")).expect("tests dir");
+        fs::write(root.join("instruction.md"), "No-op task.\n").expect("instruction");
+        fs::write(root.join("task.toml"), task_toml(name)).expect("task toml");
+
+        let test = root.join("tests").join("test.sh");
+
+        fs::write(
+            &test,
+            "#!/bin/bash\nset -euo pipefail\nmkdir -p \"$LOGS_DIR\"\necho 1 > \"$LOGS_DIR/reward.txt\"\n",
+        )
+        .expect("test");
+
         make_executable(&test).expect("test executable");
     }
 
