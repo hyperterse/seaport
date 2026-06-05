@@ -5,6 +5,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::{mpsc, Mutex};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod registry;
@@ -123,11 +125,9 @@ fn run_target(target: &RunTarget, options: &RunOptions, agent: AgentKind) -> Res
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("jobs"));
     let job_dir = job_root.join(format!("seaport-{run_id}"));
-    let mut outcomes = Vec::with_capacity(target.tasks.len());
-
-    for task in &target.tasks {
-        outcomes.push(run_trial(task, &job_dir, &run_id, options, agent)?);
-    }
+    let plans = trial_plans(target, options);
+    let concurrency = options.concurrency.min(plans.len().max(1));
+    let outcomes = run_trial_plans(&plans, &job_dir, &run_id, options, agent, concurrency)?;
 
     fs::write(
         job_dir.join("config.json"),
@@ -154,21 +154,90 @@ fn run_target(target: &RunTarget, options: &RunOptions, agent: AgentKind) -> Res
     }
 }
 
+#[derive(Clone, Copy)]
+struct TrialPlan<'a> {
+    task: &'a TaskRef,
+    attempt: usize,
+}
+
+fn trial_plans<'a>(target: &'a RunTarget, options: &RunOptions) -> Vec<TrialPlan<'a>> {
+    let mut plans = Vec::with_capacity(target.tasks.len() * options.attempts);
+
+    for task in &target.tasks {
+        for attempt in 1..=options.attempts {
+            plans.push(TrialPlan { task, attempt });
+        }
+    }
+
+    plans
+}
+
+fn run_trial_plans(
+    plans: &[TrialPlan<'_>],
+    job_dir: &Path,
+    run_id: &str,
+    options: &RunOptions,
+    agent: AgentKind,
+    concurrency: usize,
+) -> Result<Vec<TrialOutcome>, CliError> {
+    let work = Mutex::new((0..plans.len()).collect::<Vec<_>>());
+    let (sender, receiver) = mpsc::channel();
+
+    thread::scope(|scope| {
+        for _ in 0..concurrency {
+            let sender = sender.clone();
+            let work = &work;
+
+            scope.spawn(move || loop {
+                let index = {
+                    let mut work = work.lock().expect("trial queue");
+                    work.pop()
+                };
+                let Some(index) = index else {
+                    break;
+                };
+                let plan = plans[index];
+                let result = run_trial(plan.task, plan.attempt, job_dir, run_id, options, agent);
+
+                if sender.send((index, result)).is_err() {
+                    break;
+                }
+            });
+        }
+    });
+
+    drop(sender);
+
+    let mut outcomes = (0..plans.len()).map(|_| None).collect::<Vec<_>>();
+
+    for (index, result) in receiver {
+        outcomes[index] = Some(result?);
+    }
+
+    outcomes
+        .into_iter()
+        .map(|outcome| outcome.ok_or_else(|| CliError::task_failed("trial worker stopped early")))
+        .collect()
+}
+
 fn run_trial(
     task: &TaskRef,
+    attempt: usize,
     job_dir: &Path,
     run_id: &str,
     options: &RunOptions,
     agent: AgentKind,
 ) -> Result<TrialOutcome, CliError> {
     let task_name = &task.name;
-    let trial_dir = job_dir.join(sanitize_name(task_name));
+    let trial_name = trial_dir_name(task_name, attempt, options.attempts);
+    let trial_run_id = format!("{run_id}-{trial_name}");
+    let trial_dir = job_dir.join(&trial_name);
     let agent_dir = trial_dir.join("agent");
     let verifier_dir = trial_dir.join("verifier");
     let workspace = env::temp_dir().join(format!(
         "seaport-{}-{run_id}-{}",
         agent.as_str(options),
-        sanitize_name(&task.name)
+        trial_name
     ));
     let app_dir = workspace.join("app");
     let logs_dir = workspace.join("logs").join("verifier");
@@ -186,7 +255,7 @@ fn run_trial(
     let phase_envs = options.phase_envs();
     let outputs = run_task_scripts(
         &task.path,
-        run_id,
+        &trial_run_id,
         &app_dir,
         &logs_dir,
         &sandbox_agent,
@@ -211,7 +280,7 @@ fn run_trial(
     fs::write(verifier_dir.join("reward.txt"), &reward)?;
     fs::write(
         trial_dir.join("config.json"),
-        trial_config_json(task_name, agent, options),
+        trial_config_json(task_name, attempt, agent, options),
     )?;
     fs::write(
         trial_dir.join("result.json"),
@@ -231,9 +300,20 @@ fn run_trial(
 
     Ok(TrialOutcome {
         task_name: task.name.clone(),
+        attempt,
         reward: reward.trim().to_owned(),
         passed,
     })
+}
+
+fn trial_dir_name(task_name: &str, attempt: usize, attempts: usize) -> String {
+    let base = sanitize_name(task_name);
+
+    if attempts == 1 {
+        base
+    } else {
+        format!("{base}-attempt-{attempt}")
+    }
 }
 
 fn validate_task_path(task_path: &Path) -> Result<(), CliError> {
@@ -339,6 +419,7 @@ fn shell_quote(value: &str) -> String {
 
 struct TrialOutcome {
     task_name: String,
+    attempt: usize,
     reward: String,
     passed: bool,
 }
@@ -416,9 +497,11 @@ fn sanitize_name(value: &str) -> String {
 
 fn job_config_json(target: &RunTarget, options: &RunOptions, agent: AgentKind) -> String {
     format!(
-        "{{\n  \"agent\": \"{}\",\n  \"agent_command\": {},\n  \"backend\": \"{}\",\n  \"model\": {},\n  \"target\": \"{}\",\n  \"tasks\": {}\n}}\n",
+        "{{\n  \"agent\": \"{}\",\n  \"agent_command\": {},\n  \"attempts\": {},\n  \"concurrency\": {},\n  \"backend\": \"{}\",\n  \"model\": {},\n  \"target\": \"{}\",\n  \"tasks\": {}\n}}\n",
         agent.as_str(options),
         json_option(options.agent_command.as_deref()),
+        options.attempts,
+        options.concurrency,
         options.backend.as_str(),
         json_option(options.model.as_deref()),
         json_escape(&target.name),
@@ -455,10 +538,16 @@ fn trial_result_json(passed: bool, reward: &str) -> String {
     )
 }
 
-fn trial_config_json(task_name: &str, agent: AgentKind, options: &RunOptions) -> String {
+fn trial_config_json(
+    task_name: &str,
+    attempt: usize,
+    agent: AgentKind,
+    options: &RunOptions,
+) -> String {
     format!(
-        "{{\n  \"task\": \"{}\",\n  \"agent\": \"{}\"\n}}\n",
+        "{{\n  \"task\": \"{}\",\n  \"attempt\": {},\n  \"agent\": \"{}\"\n}}\n",
         json_escape(task_name),
+        attempt,
         agent.as_str(options)
     )
 }
@@ -490,8 +579,9 @@ fn trial_outcomes_json(outcomes: &[TrialOutcome]) -> String {
         .iter()
         .map(|outcome| {
             format!(
-                "{{\"task\":\"{}\",\"passed\":{},\"reward\":\"{}\"}}",
+                "{{\"task\":\"{}\",\"attempt\":{},\"passed\":{},\"reward\":\"{}\"}}",
                 json_escape(&outcome.task_name),
+                outcome.attempt,
                 outcome.passed,
                 json_escape(&outcome.reward)
             )
@@ -733,6 +823,8 @@ Options:
                           Environment variable for the verifier phase
   -m, --model <model>     Model identifier
   -n <count>              Concurrency
+  -k, --n-attempts <count>
+                          Number of attempts per task
       --jobs-dir <path>   Directory where job results are written
       --backend <name>    Execution backend: docker or unsafe-local
       --env <name>        Alias for --backend
@@ -790,7 +882,8 @@ struct RunOptions {
     agent_env: Vec<(String, String)>,
     verifier_env: Vec<(String, String)>,
     model: Option<String>,
-    concurrency: Option<String>,
+    concurrency: usize,
+    attempts: usize,
     backend: SandboxBackend,
     jobs_dir: Option<String>,
     selection: TaskSelection,
@@ -810,7 +903,8 @@ impl Default for RunOptions {
             agent_env: Vec::new(),
             verifier_env: Vec::new(),
             model: None,
-            concurrency: None,
+            concurrency: 4,
+            attempts: 1,
             backend: SandboxBackend::Docker,
             jobs_dir: None,
             selection: TaskSelection::default(),
@@ -876,7 +970,13 @@ impl RunOptions {
                     index += 2;
                 }
                 "-n" => {
-                    options.concurrency = Some(required_value(args, index, flag)?);
+                    let value = required_value(args, index, flag)?;
+                    options.concurrency = parse_positive_usize(flag, &value)?;
+                    index += 2;
+                }
+                "-k" | "--n-attempts" => {
+                    let value = required_value(args, index, flag)?;
+                    options.attempts = parse_positive_usize(flag, &value)?;
                     index += 2;
                 }
                 "--backend" | "--env" => {
@@ -904,10 +1004,7 @@ impl RunOptions {
                 }
                 "-l" | "--n-tasks" => {
                     let value = required_value(args, index, flag)?;
-                    options.selection.task_limit =
-                        Some(value.parse::<usize>().map_err(|error| {
-                            CliError::usage(format!("{flag} must be a positive integer: {error}"))
-                        })?);
+                    options.selection.task_limit = Some(parse_positive_usize(flag, &value)?);
                     index += 2;
                 }
                 unknown => {
@@ -986,6 +1083,18 @@ fn parse_env_assignment(flag: &str, value: &str) -> Result<(String, String), Cli
     }
 
     Ok((name.to_owned(), value.to_owned()))
+}
+
+fn parse_positive_usize(flag: &str, value: &str) -> Result<usize, CliError> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|error| CliError::usage(format!("{flag} must be a positive integer: {error}")))?;
+
+    if parsed == 0 {
+        return Err(CliError::usage(format!("{flag} must be greater than zero")));
+    }
+
+    Ok(parsed)
 }
 
 #[derive(Debug)]
@@ -1071,6 +1180,8 @@ mod tests {
             "anthropic/claude",
             "-n",
             "8",
+            "-k",
+            "2",
             "--env",
             "docker",
             "--jobs-dir",
@@ -1087,7 +1198,8 @@ mod tests {
 
         assert_eq!(options.dataset.as_deref(), Some("bench/example@1.0"));
         assert_eq!(options.registry_path.as_deref(), Some("registry.json"));
-        assert_eq!(options.concurrency.as_deref(), Some("8"));
+        assert_eq!(options.concurrency, 8);
+        assert_eq!(options.attempts, 2);
         assert_eq!(options.backend, SandboxBackend::Docker);
         assert_eq!(options.jobs_dir.as_deref(), Some("jobs/custom"));
         assert_eq!(options.selection.include_task_names, ["bench/*"]);
@@ -1234,6 +1346,46 @@ mod tests {
         let config = fs::read_to_string(job_dir.join("config.json")).expect("job config");
 
         assert!(config.contains("\"agent\": \"oracle\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runs_multiple_attempts_with_concurrency() {
+        let root = temp_test_dir("attempts");
+        let task = root.join("task");
+        let jobs = root.join("jobs");
+
+        write_oracle_task(&task, "acme/attempts");
+
+        let args = vec![
+            "run".to_owned(),
+            "-p".to_owned(),
+            task.display().to_string(),
+            "-a".to_owned(),
+            "oracle".to_owned(),
+            "-k".to_owned(),
+            "2".to_owned(),
+            "-n".to_owned(),
+            "2".to_owned(),
+            "--backend".to_owned(),
+            "unsafe-local".to_owned(),
+            "--jobs-dir".to_owned(),
+            jobs.display().to_string(),
+        ];
+
+        run(args).expect("attempted run");
+
+        let job_dir = single_child_dir(&jobs);
+        let result = fs::read_to_string(job_dir.join("result.json")).expect("job result");
+        let config = fs::read_to_string(job_dir.join("config.json")).expect("job config");
+
+        assert!(result.contains("\"tasks_total\": 2"));
+        assert!(result.contains("\"tasks_passed\": 2"));
+        assert!(result.contains("\"attempt\":1"));
+        assert!(result.contains("\"attempt\":2"));
+        assert!(config.contains("\"attempts\": 2"));
+        assert!(config.contains("\"concurrency\": 2"));
 
         let _ = fs::remove_dir_all(root);
     }
