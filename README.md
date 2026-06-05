@@ -19,6 +19,7 @@ Seaport currently includes:
 - `seaport init --task <org/name>`
 - `seaport view --help`
 - sandboxed Docker execution for oracle tasks
+- Harbor-compatible local dataset execution for task directories
 - a deterministic in-memory evaluation core
 - structured errors, telemetry, unit tests, integration tests, examples, and CI
 
@@ -219,6 +220,22 @@ Run the oracle solution for a local task:
 seaport run -p examples/tasks/basic-evaluation -a oracle
 ```
 
+Run every task in a Harbor-compatible local dataset directory:
+
+```sh
+seaport run -p path/to/dataset -a oracle
+```
+
+Seaport treats a directory with immediate task subdirectories as a local dataset,
+matching Harbor's local path behavior. Use Harbor-style task selection flags:
+
+```sh
+seaport run -p path/to/dataset -a oracle \
+  -i 'swe-bench/*' \
+  -x 'swe-bench/skip-*' \
+  -l 100
+```
+
 The intended non-oracle local-task command is:
 
 ```sh
@@ -231,9 +248,9 @@ The intended registered-dataset command is:
 seaport run -d acme/hello-world@1.0 -a codex -m openai/gpt-5
 ```
 
-The CLI currently runs oracle tasks and fails with a clear not-implemented
-message for non-oracle agents. The next implementation stage should wire agent
-adapters into the same sandboxed execution backend.
+The CLI currently runs oracle tasks and local oracle datasets, then fails with a
+clear not-implemented message for non-oracle agents. The next implementation
+stage should wire agent adapters into the same sandboxed execution backend.
 
 ## Expected Job Output
 

@@ -8,8 +8,10 @@ use std::process::{self, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod sandbox;
+mod target;
 
 use sandbox::{prepare_container_writable_dir, run_task_scripts, SandboxBackend};
+use target::{RunTarget, TaskRef, TaskSelection};
 
 const EXIT_USAGE: i32 = 2;
 const EXIT_UNIMPLEMENTED: i32 = 3;
@@ -67,7 +69,7 @@ fn run_eval(args: &[String]) -> Result<(), CliError> {
         ));
     }
 
-    let task_path = options
+    let path = options
         .path
         .as_deref()
         .ok_or_else(|| CliError::usage("run requires `-p <path>` for local tasks"))?;
@@ -78,14 +80,11 @@ fn run_eval(args: &[String]) -> Result<(), CliError> {
         ));
     }
 
-    run_oracle_task(Path::new(task_path), &options)
+    let target = RunTarget::from_path(Path::new(path), &options.selection)?;
+    run_oracle_target(&target, &options)
 }
 
-fn run_oracle_task(task_path: &Path, options: &RunOptions) -> Result<(), CliError> {
-    validate_task_path(task_path)?;
-
-    let task_path = task_path.canonicalize()?;
-    let task_name = task_name(&task_path)?;
+fn run_oracle_target(target: &RunTarget, options: &RunOptions) -> Result<(), CliError> {
     let run_id = timestamp_id()?;
     let job_root = options
         .jobs_dir
@@ -93,10 +92,51 @@ fn run_oracle_task(task_path: &Path, options: &RunOptions) -> Result<(), CliErro
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("jobs"));
     let job_dir = job_root.join(format!("seaport-{run_id}"));
-    let trial_dir = job_dir.join(sanitize_name(&task_name));
+    let mut outcomes = Vec::with_capacity(target.tasks.len());
+
+    for task in &target.tasks {
+        outcomes.push(run_oracle_trial(task, &job_dir, &run_id, options)?);
+    }
+
+    fs::write(
+        job_dir.join("config.json"),
+        job_config_json(target, options),
+    )?;
+    fs::write(job_dir.join("result.json"), job_result_json(&outcomes))?;
+
+    let passed = outcomes.iter().all(|outcome| outcome.passed);
+    let passed_count = outcomes.iter().filter(|outcome| outcome.passed).count();
+
+    println!("job_dir: {}", job_dir.display());
+    println!("target: {}", target.name);
+    println!("tasks: {passed_count}/{}", outcomes.len());
+    println!("passed: {passed}");
+
+    if passed {
+        Ok(())
+    } else {
+        Err(CliError::task_failed(format!(
+            "{}/{} tasks failed",
+            outcomes.len() - passed_count,
+            outcomes.len()
+        )))
+    }
+}
+
+fn run_oracle_trial(
+    task: &TaskRef,
+    job_dir: &Path,
+    run_id: &str,
+    options: &RunOptions,
+) -> Result<TrialOutcome, CliError> {
+    let task_name = &task.name;
+    let trial_dir = job_dir.join(sanitize_name(task_name));
     let agent_dir = trial_dir.join("agent");
     let verifier_dir = trial_dir.join("verifier");
-    let workspace = env::temp_dir().join(format!("seaport-oracle-{run_id}"));
+    let workspace = env::temp_dir().join(format!(
+        "seaport-oracle-{run_id}-{}",
+        sanitize_name(&task.name)
+    ));
     let app_dir = workspace.join("app");
     let logs_dir = workspace.join("logs").join("verifier");
 
@@ -109,7 +149,7 @@ fn run_oracle_task(task_path: &Path, options: &RunOptions) -> Result<(), CliErro
     prepare_container_writable_dir(&workspace.join("logs"))?;
     prepare_container_writable_dir(&logs_dir)?;
 
-    let outputs = run_task_scripts(&task_path, &run_id, &app_dir, &logs_dir, options.backend)?;
+    let outputs = run_task_scripts(&task.path, run_id, &app_dir, &logs_dir, options.backend)?;
     let reward = read_reward(&logs_dir)?;
     let passed = reward.trim() == "1" || reward.trim() == "1.0";
 
@@ -126,15 +166,7 @@ fn run_oracle_task(task_path: &Path, options: &RunOptions) -> Result<(), CliErro
         &outputs.verifier.stderr,
     )?;
     fs::write(verifier_dir.join("reward.txt"), &reward)?;
-    fs::write(
-        job_dir.join("config.json"),
-        job_config_json(&task_name, options),
-    )?;
-    fs::write(
-        job_dir.join("result.json"),
-        job_result_json(passed, reward.trim()),
-    )?;
-    fs::write(trial_dir.join("config.json"), trial_config_json(&task_name))?;
+    fs::write(trial_dir.join("config.json"), trial_config_json(task_name))?;
     fs::write(
         trial_dir.join("result.json"),
         trial_result_json(passed, reward.trim()),
@@ -147,19 +179,15 @@ fn run_oracle_task(task_path: &Path, options: &RunOptions) -> Result<(), CliErro
         );
     }
 
-    println!("job_dir: {}", job_dir.display());
     println!("task: {task_name}");
     println!("reward: {}", reward.trim());
     println!("passed: {passed}");
 
-    if passed {
-        Ok(())
-    } else {
-        Err(CliError::task_failed(format!(
-            "oracle task failed with reward {}",
-            reward.trim()
-        )))
-    }
+    Ok(TrialOutcome {
+        task_name: task.name.clone(),
+        reward: reward.trim().to_owned(),
+        passed,
+    })
 }
 
 fn validate_task_path(task_path: &Path) -> Result<(), CliError> {
@@ -189,6 +217,13 @@ fn validate_task_path(task_path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
+#[derive(Debug)]
+struct TrialOutcome {
+    task_name: String,
+    reward: String,
+    passed: bool,
+}
+
 fn read_reward(logs_dir: &Path) -> Result<String, CliError> {
     let reward_path = logs_dir.join("reward.txt");
 
@@ -205,12 +240,8 @@ fn read_reward(logs_dir: &Path) -> Result<String, CliError> {
 fn task_name(task_path: &Path) -> Result<String, CliError> {
     let task_toml = fs::read_to_string(task_path.join("task.toml"))?;
 
-    for line in task_toml.lines() {
-        let trimmed = line.trim();
-
-        if let Some(value) = trimmed.strip_prefix("name = ") {
-            return Ok(value.trim_matches('"').to_owned());
-        }
+    if let Some(name) = toml_section_value(&task_toml, "task", "name") {
+        return Ok(name);
     }
 
     Ok(task_path
@@ -218,6 +249,29 @@ fn task_name(task_path: &Path) -> Result<String, CliError> {
         .and_then(|name| name.to_str())
         .unwrap_or("task")
         .to_owned())
+}
+
+fn toml_section_value(contents: &str, section: &str, key: &str) -> Option<String> {
+    let section_header = format!("[{section}]");
+    let prefix = format!("{key} = ");
+    let mut in_section = false;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_section = trimmed == section_header;
+            continue;
+        }
+
+        if in_section {
+            if let Some(value) = trimmed.strip_prefix(&prefix) {
+                return Some(value.trim().trim_matches('"').to_owned());
+            }
+        }
+    }
+
+    None
 }
 
 fn timestamp_id() -> Result<String, CliError> {
@@ -241,16 +295,38 @@ fn sanitize_name(value: &str) -> String {
         .collect()
 }
 
-fn job_config_json(task_name: &str, options: &RunOptions) -> String {
+fn job_config_json(target: &RunTarget, options: &RunOptions) -> String {
     format!(
-        "{{\n  \"agent\": \"oracle\",\n  \"backend\": \"{}\",\n  \"model\": {},\n  \"task\": \"{}\"\n}}\n",
+        "{{\n  \"agent\": \"oracle\",\n  \"backend\": \"{}\",\n  \"model\": {},\n  \"target\": \"{}\",\n  \"tasks\": {}\n}}\n",
         options.backend.as_str(),
         json_option(options.model.as_deref()),
-        json_escape(task_name)
+        json_escape(&target.name),
+        json_array(
+            &target
+                .tasks
+                .iter()
+                .map(|task| task.name.as_str())
+                .collect::<Vec<_>>()
+        )
     )
 }
 
-fn job_result_json(passed: bool, reward: &str) -> String {
+fn job_result_json(outcomes: &[TrialOutcome]) -> String {
+    let passed_count = outcomes.iter().filter(|outcome| outcome.passed).count();
+    let reward = aggregate_reward(outcomes);
+
+    format!(
+        "{{\n  \"passed\": {},\n  \"reward\": \"{}\",\n  \"tasks_total\": {},\n  \"tasks_passed\": {},\n  \"tasks_failed\": {},\n  \"tasks\": {}\n}}\n",
+        passed_count == outcomes.len(),
+        json_escape(&reward),
+        outcomes.len(),
+        passed_count,
+        outcomes.len() - passed_count,
+        trial_outcomes_json(outcomes)
+    )
+}
+
+fn trial_result_json(passed: bool, reward: &str) -> String {
     format!(
         "{{\n  \"passed\": {},\n  \"reward\": \"{}\"\n}}\n",
         passed,
@@ -262,8 +338,53 @@ fn trial_config_json(task_name: &str) -> String {
     format!("{{\n  \"task\": \"{}\"\n}}\n", json_escape(task_name))
 }
 
-fn trial_result_json(passed: bool, reward: &str) -> String {
-    job_result_json(passed, reward)
+fn aggregate_reward(outcomes: &[TrialOutcome]) -> String {
+    if outcomes.is_empty() {
+        return "0".to_owned();
+    }
+
+    let mut total = 0.0;
+
+    for outcome in outcomes {
+        let Ok(reward) = outcome.reward.parse::<f64>() else {
+            return if outcomes.iter().all(|outcome| outcome.passed) {
+                "1".to_owned()
+            } else {
+                "0".to_owned()
+            };
+        };
+
+        total += reward;
+    }
+
+    format!("{:.6}", total / outcomes.len() as f64)
+}
+
+fn trial_outcomes_json(outcomes: &[TrialOutcome]) -> String {
+    let items = outcomes
+        .iter()
+        .map(|outcome| {
+            format!(
+                "{{\"task\":\"{}\",\"passed\":{},\"reward\":\"{}\"}}",
+                json_escape(&outcome.task_name),
+                outcome.passed,
+                json_escape(&outcome.reward)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!("[{items}]")
+}
+
+fn json_array(values: &[&str]) -> String {
+    let items = values
+        .iter()
+        .map(|value| format!("\"{}\"", json_escape(value)))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!("[{items}]")
 }
 
 fn trajectory_json(output: &Output) -> String {
@@ -474,6 +595,11 @@ Options:
       --jobs-dir <path>   Directory where job results are written
       --backend <name>    Execution backend: docker or unsafe-local
       --env <name>        Alias for --backend
+  -i, --include-task-name <glob>
+                          Include only matching task names
+  -x, --exclude-task-name <glob>
+                          Exclude matching task names
+  -l, --n-tasks <count>   Limit number of discovered tasks
       --help              Show this help"
     );
 }
@@ -519,6 +645,7 @@ struct RunOptions {
     concurrency: Option<String>,
     backend: SandboxBackend,
     jobs_dir: Option<String>,
+    selection: TaskSelection,
 }
 
 impl Default for RunOptions {
@@ -531,6 +658,7 @@ impl Default for RunOptions {
             concurrency: None,
             backend: SandboxBackend::Docker,
             jobs_dir: None,
+            selection: TaskSelection::default(),
         }
     }
 }
@@ -571,6 +699,28 @@ impl RunOptions {
                 }
                 "--jobs-dir" => {
                     options.jobs_dir = Some(required_value(args, index, flag)?);
+                    index += 2;
+                }
+                "-i" | "--include-task-name" => {
+                    options
+                        .selection
+                        .include_task_names
+                        .push(required_value(args, index, flag)?);
+                    index += 2;
+                }
+                "-x" | "--exclude-task-name" => {
+                    options
+                        .selection
+                        .exclude_task_names
+                        .push(required_value(args, index, flag)?);
+                    index += 2;
+                }
+                "-l" | "--n-tasks" => {
+                    let value = required_value(args, index, flag)?;
+                    options.selection.task_limit =
+                        Some(value.parse::<usize>().map_err(|error| {
+                            CliError::usage(format!("{flag} must be a positive integer: {error}"))
+                        })?);
                     index += 2;
                 }
                 unknown => {
@@ -674,6 +824,12 @@ mod tests {
             "docker",
             "--jobs-dir",
             "jobs/custom",
+            "-i",
+            "bench/*",
+            "-x",
+            "bench/skip-*",
+            "-l",
+            "5",
         ]);
 
         let options = RunOptions::parse(&args).expect("options");
@@ -682,6 +838,9 @@ mod tests {
         assert_eq!(options.concurrency.as_deref(), Some("8"));
         assert_eq!(options.backend, SandboxBackend::Docker);
         assert_eq!(options.jobs_dir.as_deref(), Some("jobs/custom"));
+        assert_eq!(options.selection.include_task_names, ["bench/*"]);
+        assert_eq!(options.selection.exclude_task_names, ["bench/skip-*"]);
+        assert_eq!(options.selection.task_limit, Some(5));
     }
 
     #[test]
@@ -736,7 +895,93 @@ mod tests {
         assert_eq!(error.exit_code(), EXIT_USAGE);
     }
 
+    #[test]
+    fn runs_harbor_style_local_dataset() {
+        let root = temp_test_dir("local-dataset");
+        let dataset = root.join("suite");
+        let jobs = root.join("jobs");
+
+        fs::create_dir_all(&dataset).expect("dataset dir");
+        fs::write(
+            dataset.join("dataset.toml"),
+            "[dataset]\nname = \"acme/suite\"\ndescription = \"test suite\"\n",
+        )
+        .expect("dataset manifest");
+        write_oracle_task(&dataset.join("one"), "acme/one");
+        write_oracle_task(&dataset.join("two"), "acme/two");
+
+        let args = vec![
+            "run".to_owned(),
+            "-p".to_owned(),
+            dataset.display().to_string(),
+            "-a".to_owned(),
+            "oracle".to_owned(),
+            "--backend".to_owned(),
+            "unsafe-local".to_owned(),
+            "--jobs-dir".to_owned(),
+            jobs.display().to_string(),
+            "-i".to_owned(),
+            "acme/*".to_owned(),
+            "-x".to_owned(),
+            "acme/two".to_owned(),
+        ];
+
+        run(args).expect("dataset run");
+
+        let job_dir = single_child_dir(&jobs);
+        let result = fs::read_to_string(job_dir.join("result.json")).expect("job result");
+        let config = fs::read_to_string(job_dir.join("config.json")).expect("job config");
+
+        assert!(result.contains("\"tasks_total\": 1"));
+        assert!(result.contains("\"tasks_passed\": 1"));
+        assert!(config.contains("\"target\": \"acme/suite\""));
+        assert!(config.contains("\"acme/one\""));
+        assert!(!config.contains("\"acme/two\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
     fn strings<const N: usize>(items: [&str; N]) -> Vec<String> {
         items.into_iter().map(str::to_owned).collect()
+    }
+
+    fn temp_test_dir(name: &str) -> PathBuf {
+        let id = timestamp_id().expect("timestamp");
+        env::temp_dir().join(format!("seaport-{name}-{id}"))
+    }
+
+    fn write_oracle_task(root: &Path, name: &str) {
+        fs::create_dir_all(root.join("solution")).expect("solution dir");
+        fs::create_dir_all(root.join("tests")).expect("tests dir");
+        fs::write(root.join("instruction.md"), "Create output.txt.\n").expect("instruction");
+        fs::write(root.join("task.toml"), task_toml(name)).expect("task toml");
+
+        let solve = root.join("solution").join("solve.sh");
+        let test = root.join("tests").join("test.sh");
+
+        fs::write(
+            &solve,
+            "#!/bin/bash\nset -euo pipefail\nprintf 'ok\\n' > \"$APP_DIR/output.txt\"\n",
+        )
+        .expect("solve");
+        fs::write(
+            &test,
+            "#!/bin/bash\nset -euo pipefail\nmkdir -p \"$LOGS_DIR\"\nif [ \"$(cat \"$APP_DIR/output.txt\")\" = \"ok\" ]; then echo 1 > \"$LOGS_DIR/reward.txt\"; else echo 0 > \"$LOGS_DIR/reward.txt\"; fi\n",
+        )
+        .expect("test");
+
+        make_executable(&solve).expect("solve executable");
+        make_executable(&test).expect("test executable");
+    }
+
+    fn single_child_dir(path: &Path) -> PathBuf {
+        let children = fs::read_dir(path)
+            .expect("read jobs")
+            .map(|entry| entry.expect("entry").path())
+            .filter(|path| path.is_dir())
+            .collect::<Vec<_>>();
+
+        assert_eq!(children.len(), 1);
+        children.into_iter().next().expect("job dir")
     }
 }
