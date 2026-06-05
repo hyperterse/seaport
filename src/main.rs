@@ -15,8 +15,8 @@ use registry::{
     resolve_git_task_source, resolve_local_registry_dataset, resolve_local_registry_task,
 };
 use sandbox::{
-    prepare_container_writable_dir, run_task_scripts, AgentStep, ExternalAgent, SandboxAgent,
-    SandboxBackend,
+    prepare_container_writable_dir, run_task_scripts, AgentStep, ExternalAgent, PhaseEnvs,
+    SandboxAgent, SandboxBackend,
 };
 use target::{RunTarget, TaskRef, TaskSelection};
 
@@ -183,12 +183,14 @@ fn run_trial(
     prepare_container_writable_dir(&logs_dir)?;
 
     let sandbox_agent = agent.sandbox_agent(options)?;
+    let phase_envs = options.phase_envs();
     let outputs = run_task_scripts(
         &task.path,
         run_id,
         &app_dir,
         &logs_dir,
         &sandbox_agent,
+        &phase_envs,
         options.backend,
     )?;
     let reward = read_reward(&logs_dir)?;
@@ -725,6 +727,10 @@ Options:
   -a, --agent <agent>     Agent adapter name; defaults to oracle
       --agent-command <shell>
                           Shell command for custom or not-yet-native agents
+      --ae, --agent-env KEY=VALUE
+                          Environment variable for the agent phase
+      --ve, --verifier-env KEY=VALUE
+                          Environment variable for the verifier phase
   -m, --model <model>     Model identifier
   -n <count>              Concurrency
       --jobs-dir <path>   Directory where job results are written
@@ -781,6 +787,8 @@ struct RunOptions {
     registry_path: Option<String>,
     agent: Option<String>,
     agent_command: Option<String>,
+    agent_env: Vec<(String, String)>,
+    verifier_env: Vec<(String, String)>,
     model: Option<String>,
     concurrency: Option<String>,
     backend: SandboxBackend,
@@ -799,6 +807,8 @@ impl Default for RunOptions {
             registry_path: None,
             agent: None,
             agent_command: None,
+            agent_env: Vec::new(),
+            verifier_env: Vec::new(),
             model: None,
             concurrency: None,
             backend: SandboxBackend::Docker,
@@ -847,6 +857,18 @@ impl RunOptions {
                 }
                 "--agent-command" => {
                     options.agent_command = Some(required_value(args, index, flag)?);
+                    index += 2;
+                }
+                "--ae" | "--agent-env" => {
+                    let value = required_value(args, index, flag)?;
+                    options.agent_env.push(parse_env_assignment(flag, &value)?);
+                    index += 2;
+                }
+                "--ve" | "--verifier-env" => {
+                    let value = required_value(args, index, flag)?;
+                    options
+                        .verifier_env
+                        .push(parse_env_assignment(flag, &value)?);
                     index += 2;
                 }
                 "-m" | "--model" => {
@@ -939,12 +961,31 @@ impl RunOptions {
 
         Ok(())
     }
+
+    fn phase_envs(&self) -> PhaseEnvs {
+        PhaseEnvs {
+            agent: self.agent_env.clone(),
+            verifier: self.verifier_env.clone(),
+        }
+    }
 }
 
 fn required_value(args: &[String], index: usize, flag: &str) -> Result<String, CliError> {
     args.get(index + 1)
         .cloned()
         .ok_or_else(|| CliError::usage(format!("{flag} requires a value")))
+}
+
+fn parse_env_assignment(flag: &str, value: &str) -> Result<(String, String), CliError> {
+    let (name, value) = value
+        .split_once('=')
+        .ok_or_else(|| CliError::usage(format!("{flag} requires KEY=VALUE")))?;
+
+    if name.is_empty() {
+        return Err(CliError::usage(format!("{flag} requires a non-empty KEY")));
+    }
+
+    Ok((name.to_owned(), value.to_owned()))
 }
 
 #[derive(Debug)]
@@ -1093,6 +1134,31 @@ mod tests {
     }
 
     #[test]
+    fn parses_phase_environment_options() {
+        let args = strings([
+            "-p",
+            "tasks/example",
+            "-a",
+            "custom",
+            "--ae",
+            "OPENAI_API_KEY=test-key",
+            "--verifier-env",
+            "EXPECTED=ok",
+        ]);
+
+        let options = RunOptions::parse(&args).expect("options");
+
+        assert_eq!(
+            options.agent_env,
+            [("OPENAI_API_KEY".to_owned(), "test-key".to_owned())]
+        );
+        assert_eq!(
+            options.verifier_env,
+            [("EXPECTED".to_owned(), "ok".to_owned())]
+        );
+    }
+
+    #[test]
     fn parses_unsafe_local_backend() {
         let args = strings([
             "-p",
@@ -1230,7 +1296,9 @@ mod tests {
             "-a".to_owned(),
             "custom".to_owned(),
             "--agent-command".to_owned(),
-            "printf 'ok\\n' > \"$APP_DIR/output.txt\"".to_owned(),
+            "printf '%s\\n' \"$SEAPORT_TEST_VALUE\" > \"$APP_DIR/output.txt\"".to_owned(),
+            "--ae".to_owned(),
+            "SEAPORT_TEST_VALUE=ok".to_owned(),
             "--backend".to_owned(),
             "unsafe-local".to_owned(),
             "--jobs-dir".to_owned(),
@@ -1245,7 +1313,39 @@ mod tests {
 
         assert!(result.contains("\"tasks_passed\": 1"));
         assert!(config.contains("\"agent\": \"custom\""));
-        assert!(config.contains("\"agent_command\": \"printf 'ok\\\\n'"));
+        assert!(config.contains("\"agent_command\": \"printf '%s\\\\n'"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn passes_environment_to_verifier_phase() {
+        let root = temp_test_dir("verifier-env");
+        let task = root.join("task");
+        let jobs = root.join("jobs");
+
+        write_verifier_env_task(&task, "acme/verifier-env");
+
+        let args = vec![
+            "run".to_owned(),
+            "-p".to_owned(),
+            task.display().to_string(),
+            "-a".to_owned(),
+            "nop".to_owned(),
+            "--ve".to_owned(),
+            "SEAPORT_EXPECTED=ok".to_owned(),
+            "--backend".to_owned(),
+            "unsafe-local".to_owned(),
+            "--jobs-dir".to_owned(),
+            jobs.display().to_string(),
+        ];
+
+        run(args).expect("verifier env run");
+
+        let job_dir = single_child_dir(&jobs);
+        let result = fs::read_to_string(job_dir.join("result.json")).expect("job result");
+
+        assert!(result.contains("\"tasks_passed\": 1"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1503,6 +1603,22 @@ mod tests {
         fs::write(
             &test,
             "#!/bin/bash\nset -euo pipefail\nmkdir -p \"$LOGS_DIR\"\nif [ \"$(cat \"$APP_DIR/output.txt\")\" = \"ok\" ]; then echo 1 > \"$LOGS_DIR/reward.txt\"; else echo 0 > \"$LOGS_DIR/reward.txt\"; fi\n",
+        )
+        .expect("test");
+
+        make_executable(&test).expect("test executable");
+    }
+
+    fn write_verifier_env_task(root: &Path, name: &str) {
+        fs::create_dir_all(root.join("tests")).expect("tests dir");
+        fs::write(root.join("instruction.md"), "Verifier env task.\n").expect("instruction");
+        fs::write(root.join("task.toml"), task_toml(name)).expect("task toml");
+
+        let test = root.join("tests").join("test.sh");
+
+        fs::write(
+            &test,
+            "#!/bin/bash\nset -euo pipefail\nmkdir -p \"$LOGS_DIR\"\nif [ \"$SEAPORT_EXPECTED\" = \"ok\" ]; then echo 1 > \"$LOGS_DIR/reward.txt\"; else echo 0 > \"$LOGS_DIR/reward.txt\"; fi\n",
         )
         .expect("test");
 

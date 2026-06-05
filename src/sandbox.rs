@@ -60,22 +60,35 @@ pub(crate) struct ExternalAgent {
     pub(crate) model: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PhaseEnvs {
+    pub(crate) agent: Vec<(String, String)>,
+    pub(crate) verifier: Vec<(String, String)>,
+}
+
 pub(crate) fn run_task_scripts(
     task_path: &Path,
     run_id: &str,
     app_dir: &Path,
     logs_dir: &Path,
     agent: &SandboxAgent,
+    envs: &PhaseEnvs,
     backend: SandboxBackend,
 ) -> Result<ScriptOutputs, CliError> {
     let environment = task_environment(task_path)?;
 
     match backend {
-        SandboxBackend::Docker => {
-            run_scripts_in_docker(task_path, run_id, app_dir, logs_dir, agent, &environment)
-        }
+        SandboxBackend::Docker => run_scripts_in_docker(
+            task_path,
+            run_id,
+            app_dir,
+            logs_dir,
+            agent,
+            envs,
+            &environment,
+        ),
         SandboxBackend::UnsafeLocal => {
-            run_scripts_locally(task_path, app_dir, logs_dir, agent, &environment)
+            run_scripts_locally(task_path, app_dir, logs_dir, agent, envs, &environment)
         }
     }
 }
@@ -102,6 +115,7 @@ fn run_scripts_in_docker(
     app_dir: &Path,
     logs_dir: &Path,
     agent_kind: &SandboxAgent,
+    envs: &PhaseEnvs,
     environment: &TaskEnvironment,
 ) -> Result<ScriptOutputs, CliError> {
     ensure_docker_available()?;
@@ -119,6 +133,7 @@ fn run_scripts_in_docker(
                     logs_dir,
                     script: "solution/solve.sh",
                     network: environment.agent_network,
+                    env: &envs.agent,
                     timeout: environment.agent_timeout,
                 })?,
             ),
@@ -133,6 +148,7 @@ fn run_scripts_in_docker(
                     logs_dir,
                     agent,
                     network: environment.agent_network,
+                    env: &envs.agent,
                     timeout: environment.agent_timeout,
                 })?,
             ),
@@ -145,6 +161,7 @@ fn run_scripts_in_docker(
             logs_dir,
             script: "tests/test.sh",
             network: environment.verifier_network,
+            env: &envs.verifier,
             timeout: environment.verifier_timeout,
         })?;
 
@@ -476,6 +493,7 @@ struct DockerScriptRun<'a> {
     logs_dir: &'a Path,
     script: &'a str,
     network: DockerNetwork,
+    env: &'a [(String, String)],
     timeout: Duration,
 }
 
@@ -487,6 +505,7 @@ struct DockerShellRun<'a> {
     logs_dir: &'a Path,
     agent: &'a ExternalAgent,
     network: DockerNetwork,
+    env: &'a [(String, String)],
     timeout: Duration,
 }
 
@@ -496,6 +515,7 @@ fn run_script_in_docker(run: DockerScriptRun<'_>) -> Result<Output, CliError> {
         .parent()
         .ok_or_else(|| CliError::usage("logs directory has no parent"))?;
     let container_name = docker_container_name(run.run_id, run.script);
+    let extra_env = env_refs(run.env);
     let command = docker_run_command(DockerRunCommand {
         image: run.image,
         container_name: &container_name,
@@ -504,7 +524,7 @@ fn run_script_in_docker(run: DockerScriptRun<'_>) -> Result<Output, CliError> {
         logs_root,
         invocation: DockerInvocation::TaskScript(run.script),
         network: run.network,
-        extra_env: &[],
+        extra_env: &extra_env,
     });
     let timed_output = run_command_with_timeout(command, run.timeout)?;
     let output = timed_output.output;
@@ -537,7 +557,8 @@ fn run_shell_in_docker(run: DockerShellRun<'_>) -> Result<Output, CliError> {
         .parent()
         .ok_or_else(|| CliError::usage("logs directory has no parent"))?;
     let container_name = docker_container_name(run.run_id, "agent");
-    let mut extra_env = vec![("SEAPORT_AGENT_NAME", run.agent.name.as_str())];
+    let mut extra_env = env_refs(run.env);
+    extra_env.push(("SEAPORT_AGENT_NAME", run.agent.name.as_str()));
 
     if let Some(model) = run.agent.model.as_deref() {
         extra_env.push(("SEAPORT_MODEL", model));
@@ -724,6 +745,7 @@ fn run_scripts_locally(
     app_dir: &Path,
     logs_dir: &Path,
     agent_kind: &SandboxAgent,
+    envs: &PhaseEnvs,
     environment: &TaskEnvironment,
 ) -> Result<ScriptOutputs, CliError> {
     let verifier = task_path.join("tests").join("test.sh");
@@ -735,6 +757,7 @@ fn run_scripts_locally(
                 task_path,
                 app_dir,
                 logs_dir,
+                &envs.agent,
                 environment.agent_timeout,
             )?,
         ),
@@ -746,6 +769,7 @@ fn run_scripts_locally(
                 task_path,
                 app_dir,
                 logs_dir,
+                &envs.agent,
                 environment.agent_timeout,
             )?,
         ),
@@ -755,6 +779,7 @@ fn run_scripts_locally(
         task_path,
         app_dir,
         logs_dir,
+        &envs.verifier,
         environment.verifier_timeout,
     )?;
 
@@ -766,6 +791,7 @@ fn run_shell_locally(
     task_path: &Path,
     app_dir: &Path,
     logs_dir: &Path,
+    env: &[(String, String)],
     timeout: Duration,
 ) -> Result<Output, CliError> {
     let mut command = Command::new("bash");
@@ -778,6 +804,8 @@ fn run_shell_locally(
         .env("SEAPORT_TASK_DIR", task_path)
         .env("SEAPORT_INSTRUCTION_PATH", task_path.join("instruction.md"))
         .env("SEAPORT_AGENT_NAME", &agent.name);
+
+    apply_env(&mut command, env);
 
     if let Some(model) = agent.model.as_deref() {
         command.env("SEAPORT_MODEL", model);
@@ -812,6 +840,7 @@ fn run_script_locally(
     task_path: &Path,
     app_dir: &Path,
     logs_dir: &Path,
+    env: &[(String, String)],
     timeout: Duration,
 ) -> Result<Output, CliError> {
     let mut command = Command::new("bash");
@@ -822,6 +851,7 @@ fn run_script_locally(
         .env("LOGS_DIR", logs_dir)
         .env("SEAPORT_TASK_DIR", task_path)
         .env("SEAPORT_INSTRUCTION_PATH", task_path.join("instruction.md"));
+    apply_env(&mut command, env);
     let timed_output = run_command_with_timeout(command, timeout)?;
     let output = timed_output.output;
 
@@ -844,6 +874,18 @@ fn run_script_locally(
     }
 
     Ok(output)
+}
+
+fn env_refs(env: &[(String, String)]) -> Vec<(&str, &str)> {
+    env.iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect()
+}
+
+fn apply_env(command: &mut Command, env: &[(String, String)]) {
+    for (name, value) in env {
+        command.env(name, value);
+    }
 }
 
 struct TimedOutput {
