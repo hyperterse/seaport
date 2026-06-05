@@ -105,12 +105,12 @@ fn run_scripts_in_docker(
                 "solution/solve.sh",
                 run_script_in_docker(DockerScriptRun {
                     image: &image.reference,
-                    environment,
                     run_id,
                     task_path,
                     app_dir,
                     logs_dir,
                     script: "solution/solve.sh",
+                    network: environment.agent_network,
                     timeout: environment.agent_timeout,
                 })?,
             ),
@@ -118,12 +118,12 @@ fn run_scripts_in_docker(
         };
         let verifier = run_script_in_docker(DockerScriptRun {
             image: &image.reference,
-            environment,
             run_id,
             task_path,
             app_dir,
             logs_dir,
             script: "tests/test.sh",
+            network: environment.verifier_network,
             timeout: environment.verifier_timeout,
         })?;
 
@@ -144,12 +144,16 @@ struct DockerImage {
 
 struct TaskEnvironment {
     image: String,
-    network: DockerNetwork,
+    prebuilt_image: bool,
+    build_network: DockerNetwork,
+    agent_network: DockerNetwork,
+    verifier_network: DockerNetwork,
+    build_timeout: Duration,
     agent_timeout: Duration,
     verifier_timeout: Duration,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DockerNetwork {
     None,
     Bridge,
@@ -166,42 +170,119 @@ impl DockerNetwork {
 
 fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
     let task_toml = fs::read_to_string(task_path.join("task.toml"))?;
-    let image = toml_string_value(&task_toml, "docker_image")
+    let explicit_image = toml_section_value(&task_toml, "environment", "docker_image")
+        .or_else(|| toml_top_level_value(&task_toml, "docker_image"));
+    let image = explicit_image
+        .clone()
         .unwrap_or_else(|| DEFAULT_DOCKER_IMAGE.to_owned());
+    let baseline_network = baseline_network(&task_toml)?;
+    let build_timeout = toml_duration_value_with_default(
+        &task_toml,
+        "environment",
+        "build_timeout_sec",
+        DOCKER_BUILD_TIMEOUT,
+    )?;
     let agent_timeout = toml_duration_value(&task_toml, "agent", "timeout_sec")?;
     let verifier_timeout = toml_duration_value(&task_toml, "verifier", "timeout_sec")?;
-    let network = match toml_string_value(&task_toml, "network_mode")
-        .unwrap_or_else(|| "no-network".to_owned())
-        .as_str()
-    {
-        "no-network" | "none" => DockerNetwork::None,
-        "bridge" => DockerNetwork::Bridge,
-        value => {
-            return Err(CliError::usage(format!(
-                "unsupported environment.network_mode `{value}`; use `no-network` or `bridge`"
-            )));
-        }
-    };
+    let agent_network = phase_network(&task_toml, "agent")?.unwrap_or(baseline_network);
+    let verifier_network = phase_network(&task_toml, "verifier")?.unwrap_or(baseline_network);
+
+    reject_unsupported_task_os(&task_toml)?;
 
     Ok(TaskEnvironment {
         image,
-        network,
+        prebuilt_image: explicit_image.is_some(),
+        build_network: baseline_network,
+        agent_network,
+        verifier_network,
+        build_timeout,
         agent_timeout,
         verifier_timeout,
     })
 }
 
-fn toml_string_value(contents: &str, key: &str) -> Option<String> {
+fn baseline_network(contents: &str) -> Result<DockerNetwork, CliError> {
+    if let Some(value) = toml_section_value(contents, "environment", "network_mode")
+        .or_else(|| toml_top_level_value(contents, "network_mode"))
+    {
+        return parse_network_mode("environment.network_mode", &value);
+    }
+
+    if let Some(value) = toml_bool_value(contents, "environment", "allow_internet")? {
+        return Ok(if value {
+            DockerNetwork::Bridge
+        } else {
+            DockerNetwork::None
+        });
+    }
+
+    Ok(DockerNetwork::Bridge)
+}
+
+fn phase_network(contents: &str, section: &str) -> Result<Option<DockerNetwork>, CliError> {
+    match toml_section_value(contents, section, "network_mode") {
+        Some(value) => parse_network_mode(&format!("{section}.network_mode"), &value).map(Some),
+        None => Ok(None),
+    }
+}
+
+fn parse_network_mode(field: &str, value: &str) -> Result<DockerNetwork, CliError> {
+    match value {
+        "no-network" | "none" => Ok(DockerNetwork::None),
+        "public" | "bridge" => Ok(DockerNetwork::Bridge),
+        "allowlist" => Err(CliError::unimplemented(format!(
+            "{field} = `allowlist` is not implemented for the docker backend yet"
+        ))),
+        unknown => Err(CliError::usage(format!(
+            "unsupported {field} `{unknown}`; use `public`, `no-network`, or `allowlist`"
+        ))),
+    }
+}
+
+fn reject_unsupported_task_os(contents: &str) -> Result<(), CliError> {
+    let Some(os) = toml_section_value(contents, "environment", "os") else {
+        return Ok(());
+    };
+
+    if os == "linux" {
+        Ok(())
+    } else {
+        Err(CliError::unimplemented(format!(
+            "[environment].os = `{os}` is not implemented by Seaport's docker backend yet"
+        )))
+    }
+}
+
+fn toml_top_level_value(contents: &str, key: &str) -> Option<String> {
     let prefix = format!("{key} = ");
+    let mut in_section = false;
 
     contents.lines().find_map(|line| {
-        line.trim()
-            .strip_prefix(&prefix)
-            .map(|value| value.trim().trim_matches('"').to_owned())
+        let trimmed = line.trim();
+
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            in_section = true;
+            return None;
+        }
+
+        if in_section {
+            return None;
+        }
+
+        trimmed.strip_prefix(&prefix).map(toml_scalar_value)
     })
 }
 
 fn toml_duration_value(contents: &str, section: &str, key: &str) -> Result<Duration, CliError> {
+    toml_duration_value_with_default(contents, section, key, Duration::from_secs(120))
+}
+
+fn toml_duration_value_with_default(
+    contents: &str,
+    section: &str,
+    key: &str,
+    default: Duration,
+) -> Result<Duration, CliError> {
     match toml_section_value(contents, section, key) {
         Some(value) => {
             let seconds = value.parse::<f64>().map_err(|error| {
@@ -216,7 +297,7 @@ fn toml_duration_value(contents: &str, section: &str, key: &str) -> Result<Durat
 
             Ok(Duration::from_secs_f64(seconds))
         }
-        None => Ok(Duration::from_secs(120)),
+        None => Ok(default),
     }
 }
 
@@ -235,12 +316,55 @@ fn toml_section_value(contents: &str, section: &str, key: &str) -> Option<String
 
         if in_section {
             if let Some(value) = trimmed.strip_prefix(&prefix) {
-                return Some(value.trim().trim_matches('"').to_owned());
+                return Some(toml_scalar_value(value));
             }
         }
     }
 
     None
+}
+
+fn toml_bool_value(contents: &str, section: &str, key: &str) -> Result<Option<bool>, CliError> {
+    let Some(value) = toml_section_value(contents, section, key) else {
+        return Ok(None);
+    };
+
+    match value.as_str() {
+        "true" => Ok(Some(true)),
+        "false" => Ok(Some(false)),
+        unknown => Err(CliError::usage(format!(
+            "[{section}].{key} must be true or false, got `{unknown}`"
+        ))),
+    }
+}
+
+fn toml_scalar_value(value: &str) -> String {
+    strip_inline_comment(value.trim())
+        .trim()
+        .trim_matches('"')
+        .to_owned()
+}
+
+fn strip_inline_comment(value: &str) -> &str {
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for (index, character) in value.char_indices() {
+        if character == '"' && !escaped {
+            in_quotes = !in_quotes;
+        }
+
+        if character == '#' && !in_quotes {
+            return &value[..index];
+        }
+
+        escaped = character == '\\' && !escaped;
+        if character != '\\' {
+            escaped = false;
+        }
+    }
+
+    value
 }
 
 fn prepare_docker_image(
@@ -250,7 +374,7 @@ fn prepare_docker_image(
 ) -> Result<DockerImage, CliError> {
     let dockerfile = task_path.join("environment").join("Dockerfile");
 
-    if !dockerfile.is_file() {
+    if environment.prebuilt_image || !dockerfile.is_file() {
         return Ok(DockerImage {
             reference: environment.image.clone(),
             remove_after_run: false,
@@ -267,20 +391,20 @@ fn prepare_docker_image(
             "build",
             "--pull=false",
             "--network",
-            environment.network.as_docker_arg(),
+            environment.build_network.as_docker_arg(),
             "-q",
             "-t",
             &tag,
         ])
         .arg(environment_dir);
-    let timed_output = run_command_with_timeout(command, DOCKER_BUILD_TIMEOUT)?;
+    let timed_output = run_command_with_timeout(command, environment.build_timeout)?;
     let output = timed_output.output;
 
     if timed_output.timed_out {
         cleanup_docker_image(&tag);
         return Err(CliError::task_failed(format!(
             "docker image build timed out after {:.3}s for {}",
-            DOCKER_BUILD_TIMEOUT.as_secs_f64(),
+            environment.build_timeout.as_secs_f64(),
             dockerfile.display()
         )));
     }
@@ -325,12 +449,12 @@ fn ensure_docker_available() -> Result<(), CliError> {
 
 struct DockerScriptRun<'a> {
     image: &'a str,
-    environment: &'a TaskEnvironment,
     run_id: &'a str,
     task_path: &'a Path,
     app_dir: &'a Path,
     logs_dir: &'a Path,
     script: &'a str,
+    network: DockerNetwork,
     timeout: Duration,
 }
 
@@ -342,12 +466,12 @@ fn run_script_in_docker(run: DockerScriptRun<'_>) -> Result<Output, CliError> {
     let container_name = docker_container_name(run.run_id, run.script);
     let command = docker_run_command(
         run.image,
-        run.environment,
         &container_name,
         run.task_path,
         run.app_dir,
         logs_root,
         run.script,
+        run.network,
     );
     let timed_output = run_command_with_timeout(command, run.timeout)?;
     let output = timed_output.output;
@@ -376,12 +500,12 @@ fn run_script_in_docker(run: DockerScriptRun<'_>) -> Result<Output, CliError> {
 
 fn docker_run_command(
     image: &str,
-    environment: &TaskEnvironment,
     container_name: &str,
     task_path: &Path,
     app_dir: &Path,
     logs_root: &Path,
     script: &str,
+    network: DockerNetwork,
 ) -> Command {
     let mut command = Command::new("docker");
     command
@@ -391,7 +515,7 @@ fn docker_run_command(
             "--name",
             container_name,
             "--network",
-            environment.network.as_docker_arg(),
+            network.as_docker_arg(),
             "--cap-drop",
             "ALL",
             "--security-opt",
@@ -645,20 +769,14 @@ mod tests {
 
     #[test]
     fn docker_command_uses_sandbox_flags() {
-        let environment = TaskEnvironment {
-            image: "ubuntu:24.04".to_owned(),
-            network: DockerNetwork::None,
-            agent_timeout: Duration::from_secs(1),
-            verifier_timeout: Duration::from_secs(1),
-        };
         let command = docker_run_command(
             "seaport-task-test",
-            &environment,
             "seaport-test-container",
             Path::new("/tmp/task"),
             Path::new("/tmp/app"),
             Path::new("/tmp/logs"),
             "tests/test.sh",
+            DockerNetwork::None,
         );
         let args = command_args(command);
 
@@ -688,10 +806,80 @@ mod tests {
             .any(|arg| arg == "type=bind,source=/tmp/task,target=/seaport/task,readonly"));
     }
 
+    #[test]
+    fn task_environment_reads_harbor_environment_sections() {
+        let task = temp_task_dir("harbor-environment-sections");
+        fs::create_dir_all(&task).expect("task dir");
+        fs::write(
+            task.join("task.toml"),
+            r#"
+[environment]
+docker_image = "python:3.12"
+network_mode = "public"
+build_timeout_sec = 7.5
+os = "linux"
+
+[agent]
+timeout_sec = 3
+network_mode = "no-network"
+
+[verifier]
+timeout_sec = 5
+network_mode = "public"
+"#,
+        )
+        .expect("task toml");
+
+        let environment = task_environment(&task).expect("environment");
+
+        assert_eq!(environment.image, "python:3.12");
+        assert!(environment.prebuilt_image);
+        assert_eq!(environment.build_network, DockerNetwork::Bridge);
+        assert_eq!(environment.agent_network, DockerNetwork::None);
+        assert_eq!(environment.verifier_network, DockerNetwork::Bridge);
+        assert_eq!(environment.build_timeout, Duration::from_secs_f64(7.5));
+        assert_eq!(environment.agent_timeout, Duration::from_secs(3));
+        assert_eq!(environment.verifier_timeout, Duration::from_secs(5));
+
+        let _ = fs::remove_dir_all(task);
+    }
+
+    #[test]
+    fn task_environment_defaults_to_harbor_public_network() {
+        let task = temp_task_dir("harbor-public-default");
+        fs::create_dir_all(&task).expect("task dir");
+        fs::write(
+            task.join("task.toml"),
+            r#"
+[environment]
+docker_image = "ubuntu:24.04" # explicit prebuilt image
+"#,
+        )
+        .expect("task toml");
+
+        let environment = task_environment(&task).expect("environment");
+
+        assert_eq!(environment.build_network, DockerNetwork::Bridge);
+        assert_eq!(environment.agent_network, DockerNetwork::Bridge);
+        assert_eq!(environment.verifier_network, DockerNetwork::Bridge);
+        assert_eq!(environment.build_timeout, DOCKER_BUILD_TIMEOUT);
+
+        let _ = fs::remove_dir_all(task);
+    }
+
     fn command_args(command: Command) -> Vec<String> {
         command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect()
+    }
+
+    fn temp_task_dir(name: &str) -> std::path::PathBuf {
+        let id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+
+        std::env::temp_dir().join(format!("seaport-{name}-{id}"))
     }
 }
