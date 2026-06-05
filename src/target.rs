@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::registry::ResolvedRegistryDataset;
 use crate::{task_name, validate_task_path, CliError, EXIT_USAGE};
 
 #[derive(Debug)]
@@ -20,6 +21,30 @@ impl RunTarget {
         }
 
         Self::local_dataset(path, selection)
+    }
+
+    pub(crate) fn from_registry_dataset(
+        dataset: ResolvedRegistryDataset,
+        selection: &TaskSelection,
+    ) -> Result<Self, CliError> {
+        let mut tasks = dataset
+            .task_paths
+            .iter()
+            .map(|path| TaskRef::from_path(path))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        selection.apply(&mut tasks)?;
+
+        if tasks.is_empty() {
+            return Err(CliError::usage(
+                "task filters removed every task from the registry dataset",
+            ));
+        }
+
+        Ok(Self {
+            name: dataset.name,
+            tasks,
+        })
     }
 
     fn local_dataset(path: &Path, selection: &TaskSelection) -> Result<Self, CliError> {

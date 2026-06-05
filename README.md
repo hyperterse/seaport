@@ -236,6 +236,16 @@ seaport run -p path/to/dataset -a oracle \
   -l 100
 ```
 
+Run a dataset from a Harbor-compatible local registry JSON file:
+
+```sh
+seaport run -d org/dataset@head --registry-path registry.json -a oracle
+```
+
+Registry task paths are resolved relative to the registry file when they are not
+absolute. Git-backed registry tasks and hosted package datasets are still
+future work.
+
 The intended non-oracle local-task command is:
 
 ```sh

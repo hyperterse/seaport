@@ -7,9 +7,11 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod registry;
 mod sandbox;
 mod target;
 
+use registry::resolve_local_registry_dataset;
 use sandbox::{prepare_container_writable_dir, run_task_scripts, SandboxBackend};
 use target::{RunTarget, TaskRef, TaskSelection};
 
@@ -63,25 +65,33 @@ fn run_eval(args: &[String]) -> Result<(), CliError> {
         ));
     }
 
-    if options.dataset.is_some() {
-        return Err(CliError::unimplemented(
-            "registered datasets are not implemented yet; use `-p <path>` for local tasks",
-        ));
-    }
-
-    let path = options
-        .path
-        .as_deref()
-        .ok_or_else(|| CliError::usage("run requires `-p <path>` for local tasks"))?;
-
     if agent != "oracle" {
         return Err(CliError::unimplemented(
             "only the oracle agent is implemented for local task execution",
         ));
     }
 
-    let target = RunTarget::from_path(Path::new(path), &options.selection)?;
+    let target = resolve_run_target(&options)?;
     run_oracle_target(&target, &options)
+}
+
+fn resolve_run_target(options: &RunOptions) -> Result<RunTarget, CliError> {
+    if let Some(path) = options.path.as_deref() {
+        return RunTarget::from_path(Path::new(path), &options.selection);
+    }
+
+    let dataset = options
+        .dataset
+        .as_deref()
+        .ok_or_else(|| CliError::usage("run requires either `-p <path>` or `-d <dataset>`"))?;
+    let registry_path = options.registry_path.as_deref().ok_or_else(|| {
+        CliError::unimplemented(
+            "registered package datasets are not implemented yet; pass `--registry-path <registry.json>` for local Harbor registry datasets",
+        )
+    })?;
+    let resolved = resolve_local_registry_dataset(dataset, Path::new(registry_path))?;
+
+    RunTarget::from_registry_dataset(resolved, &options.selection)
 }
 
 fn run_oracle_target(target: &RunTarget, options: &RunOptions) -> Result<(), CliError> {
@@ -589,6 +599,8 @@ Usage:
 Options:
   -p, --path <path>       Local task or dataset directory
   -d, --dataset <name>    Registered dataset name
+      --registry-path <path>
+                          Harbor registry JSON for -d datasets
   -a, --agent <agent>     Agent adapter name
   -m, --model <model>     Model identifier
   -n <count>              Concurrency
@@ -640,6 +652,7 @@ Usage:
 struct RunOptions {
     path: Option<String>,
     dataset: Option<String>,
+    registry_path: Option<String>,
     agent: Option<String>,
     model: Option<String>,
     concurrency: Option<String>,
@@ -653,6 +666,7 @@ impl Default for RunOptions {
         Self {
             path: None,
             dataset: None,
+            registry_path: None,
             agent: None,
             model: None,
             concurrency: None,
@@ -678,6 +692,10 @@ impl RunOptions {
                 }
                 "-d" | "--dataset" => {
                     options.dataset = Some(required_value(args, index, flag)?);
+                    index += 2;
+                }
+                "--registry-path" => {
+                    options.registry_path = Some(required_value(args, index, flag)?);
                     index += 2;
                 }
                 "-a" | "--agent" => {
@@ -814,6 +832,8 @@ mod tests {
         let args = strings([
             "-d",
             "bench/example@1.0",
+            "--registry-path",
+            "registry.json",
             "-a",
             "claude-code",
             "-m",
@@ -835,6 +855,7 @@ mod tests {
         let options = RunOptions::parse(&args).expect("options");
 
         assert_eq!(options.dataset.as_deref(), Some("bench/example@1.0"));
+        assert_eq!(options.registry_path.as_deref(), Some("registry.json"));
         assert_eq!(options.concurrency.as_deref(), Some("8"));
         assert_eq!(options.backend, SandboxBackend::Docker);
         assert_eq!(options.jobs_dir.as_deref(), Some("jobs/custom"));
@@ -937,6 +958,54 @@ mod tests {
         assert!(config.contains("\"target\": \"acme/suite\""));
         assert!(config.contains("\"acme/one\""));
         assert!(!config.contains("\"acme/two\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runs_local_registry_dataset() {
+        let root = temp_test_dir("registry-dataset");
+        let tasks = root.join("tasks");
+        let jobs = root.join("jobs");
+        let registry = root.join("registry.json");
+
+        write_oracle_task(&tasks.join("one"), "acme/one");
+        write_oracle_task(&tasks.join("two"), "acme/two");
+        fs::write(
+            &registry,
+            format!(
+                "[{{\"name\":\"acme/suite\",\"version\":\"head\",\"description\":\"suite\",\"tasks\":[{{\"name\":\"acme/one\",\"path\":\"{}\"}},{{\"name\":\"acme/two\",\"path\":\"{}\"}}]}}]\n",
+                tasks.join("one").display(),
+                tasks.join("two").display()
+            ),
+        )
+        .expect("registry");
+
+        let args = vec![
+            "run".to_owned(),
+            "-d".to_owned(),
+            "acme/suite".to_owned(),
+            "--registry-path".to_owned(),
+            registry.display().to_string(),
+            "-a".to_owned(),
+            "oracle".to_owned(),
+            "--backend".to_owned(),
+            "unsafe-local".to_owned(),
+            "--jobs-dir".to_owned(),
+            jobs.display().to_string(),
+            "-l".to_owned(),
+            "1".to_owned(),
+        ];
+
+        run(args).expect("registry run");
+
+        let job_dir = single_child_dir(&jobs);
+        let result = fs::read_to_string(job_dir.join("result.json")).expect("job result");
+        let config = fs::read_to_string(job_dir.join("config.json")).expect("job config");
+
+        assert!(result.contains("\"tasks_total\": 1"));
+        assert!(result.contains("\"tasks_passed\": 1"));
+        assert!(config.contains("\"target\": \"acme/suite\""));
 
         let _ = fs::remove_dir_all(root);
     }
