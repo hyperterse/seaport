@@ -46,10 +46,18 @@ impl AgentStep {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SandboxAgent {
     Oracle,
     Nop,
+    External(ExternalAgent),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExternalAgent {
+    pub(crate) name: String,
+    pub(crate) command: String,
+    pub(crate) model: Option<String>,
 }
 
 pub(crate) fn run_task_scripts(
@@ -57,7 +65,7 @@ pub(crate) fn run_task_scripts(
     run_id: &str,
     app_dir: &Path,
     logs_dir: &Path,
-    agent: SandboxAgent,
+    agent: &SandboxAgent,
     backend: SandboxBackend,
 ) -> Result<ScriptOutputs, CliError> {
     let environment = task_environment(task_path)?;
@@ -93,7 +101,7 @@ fn run_scripts_in_docker(
     run_id: &str,
     app_dir: &Path,
     logs_dir: &Path,
-    agent_kind: SandboxAgent,
+    agent_kind: &SandboxAgent,
     environment: &TaskEnvironment,
 ) -> Result<ScriptOutputs, CliError> {
     ensure_docker_available()?;
@@ -115,6 +123,19 @@ fn run_scripts_in_docker(
                 })?,
             ),
             SandboxAgent::Nop => AgentStep::nop(),
+            SandboxAgent::External(agent) => AgentStep::from_output(
+                agent.command.clone(),
+                run_shell_in_docker(DockerShellRun {
+                    image: &image.reference,
+                    run_id,
+                    task_path,
+                    app_dir,
+                    logs_dir,
+                    agent,
+                    network: environment.agent_network,
+                    timeout: environment.agent_timeout,
+                })?,
+            ),
         };
         let verifier = run_script_in_docker(DockerScriptRun {
             image: &image.reference,
@@ -458,21 +479,33 @@ struct DockerScriptRun<'a> {
     timeout: Duration,
 }
 
+struct DockerShellRun<'a> {
+    image: &'a str,
+    run_id: &'a str,
+    task_path: &'a Path,
+    app_dir: &'a Path,
+    logs_dir: &'a Path,
+    agent: &'a ExternalAgent,
+    network: DockerNetwork,
+    timeout: Duration,
+}
+
 fn run_script_in_docker(run: DockerScriptRun<'_>) -> Result<Output, CliError> {
     let logs_root = run
         .logs_dir
         .parent()
         .ok_or_else(|| CliError::usage("logs directory has no parent"))?;
     let container_name = docker_container_name(run.run_id, run.script);
-    let command = docker_run_command(
-        run.image,
-        &container_name,
-        run.task_path,
-        run.app_dir,
+    let command = docker_run_command(DockerRunCommand {
+        image: run.image,
+        container_name: &container_name,
+        task_path: run.task_path,
+        app_dir: run.app_dir,
         logs_root,
-        run.script,
-        run.network,
-    );
+        invocation: DockerInvocation::TaskScript(run.script),
+        network: run.network,
+        extra_env: &[],
+    });
     let timed_output = run_command_with_timeout(command, run.timeout)?;
     let output = timed_output.output;
 
@@ -498,24 +531,79 @@ fn run_script_in_docker(run: DockerScriptRun<'_>) -> Result<Output, CliError> {
     Ok(output)
 }
 
-fn docker_run_command(
-    image: &str,
-    container_name: &str,
-    task_path: &Path,
-    app_dir: &Path,
-    logs_root: &Path,
-    script: &str,
+fn run_shell_in_docker(run: DockerShellRun<'_>) -> Result<Output, CliError> {
+    let logs_root = run
+        .logs_dir
+        .parent()
+        .ok_or_else(|| CliError::usage("logs directory has no parent"))?;
+    let container_name = docker_container_name(run.run_id, "agent");
+    let mut extra_env = vec![("SEAPORT_AGENT_NAME", run.agent.name.as_str())];
+
+    if let Some(model) = run.agent.model.as_deref() {
+        extra_env.push(("SEAPORT_MODEL", model));
+    }
+
+    let command = docker_run_command(DockerRunCommand {
+        image: run.image,
+        container_name: &container_name,
+        task_path: run.task_path,
+        app_dir: run.app_dir,
+        logs_root,
+        invocation: DockerInvocation::ShellCommand(&run.agent.command),
+        network: run.network,
+        extra_env: &extra_env,
+    });
+    let timed_output = run_command_with_timeout(command, run.timeout)?;
+    let output = timed_output.output;
+
+    if timed_output.timed_out {
+        cleanup_docker_container(&container_name);
+        return Err(CliError::task_failed(format!(
+            "sandboxed docker agent timed out after {:.3}s: {}",
+            run.timeout.as_secs_f64(),
+            run.agent.name
+        )));
+    }
+
+    if !output.status.success() {
+        return Err(CliError::task_failed(format!(
+            "sandboxed docker agent failed: {} (status: {})\nstdout:\n{}\nstderr:\n{}",
+            run.agent.name,
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(output)
+}
+
+enum DockerInvocation<'a> {
+    TaskScript(&'a str),
+    ShellCommand(&'a str),
+}
+
+struct DockerRunCommand<'a> {
+    image: &'a str,
+    container_name: &'a str,
+    task_path: &'a Path,
+    app_dir: &'a Path,
+    logs_root: &'a Path,
+    invocation: DockerInvocation<'a>,
     network: DockerNetwork,
-) -> Command {
+    extra_env: &'a [(&'a str, &'a str)],
+}
+
+fn docker_run_command(run: DockerRunCommand<'_>) -> Command {
     let mut command = Command::new("docker");
     command
         .args([
             "run",
             "--rm",
             "--name",
-            container_name,
+            run.container_name,
             "--network",
-            network.as_docker_arg(),
+            run.network.as_docker_arg(),
             "--cap-drop",
             "ALL",
             "--security-opt",
@@ -543,25 +631,40 @@ fn docker_run_command(
             "LOGS_DIR=/logs/verifier",
             "--env",
             "SEAPORT_TASK_DIR=/seaport/task",
+            "--env",
+            "SEAPORT_INSTRUCTION_PATH=/seaport/task/instruction.md",
         ])
+        .args(
+            run.extra_env
+                .iter()
+                .flat_map(|(name, value)| ["--env".to_owned(), format!("{name}={value}")]),
+        )
         .arg("--mount")
         .arg(format!(
             "type=bind,source={},target=/app",
-            app_dir.display()
+            run.app_dir.display()
         ))
         .arg("--mount")
         .arg(format!(
             "type=bind,source={},target=/logs",
-            logs_root.display()
+            run.logs_root.display()
         ))
         .arg("--mount")
         .arg(format!(
             "type=bind,source={},target=/seaport/task,readonly",
-            task_path.display()
+            run.task_path.display()
         ))
-        .arg(image)
-        .arg("bash")
-        .arg(format!("/seaport/task/{script}"));
+        .arg(run.image)
+        .arg("bash");
+
+    match run.invocation {
+        DockerInvocation::TaskScript(script) => {
+            command.arg(format!("/seaport/task/{script}"));
+        }
+        DockerInvocation::ShellCommand(shell_command) => {
+            command.arg("-lc").arg(shell_command);
+        }
+    }
 
     command
 }
@@ -620,7 +723,7 @@ fn run_scripts_locally(
     task_path: &Path,
     app_dir: &Path,
     logs_dir: &Path,
-    agent_kind: SandboxAgent,
+    agent_kind: &SandboxAgent,
     environment: &TaskEnvironment,
 ) -> Result<ScriptOutputs, CliError> {
     let verifier = task_path.join("tests").join("test.sh");
@@ -636,6 +739,16 @@ fn run_scripts_locally(
             )?,
         ),
         SandboxAgent::Nop => AgentStep::nop(),
+        SandboxAgent::External(agent) => AgentStep::from_output(
+            agent.command.clone(),
+            run_shell_locally(
+                agent,
+                task_path,
+                app_dir,
+                logs_dir,
+                environment.agent_timeout,
+            )?,
+        ),
     };
     let verifier = run_script_locally(
         &verifier,
@@ -646,6 +759,52 @@ fn run_scripts_locally(
     )?;
 
     Ok(ScriptOutputs { agent, verifier })
+}
+
+fn run_shell_locally(
+    agent: &ExternalAgent,
+    task_path: &Path,
+    app_dir: &Path,
+    logs_dir: &Path,
+    timeout: Duration,
+) -> Result<Output, CliError> {
+    let mut command = Command::new("bash");
+    command
+        .arg("-lc")
+        .arg(&agent.command)
+        .current_dir(app_dir)
+        .env("APP_DIR", app_dir)
+        .env("LOGS_DIR", logs_dir)
+        .env("SEAPORT_TASK_DIR", task_path)
+        .env("SEAPORT_INSTRUCTION_PATH", task_path.join("instruction.md"))
+        .env("SEAPORT_AGENT_NAME", &agent.name);
+
+    if let Some(model) = agent.model.as_deref() {
+        command.env("SEAPORT_MODEL", model);
+    }
+
+    let timed_output = run_command_with_timeout(command, timeout)?;
+    let output = timed_output.output;
+
+    if timed_output.timed_out {
+        return Err(CliError::task_failed(format!(
+            "unsafe local agent timed out after {:.3}s: {}",
+            timeout.as_secs_f64(),
+            agent.name
+        )));
+    }
+
+    if !output.status.success() {
+        return Err(CliError::task_failed(format!(
+            "unsafe local agent failed: {} (status: {})\nstdout:\n{}\nstderr:\n{}",
+            agent.name,
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(output)
 }
 
 fn run_script_locally(
@@ -661,7 +820,8 @@ fn run_script_locally(
         .current_dir(app_dir)
         .env("APP_DIR", app_dir)
         .env("LOGS_DIR", logs_dir)
-        .env("SEAPORT_TASK_DIR", task_path);
+        .env("SEAPORT_TASK_DIR", task_path)
+        .env("SEAPORT_INSTRUCTION_PATH", task_path.join("instruction.md"));
     let timed_output = run_command_with_timeout(command, timeout)?;
     let output = timed_output.output;
 
@@ -769,15 +929,16 @@ mod tests {
 
     #[test]
     fn docker_command_uses_sandbox_flags() {
-        let command = docker_run_command(
-            "seaport-task-test",
-            "seaport-test-container",
-            Path::new("/tmp/task"),
-            Path::new("/tmp/app"),
-            Path::new("/tmp/logs"),
-            "tests/test.sh",
-            DockerNetwork::None,
-        );
+        let command = docker_run_command(DockerRunCommand {
+            image: "seaport-task-test",
+            container_name: "seaport-test-container",
+            task_path: Path::new("/tmp/task"),
+            app_dir: Path::new("/tmp/app"),
+            logs_root: Path::new("/tmp/logs"),
+            invocation: DockerInvocation::TaskScript("tests/test.sh"),
+            network: DockerNetwork::None,
+            extra_env: &[],
+        });
         let args = command_args(command);
 
         assert!(args

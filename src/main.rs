@@ -15,7 +15,8 @@ use registry::{
     resolve_git_task_source, resolve_local_registry_dataset, resolve_local_registry_task,
 };
 use sandbox::{
-    prepare_container_writable_dir, run_task_scripts, AgentStep, SandboxAgent, SandboxBackend,
+    prepare_container_writable_dir, run_task_scripts, AgentStep, ExternalAgent, SandboxAgent,
+    SandboxBackend,
 };
 use target::{RunTarget, TaskRef, TaskSelection};
 
@@ -63,7 +64,7 @@ fn run_eval(args: &[String]) -> Result<(), CliError> {
     let agent = options.agent.as_deref().unwrap_or("oracle");
     let agent = AgentKind::parse(agent)?;
 
-    if agent.requires_model() && options.model.is_none() {
+    if agent.requires_model() && options.model.is_none() && options.agent_command.is_none() {
         return Err(CliError::usage(
             "run requires `-m <model>` for model-backed agents",
         ));
@@ -166,7 +167,7 @@ fn run_trial(
     let verifier_dir = trial_dir.join("verifier");
     let workspace = env::temp_dir().join(format!(
         "seaport-{}-{run_id}-{}",
-        agent.as_str(),
+        agent.as_str(options),
         sanitize_name(&task.name)
     ));
     let app_dir = workspace.join("app");
@@ -181,12 +182,13 @@ fn run_trial(
     prepare_container_writable_dir(&workspace.join("logs"))?;
     prepare_container_writable_dir(&logs_dir)?;
 
+    let sandbox_agent = agent.sandbox_agent(options)?;
     let outputs = run_task_scripts(
         &task.path,
         run_id,
         &app_dir,
         &logs_dir,
-        agent.sandbox_agent(),
+        &sandbox_agent,
         options.backend,
     )?;
     let reward = read_reward(&logs_dir)?;
@@ -207,7 +209,7 @@ fn run_trial(
     fs::write(verifier_dir.join("reward.txt"), &reward)?;
     fs::write(
         trial_dir.join("config.json"),
-        trial_config_json(task_name, agent),
+        trial_config_json(task_name, agent, options),
     )?;
     fs::write(
         trial_dir.join("result.json"),
@@ -258,6 +260,7 @@ fn validate_task_path(task_path: &Path) -> Result<(), CliError> {
 enum AgentKind {
     Oracle,
     Nop,
+    External,
 }
 
 impl AgentKind {
@@ -265,29 +268,71 @@ impl AgentKind {
         match value {
             "oracle" => Ok(Self::Oracle),
             "nop" => Ok(Self::Nop),
-            unsupported => Err(CliError::unimplemented(format!(
-                "agent `{unsupported}` is not implemented yet"
-            ))),
+            _ => Ok(Self::External),
         }
     }
 
-    fn as_str(self) -> &'static str {
+    fn as_str(self, options: &RunOptions) -> &str {
         match self {
             Self::Oracle => "oracle",
             Self::Nop => "nop",
+            Self::External => options.agent.as_deref().unwrap_or("agent"),
         }
     }
 
     fn requires_model(self) -> bool {
-        false
+        matches!(self, Self::External)
     }
 
-    fn sandbox_agent(self) -> SandboxAgent {
+    fn sandbox_agent(self, options: &RunOptions) -> Result<SandboxAgent, CliError> {
         match self {
-            Self::Oracle => SandboxAgent::Oracle,
-            Self::Nop => SandboxAgent::Nop,
+            Self::Oracle => Ok(SandboxAgent::Oracle),
+            Self::Nop => Ok(SandboxAgent::Nop),
+            Self::External => {
+                let name = options.agent.as_deref().unwrap_or("agent");
+                let command = match options.agent_command.as_deref() {
+                    Some(command) => command.to_owned(),
+                    None => default_agent_command(name, options.model.as_deref())?,
+                };
+
+                Ok(SandboxAgent::External(ExternalAgent {
+                    name: name.to_owned(),
+                    command,
+                    model: options.model.clone(),
+                }))
+            }
         }
     }
+}
+
+fn default_agent_command(agent: &str, model: Option<&str>) -> Result<String, CliError> {
+    match agent {
+        "codex" => {
+            let model = model
+                .map(|model| format!(" --model {}", shell_quote(model)))
+                .unwrap_or_default();
+
+            Ok(format!(
+                "codex exec --dangerously-bypass-approvals-and-sandbox --cd /app{model} \"$(cat \\\"$SEAPORT_INSTRUCTION_PATH\\\")\""
+            ))
+        }
+        "claude-code" | "claude" => {
+            let model = model
+                .map(|model| format!(" --model {}", shell_quote(model)))
+                .unwrap_or_default();
+
+            Ok(format!(
+                "claude --print --dangerously-skip-permissions{model} \"$(cat \\\"$SEAPORT_INSTRUCTION_PATH\\\")\""
+            ))
+        }
+        unsupported => Err(CliError::unimplemented(format!(
+            "agent `{unsupported}` requires `--agent-command <shell-command>` until a native adapter is implemented"
+        ))),
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 struct TrialOutcome {
@@ -369,8 +414,9 @@ fn sanitize_name(value: &str) -> String {
 
 fn job_config_json(target: &RunTarget, options: &RunOptions, agent: AgentKind) -> String {
     format!(
-        "{{\n  \"agent\": \"{}\",\n  \"backend\": \"{}\",\n  \"model\": {},\n  \"target\": \"{}\",\n  \"tasks\": {}\n}}\n",
-        agent.as_str(),
+        "{{\n  \"agent\": \"{}\",\n  \"agent_command\": {},\n  \"backend\": \"{}\",\n  \"model\": {},\n  \"target\": \"{}\",\n  \"tasks\": {}\n}}\n",
+        agent.as_str(options),
+        json_option(options.agent_command.as_deref()),
         options.backend.as_str(),
         json_option(options.model.as_deref()),
         json_escape(&target.name),
@@ -407,11 +453,11 @@ fn trial_result_json(passed: bool, reward: &str) -> String {
     )
 }
 
-fn trial_config_json(task_name: &str, agent: AgentKind) -> String {
+fn trial_config_json(task_name: &str, agent: AgentKind, options: &RunOptions) -> String {
     format!(
         "{{\n  \"task\": \"{}\",\n  \"agent\": \"{}\"\n}}\n",
         json_escape(task_name),
-        agent.as_str()
+        agent.as_str(options)
     )
 }
 
@@ -677,6 +723,8 @@ Options:
       --registry-path <path>
                           Harbor registry JSON for -d datasets and -t tasks
   -a, --agent <agent>     Agent adapter name; defaults to oracle
+      --agent-command <shell>
+                          Shell command for custom or not-yet-native agents
   -m, --model <model>     Model identifier
   -n <count>              Concurrency
       --jobs-dir <path>   Directory where job results are written
@@ -732,6 +780,7 @@ struct RunOptions {
     task_git_commit: Option<String>,
     registry_path: Option<String>,
     agent: Option<String>,
+    agent_command: Option<String>,
     model: Option<String>,
     concurrency: Option<String>,
     backend: SandboxBackend,
@@ -749,6 +798,7 @@ impl Default for RunOptions {
             task_git_commit: None,
             registry_path: None,
             agent: None,
+            agent_command: None,
             model: None,
             concurrency: None,
             backend: SandboxBackend::Docker,
@@ -793,6 +843,10 @@ impl RunOptions {
                 }
                 "-a" | "--agent" => {
                     options.agent = Some(required_value(args, index, flag)?);
+                    index += 2;
+                }
+                "--agent-command" => {
+                    options.agent_command = Some(required_value(args, index, flag)?);
                     index += 2;
                 }
                 "-m" | "--model" => {
@@ -1019,6 +1073,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_agent_command_option() {
+        let args = strings([
+            "-p",
+            "tasks/example",
+            "-a",
+            "custom",
+            "--agent-command",
+            "printf ok > \"$APP_DIR/output.txt\"",
+        ]);
+
+        let options = RunOptions::parse(&args).expect("options");
+
+        assert_eq!(options.agent.as_deref(), Some("custom"));
+        assert_eq!(
+            options.agent_command.as_deref(),
+            Some("printf ok > \"$APP_DIR/output.txt\"")
+        );
+    }
+
+    #[test]
     fn parses_unsafe_local_backend() {
         let args = strings([
             "-p",
@@ -1055,6 +1129,15 @@ mod tests {
     #[test]
     fn rejects_task_git_commit_without_git_url() {
         let args = strings(["run", "-p", "tasks/example", "--task-git-commit", "abc123"]);
+
+        let error = run(args).expect_err("error");
+
+        assert_eq!(error.exit_code(), EXIT_USAGE);
+    }
+
+    #[test]
+    fn codex_agent_requires_model_without_custom_command() {
+        let args = strings(["run", "-p", "missing", "-a", "codex"]);
 
         let error = run(args).expect_err("error");
 
@@ -1128,6 +1211,41 @@ mod tests {
 
         assert!(result.contains("\"tasks_passed\": 1"));
         assert!(trajectory.contains("\"command\": \"nop\""));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn runs_external_agent_command_without_rust_code() {
+        let root = temp_test_dir("external-agent-command");
+        let task = root.join("task");
+        let jobs = root.join("jobs");
+
+        write_agent_task(&task, "acme/external-agent");
+
+        let args = vec![
+            "run".to_owned(),
+            "-p".to_owned(),
+            task.display().to_string(),
+            "-a".to_owned(),
+            "custom".to_owned(),
+            "--agent-command".to_owned(),
+            "printf 'ok\\n' > \"$APP_DIR/output.txt\"".to_owned(),
+            "--backend".to_owned(),
+            "unsafe-local".to_owned(),
+            "--jobs-dir".to_owned(),
+            jobs.display().to_string(),
+        ];
+
+        run(args).expect("external command run");
+
+        let job_dir = single_child_dir(&jobs);
+        let result = fs::read_to_string(job_dir.join("result.json")).expect("job result");
+        let config = fs::read_to_string(job_dir.join("config.json")).expect("job config");
+
+        assert!(result.contains("\"tasks_passed\": 1"));
+        assert!(config.contains("\"agent\": \"custom\""));
+        assert!(config.contains("\"agent_command\": \"printf 'ok\\\\n'"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1368,6 +1486,23 @@ mod tests {
         fs::write(
             &test,
             "#!/bin/bash\nset -euo pipefail\nmkdir -p \"$LOGS_DIR\"\necho 1 > \"$LOGS_DIR/reward.txt\"\n",
+        )
+        .expect("test");
+
+        make_executable(&test).expect("test executable");
+    }
+
+    fn write_agent_task(root: &Path, name: &str) {
+        fs::create_dir_all(root.join("tests")).expect("tests dir");
+        fs::write(root.join("instruction.md"), "Create output.txt with ok.\n")
+            .expect("instruction");
+        fs::write(root.join("task.toml"), task_toml(name)).expect("task toml");
+
+        let test = root.join("tests").join("test.sh");
+
+        fs::write(
+            &test,
+            "#!/bin/bash\nset -euo pipefail\nmkdir -p \"$LOGS_DIR\"\nif [ \"$(cat \"$APP_DIR/output.txt\")\" = \"ok\" ]; then echo 1 > \"$LOGS_DIR/reward.txt\"; else echo 0 > \"$LOGS_DIR/reward.txt\"; fi\n",
         )
         .expect("test");
 
