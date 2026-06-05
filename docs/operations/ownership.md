@@ -18,10 +18,21 @@ quality gates.
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets -- -D warnings`
-- `cargo test --all-targets`
-- `cargo test --doc`
+- `cargo test --all-targets --locked`
+- `cargo test --doc --locked`
+- `bash -n install.sh`
 - `cargo run -- --help`
 - `test -f examples/tasks/basic-evaluation/task.toml`
 - `test -x examples/tasks/basic-evaluation/solution/solve.sh`
 - `test -x examples/tasks/basic-evaluation/tests/test.sh`
 - `cargo bench --bench evaluation`
+
+## Release Checklist
+
+1. Update `CHANGELOG.md`.
+2. Confirm `Cargo.toml` version matches the intended tag without the leading
+   `v`.
+3. Run the release verification commands above.
+4. Push a semantic version tag such as `v0.1.0`.
+5. Confirm GitHub Releases contains platform archives and `checksums.txt`.
+6. Smoke-test the installer with `VERSION=<version>`.

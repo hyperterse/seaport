@@ -27,7 +27,25 @@ collection, registry datasets, and the results viewer still need to be wired.
 
 ## Installation
 
-Install from this repository:
+Install the latest released Seaport CLI:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/hyperterse/seaport/main/install.sh | bash
+```
+
+Install a specific version:
+
+```sh
+VERSION=0.1.0 curl -fsSL https://raw.githubusercontent.com/hyperterse/seaport/main/install.sh | bash
+```
+
+Installer options:
+
+- `VERSION`: version to install, without the leading `v`; defaults to latest
+- `INSTALL_DIR`: installation directory; defaults to `~/.local/bin`
+- `BASE_URL`: release base URL; defaults to GitHub Releases
+
+Install from this repository during development:
 
 ```sh
 cargo install --path .
@@ -252,11 +270,22 @@ Run the full local verification set:
 ```sh
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test --all-targets
-cargo test --doc
+cargo test --all-targets --locked
+cargo test --doc --locked
+bash -n install.sh
 cargo run -- --help
 cargo bench --bench evaluation
 ```
+
+Create a release by pushing a semantic version tag:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow builds Linux, macOS, and Windows archives, publishes them
+to GitHub Releases, and uploads `checksums.txt`.
 
 Run only tests:
 
