@@ -247,6 +247,21 @@ The current implementation reports that no registry is configured. The next
 registry stage should add local registry files, remote registry resolution,
 dataset artifact downloads, and cache management.
 
+## Benchmarks
+
+Seaport includes a same-task oracle benchmark against Harbor:
+
+```sh
+python3 benchmarks/run.py --iterations 5
+```
+
+The benchmark task lives at `benchmarks/tasks/basic-oracle`. The runner writes
+machine-local output to `benchmarks/results/latest.json` and
+`benchmarks/results/latest.md`.
+
+The latest committed benchmark report is
+[`benchmarks/results/2026-06-05-oracle.md`](benchmarks/results/2026-06-05-oracle.md).
+
 ## Internal Library
 
 The repository also contains a Rust library used by the CLI implementation. It
@@ -273,6 +288,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all-targets --locked
 cargo test --doc --locked
 bash -n install.sh
+PYTHONPYCACHEPREFIX=/tmp/seaport-pycache python3 -m py_compile benchmarks/run.py
 cargo run -- --help
 cargo bench --bench evaluation
 ```

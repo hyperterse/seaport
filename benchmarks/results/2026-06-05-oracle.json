@@ -1,0 +1,39 @@
+{
+  "date": "2026-06-05",
+  "environment": {
+    "os": "macOS arm64",
+    "docker": "29.4.0 via OrbStack",
+    "harbor": "0.13.1",
+    "seaport": "local release build"
+  },
+  "task": "benchmarks/tasks/basic-oracle",
+  "iterations_requested": 3,
+  "results": [
+    {
+      "name": "seaport",
+      "successes": 3,
+      "durations_sec": [
+        0.339991792,
+        0.02079575,
+        0.016870584
+      ],
+      "mean_sec": 0.125886042
+    },
+    {
+      "name": "harbor",
+      "successes": 3,
+      "durations_sec": [
+        29.716727375,
+        80.327744542,
+        18.260834125
+      ],
+      "mean_sec": 42.76843534733333
+    }
+  ],
+  "comparison": {
+    "comparable": true,
+    "seaport_faster": true,
+    "speedup_ratio": 339.73929649272264
+  },
+  "caveat": "Compares oracle harness overhead on the same task. Seaport uses its local oracle runner; Harbor uses Docker-backed oracle task execution."
+}

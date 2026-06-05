@@ -1,0 +1,16 @@
+schema_version = "1.0"
+
+[task]
+name = "seaport/basic-oracle"
+description = "Minimal oracle task used to compare Seaport and Harbor harness overhead."
+
+[agent]
+timeout_sec = 120.0
+user = "agent"
+
+[verifier]
+timeout_sec = 120.0
+
+[environment]
+docker_image = "ubuntu:24.04"
+network_mode = "no-network"

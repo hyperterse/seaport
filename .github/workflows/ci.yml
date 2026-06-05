@@ -28,12 +28,19 @@ jobs:
       - run: cargo test --all-targets --locked
       - run: cargo test --doc --locked
       - run: bash -n install.sh
+      - run: PYTHONPYCACHEPREFIX=/tmp/seaport-pycache python3 -m py_compile benchmarks/run.py
       - run: cargo run -- --help
       - run: test -f examples/tasks/basic-evaluation/task.toml
         shell: bash
       - run: test -x examples/tasks/basic-evaluation/solution/solve.sh
         shell: bash
       - run: test -x examples/tasks/basic-evaluation/tests/test.sh
+        shell: bash
+      - run: test -f benchmarks/tasks/basic-oracle/task.toml
+        shell: bash
+      - run: test -x benchmarks/tasks/basic-oracle/solution/solve.sh
+        shell: bash
+      - run: test -x benchmarks/tasks/basic-oracle/tests/test.sh
         shell: bash
 
   benchmark:
