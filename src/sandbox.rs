@@ -76,6 +76,7 @@ pub(crate) fn run_task_scripts(
     backend: SandboxBackend,
 ) -> Result<ScriptOutputs, CliError> {
     let environment = task_environment(task_path)?;
+    prepare_task_file_workspace(task_path, app_dir)?;
 
     match backend {
         SandboxBackend::Docker => run_scripts_in_docker(
@@ -106,6 +107,71 @@ pub(crate) fn prepare_container_writable_dir(path: &Path) -> Result<(), CliError
 
 #[cfg(not(unix))]
 pub(crate) fn prepare_container_writable_dir(_path: &Path) -> Result<(), CliError> {
+    Ok(())
+}
+
+fn prepare_task_file_workspace(task_path: &Path, app_dir: &Path) -> Result<(), CliError> {
+    let source = task_path.join("environment").join("task_file");
+
+    if !source.is_dir() {
+        return Ok(());
+    }
+
+    let target = app_dir.join("task_file");
+
+    if target.exists() {
+        fs::remove_dir_all(&target)?;
+    }
+
+    copy_dir_all(&source, &target)?;
+    prepare_container_writable_tree(&target)
+}
+
+fn copy_dir_all(source: &Path, target: &Path) -> Result<(), CliError> {
+    fs::create_dir_all(target)?;
+
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = entry.file_type()?;
+
+        if file_type.is_dir() {
+            copy_dir_all(&source_path, &target_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &target_path)?;
+        } else {
+            return Err(CliError::usage(format!(
+                "unsupported entry in environment/task_file: {}",
+                source_path.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_container_writable_tree(path: &Path) -> Result<(), CliError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = fs::metadata(path)?;
+    let mut permissions = metadata.permissions();
+
+    permissions.set_mode(if metadata.is_dir() { 0o777 } else { 0o666 });
+    fs::set_permissions(path, permissions)?;
+
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            prepare_container_writable_tree(&entry?.path())?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn prepare_container_writable_tree(_path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
@@ -1007,6 +1073,32 @@ mod tests {
         assert!(args
             .iter()
             .any(|arg| arg == "type=bind,source=/tmp/task,target=/seaport/task,readonly"));
+    }
+
+    #[test]
+    fn prepare_task_file_workspace_copies_packaged_task_files() {
+        let task = temp_task_dir("task-file-source");
+        let app = temp_task_dir("task-file-app");
+        let input_dir = task
+            .join("environment")
+            .join("task_file")
+            .join("input_data");
+
+        fs::create_dir_all(&input_dir).expect("input dir");
+        fs::create_dir_all(app.join("task_file")).expect("stale task file dir");
+        fs::write(input_dir.join("requests.jsonl"), "{}\n").expect("input file");
+        fs::write(app.join("task_file").join("stale.txt"), "old").expect("stale file");
+
+        prepare_task_file_workspace(&task, &app).expect("workspace");
+
+        assert_eq!(
+            fs::read_to_string(app.join("task_file/input_data/requests.jsonl")).expect("input"),
+            "{}\n"
+        );
+        assert!(!app.join("task_file/stale.txt").exists());
+
+        let _ = fs::remove_dir_all(task);
+        let _ = fs::remove_dir_all(app);
     }
 
     #[test]
