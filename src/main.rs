@@ -19,7 +19,7 @@ use registry::{
 };
 use sandbox::{
     prepare_container_writable_dir, run_task_scripts, AgentStep, ExternalAgent, PhaseEnvs,
-    SandboxAgent, SandboxBackend,
+    SandboxAgent, SandboxBackend, ScriptOutputs,
 };
 use target::{RunTarget, TaskRef, TaskSelection};
 
@@ -250,39 +250,46 @@ fn run_trial(
 
     let sandbox_agent = agent.sandbox_agent(options)?;
     let phase_envs = options.phase_envs();
-    let outputs = run_task_scripts(
-        &task.path,
-        &trial_run_id,
-        &app_dir,
-        &logs_dir,
-        &sandbox_agent,
-        &phase_envs,
-        options.backend,
-    )?;
-    let reward = read_reward(&logs_dir)?;
-    let passed = reward.trim() == "1" || reward.trim() == "1.0";
+    let execution: Result<(ScriptOutputs, String), CliError> = (|| {
+        let outputs = run_task_scripts(
+            &task.path,
+            &trial_run_id,
+            &app_dir,
+            &logs_dir,
+            &sandbox_agent,
+            &phase_envs,
+            options.backend,
+        )?;
+        let reward = read_reward(&logs_dir)?;
 
-    fs::write(
-        agent_dir.join("trajectory.json"),
-        trajectory_json(&outputs.agent),
-    )?;
-    fs::write(
-        verifier_dir.join("test-stdout.txt"),
-        &outputs.verifier.stdout,
-    )?;
-    fs::write(
-        verifier_dir.join("test-stderr.txt"),
-        &outputs.verifier.stderr,
-    )?;
-    fs::write(verifier_dir.join("reward.txt"), &reward)?;
-    fs::write(
-        trial_dir.join("config.json"),
-        trial_config_json(task_name, attempt, agent, options),
-    )?;
-    fs::write(
-        trial_dir.join("result.json"),
-        trial_result_json(passed, reward.trim()),
-    )?;
+        Ok((outputs, reward))
+    })();
+
+    let outcome = match execution {
+        Ok((outputs, reward)) => record_completed_trial(TrialRecord {
+            task_name,
+            attempt,
+            agent,
+            options,
+            trial_dir: &trial_dir,
+            agent_dir: &agent_dir,
+            verifier_dir: &verifier_dir,
+            outputs,
+            reward,
+        })?,
+        Err(error) if error.is_task_failure() => record_failed_trial(TrialFailure {
+            task_name,
+            attempt,
+            agent,
+            options,
+            trial_dir: &trial_dir,
+            agent_dir: &agent_dir,
+            verifier_dir: &verifier_dir,
+            logs_dir: &logs_dir,
+            message: error.to_string(),
+        })?,
+        Err(error) => return Err(error),
+    };
 
     if let Err(error) = fs::remove_dir_all(&workspace) {
         eprintln!(
@@ -292,15 +299,10 @@ fn run_trial(
     }
 
     println!("task: {task_name}");
-    println!("reward: {}", reward.trim());
-    println!("passed: {passed}");
+    println!("reward: {}", outcome.reward);
+    println!("passed: {}", outcome.passed);
 
-    Ok(TrialOutcome {
-        task_name: task.name.clone(),
-        attempt,
-        reward: reward.trim().to_owned(),
-        passed,
-    })
+    Ok(outcome)
 }
 
 fn trial_dir_name(task_name: &str, attempt: usize, attempts: usize) -> String {
@@ -419,6 +421,137 @@ struct TrialOutcome {
     attempt: usize,
     reward: String,
     passed: bool,
+    error: Option<String>,
+}
+
+struct TrialRecord<'a> {
+    task_name: &'a str,
+    attempt: usize,
+    agent: AgentKind,
+    options: &'a RunOptions,
+    trial_dir: &'a Path,
+    agent_dir: &'a Path,
+    verifier_dir: &'a Path,
+    outputs: ScriptOutputs,
+    reward: String,
+}
+
+struct TrialFailure<'a> {
+    task_name: &'a str,
+    attempt: usize,
+    agent: AgentKind,
+    options: &'a RunOptions,
+    trial_dir: &'a Path,
+    agent_dir: &'a Path,
+    verifier_dir: &'a Path,
+    logs_dir: &'a Path,
+    message: String,
+}
+
+fn record_completed_trial(record: TrialRecord<'_>) -> Result<TrialOutcome, CliError> {
+    let reward = record.reward.trim().to_owned();
+    let passed = reward == "1" || reward == "1.0";
+
+    fs::write(
+        record.agent_dir.join("trajectory.json"),
+        trajectory_json(&record.outputs.agent),
+    )?;
+    fs::write(
+        record.verifier_dir.join("test-stdout.txt"),
+        &record.outputs.verifier.stdout,
+    )?;
+    fs::write(
+        record.verifier_dir.join("test-stderr.txt"),
+        &record.outputs.verifier.stderr,
+    )?;
+    fs::write(record.verifier_dir.join("reward.txt"), &record.reward)?;
+    write_trial_metadata(TrialMetadata {
+        trial_dir: record.trial_dir,
+        task_name: record.task_name,
+        attempt: record.attempt,
+        agent: record.agent,
+        options: record.options,
+        passed,
+        reward: &reward,
+        error: None,
+    })?;
+
+    Ok(TrialOutcome {
+        task_name: record.task_name.to_owned(),
+        attempt: record.attempt,
+        reward,
+        passed,
+        error: None,
+    })
+}
+
+fn record_failed_trial(failure: TrialFailure<'_>) -> Result<TrialOutcome, CliError> {
+    let reward = "0";
+    let failed_agent = AgentStep {
+        command: "execution failed".to_owned(),
+        status: 1,
+        stdout: Vec::new(),
+        stderr: failure.message.as_bytes().to_vec(),
+    };
+
+    fs::write(
+        failure.agent_dir.join("trajectory.json"),
+        trajectory_json(&failed_agent),
+    )?;
+    fs::write(failure.verifier_dir.join("test-stdout.txt"), [])?;
+    fs::write(
+        failure.verifier_dir.join("test-stderr.txt"),
+        failure.message.as_bytes(),
+    )?;
+    fs::write(failure.verifier_dir.join("reward.txt"), "0\n")?;
+    fs::write(failure.logs_dir.join("reward.txt"), "0\n")?;
+    write_trial_metadata(TrialMetadata {
+        trial_dir: failure.trial_dir,
+        task_name: failure.task_name,
+        attempt: failure.attempt,
+        agent: failure.agent,
+        options: failure.options,
+        passed: false,
+        reward,
+        error: Some(&failure.message),
+    })?;
+
+    Ok(TrialOutcome {
+        task_name: failure.task_name.to_owned(),
+        attempt: failure.attempt,
+        reward: reward.to_owned(),
+        passed: false,
+        error: Some(failure.message),
+    })
+}
+
+struct TrialMetadata<'a> {
+    trial_dir: &'a Path,
+    task_name: &'a str,
+    attempt: usize,
+    agent: AgentKind,
+    options: &'a RunOptions,
+    passed: bool,
+    reward: &'a str,
+    error: Option<&'a str>,
+}
+
+fn write_trial_metadata(metadata: TrialMetadata<'_>) -> Result<(), CliError> {
+    fs::write(
+        metadata.trial_dir.join("config.json"),
+        trial_config_json(
+            metadata.task_name,
+            metadata.attempt,
+            metadata.agent,
+            metadata.options,
+        ),
+    )?;
+    fs::write(
+        metadata.trial_dir.join("result.json"),
+        trial_result_json(metadata.passed, metadata.reward, metadata.error),
+    )?;
+
+    Ok(())
 }
 
 fn read_reward(logs_dir: &Path) -> Result<String, CliError> {
@@ -527,12 +660,20 @@ fn job_result_json(outcomes: &[TrialOutcome]) -> String {
     )
 }
 
-fn trial_result_json(passed: bool, reward: &str) -> String {
-    format!(
-        "{{\n  \"passed\": {},\n  \"reward\": \"{}\"\n}}\n",
-        passed,
-        json_escape(reward)
-    )
+fn trial_result_json(passed: bool, reward: &str, error: Option<&str>) -> String {
+    match error {
+        Some(error) => format!(
+            "{{\n  \"passed\": {},\n  \"reward\": \"{}\",\n  \"error\": \"{}\"\n}}\n",
+            passed,
+            json_escape(reward),
+            json_escape(error)
+        ),
+        None => format!(
+            "{{\n  \"passed\": {},\n  \"reward\": \"{}\"\n}}\n",
+            passed,
+            json_escape(reward)
+        ),
+    }
 }
 
 fn trial_config_json(
@@ -575,12 +716,19 @@ fn trial_outcomes_json(outcomes: &[TrialOutcome]) -> String {
     let items = outcomes
         .iter()
         .map(|outcome| {
+            let error = outcome
+                .error
+                .as_deref()
+                .map(|error| format!(",\"error\":\"{}\"", json_escape(error)))
+                .unwrap_or_default();
+
             format!(
-                "{{\"task\":\"{}\",\"attempt\":{},\"passed\":{},\"reward\":\"{}\"}}",
+                "{{\"task\":\"{}\",\"attempt\":{},\"passed\":{},\"reward\":\"{}\"{}}}",
                 json_escape(&outcome.task_name),
                 outcome.attempt,
                 outcome.passed,
-                json_escape(&outcome.reward)
+                json_escape(&outcome.reward),
+                error
             )
         })
         .collect::<Vec<_>>()
@@ -1140,6 +1288,10 @@ impl CliError {
     fn exit_code(&self) -> i32 {
         self.exit_code
     }
+
+    fn is_task_failure(&self) -> bool {
+        self.exit_code == EXIT_TASK_FAILED
+    }
 }
 
 impl fmt::Display for CliError {
@@ -1560,6 +1712,55 @@ mod tests {
     }
 
     #[test]
+    fn records_task_execution_errors_without_stopping_dataset() {
+        let root = temp_test_dir("task-execution-error");
+        let dataset = root.join("suite");
+        let jobs = root.join("jobs");
+
+        fs::create_dir_all(&dataset).expect("dataset dir");
+        fs::write(
+            dataset.join("dataset.toml"),
+            "[dataset]\nname = \"acme/errors\"\ndescription = \"error suite\"\n",
+        )
+        .expect("dataset manifest");
+        write_oracle_task(&dataset.join("good"), "acme/good");
+        write_failing_oracle_task(&dataset.join("bad"), "acme/bad");
+
+        let args = vec![
+            "run".to_owned(),
+            "-p".to_owned(),
+            dataset.display().to_string(),
+            "-a".to_owned(),
+            "oracle".to_owned(),
+            "-n".to_owned(),
+            "1".to_owned(),
+            "--backend".to_owned(),
+            "unsafe-local".to_owned(),
+            "--jobs-dir".to_owned(),
+            jobs.display().to_string(),
+        ];
+
+        let error = run(args).expect_err("dataset has one failed task");
+
+        assert_eq!(error.exit_code(), EXIT_TASK_FAILED);
+
+        let job_dir = single_child_dir(&jobs);
+        let result = fs::read_to_string(job_dir.join("result.json")).expect("job result");
+        let failed_result =
+            fs::read_to_string(job_dir.join("acme-bad").join("result.json")).expect("bad result");
+
+        assert!(result.contains("\"tasks_total\": 2"));
+        assert!(result.contains("\"tasks_passed\": 1"));
+        assert!(result.contains("\"tasks_failed\": 1"));
+        assert!(result.contains("\"task\":\"acme/bad\""));
+        assert!(result.contains("\"error\":\"script failed:"));
+        assert!(failed_result.contains("\"passed\": false"));
+        assert!(failed_result.contains("\"error\": \"script failed:"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn runs_local_registry_dataset() {
         let root = temp_test_dir("registry-dataset");
         let tasks = root.join("tasks");
@@ -1732,6 +1933,30 @@ mod tests {
         fs::write(
             &test,
             "#!/bin/bash\nset -euo pipefail\nmkdir -p \"$LOGS_DIR\"\nif [ \"$(cat \"$APP_DIR/output.txt\")\" = \"ok\" ]; then echo 1 > \"$LOGS_DIR/reward.txt\"; else echo 0 > \"$LOGS_DIR/reward.txt\"; fi\n",
+        )
+        .expect("test");
+
+        make_executable(&solve).expect("solve executable");
+        make_executable(&test).expect("test executable");
+    }
+
+    fn write_failing_oracle_task(root: &Path, name: &str) {
+        fs::create_dir_all(root.join("solution")).expect("solution dir");
+        fs::create_dir_all(root.join("tests")).expect("tests dir");
+        fs::write(
+            root.join("instruction.md"),
+            "This task fails during execution.\n",
+        )
+        .expect("instruction");
+        fs::write(root.join("task.toml"), task_toml(name)).expect("task toml");
+
+        let solve = root.join("solution").join("solve.sh");
+        let test = root.join("tests").join("test.sh");
+
+        fs::write(&solve, "#!/bin/bash\nset -euo pipefail\nexit 17\n").expect("solve");
+        fs::write(
+            &test,
+            "#!/bin/bash\nset -euo pipefail\nmkdir -p \"$LOGS_DIR\"\necho 0 > \"$LOGS_DIR/reward.txt\"\n",
         )
         .expect("test");
 
