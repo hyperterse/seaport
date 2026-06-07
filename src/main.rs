@@ -2,7 +2,7 @@ use std::env;
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{mpsc, Mutex};
@@ -73,6 +73,7 @@ fn run_eval(args: &[String]) -> Result<(), CliError> {
         ));
     }
 
+    print_run_start(&options, agent)?;
     let target = resolve_run_target(&options)?;
     run_target(&target, &options, agent)
 }
@@ -83,6 +84,7 @@ fn resolve_run_target(options: &RunOptions) -> Result<RunTarget, CliError> {
             .path
             .as_deref()
             .ok_or_else(|| CliError::usage("--task-git-url requires `-p <path-in-repo>`"))?;
+        print_progress(&format!("resolving git task: {git_url} @ {path}"))?;
         let task_path =
             resolve_git_task_source(git_url, options.task_git_commit.as_deref(), Path::new(path))?;
 
@@ -90,10 +92,12 @@ fn resolve_run_target(options: &RunOptions) -> Result<RunTarget, CliError> {
     }
 
     if let Some(path) = options.path.as_deref() {
+        print_progress(&format!("loading local target: {path}"))?;
         return RunTarget::from_path(Path::new(path), &options.selection);
     }
 
     if let Some(task) = options.task.as_deref() {
+        print_progress(&format!("resolving registered task: {task}"))?;
         let resolved = match options.registry_path.as_deref() {
             Some(registry_path) => resolve_local_registry_task(task, Path::new(registry_path))?,
             None => resolve_remote_registry_task(task, options.registry_url.as_deref())?,
@@ -106,6 +110,7 @@ fn resolve_run_target(options: &RunOptions) -> Result<RunTarget, CliError> {
         .dataset
         .as_deref()
         .ok_or_else(|| CliError::usage("run requires either `-p <path>` or `-d <dataset>`"))?;
+    print_progress(&format!("resolving dataset: {dataset}"))?;
     let resolved = match options.registry_path.as_deref() {
         Some(registry_path) => resolve_local_registry_dataset(dataset, Path::new(registry_path))?,
         None => resolve_remote_registry_dataset(dataset, options.registry_url.as_deref())?,
@@ -124,6 +129,9 @@ fn run_target(target: &RunTarget, options: &RunOptions, agent: AgentKind) -> Res
     let job_dir = job_root.join(format!("seaport-{run_id}"));
     let plans = trial_plans(target, options);
     let concurrency = options.concurrency.min(plans.len().max(1));
+
+    print_target_ready(target, &job_dir, plans.len(), concurrency)?;
+
     let outcomes = run_trial_plans(&plans, &job_dir, &run_id, options, agent, concurrency)?;
 
     fs::write(
@@ -149,6 +157,57 @@ fn run_target(target: &RunTarget, options: &RunOptions, agent: AgentKind) -> Res
             outcomes.len()
         )))
     }
+}
+
+fn print_run_start(options: &RunOptions, agent: AgentKind) -> Result<(), CliError> {
+    println!("Seaport run");
+    println!("  source: {}", run_source_label(options));
+    println!("  agent: {}", agent.as_str(options));
+    println!("  backend: {}", options.backend.as_str());
+    println!("  attempts: {}", options.attempts);
+    println!("  requested concurrency: {}", options.concurrency);
+    io::stdout().flush()?;
+
+    Ok(())
+}
+
+fn run_source_label(options: &RunOptions) -> String {
+    if let Some(git_url) = options.task_git_url.as_deref() {
+        format!("git {git_url}")
+    } else if let Some(dataset) = options.dataset.as_deref() {
+        format!("dataset {dataset}")
+    } else if let Some(task) = options.task.as_deref() {
+        format!("task {task}")
+    } else if let Some(path) = options.path.as_deref() {
+        format!("path {path}")
+    } else {
+        "unknown".to_owned()
+    }
+}
+
+fn print_target_ready(
+    target: &RunTarget,
+    job_dir: &Path,
+    trials: usize,
+    concurrency: usize,
+) -> Result<(), CliError> {
+    println!();
+    println!("Target ready");
+    println!("  target: {}", target.name);
+    println!("  tasks: {}", target.tasks.len());
+    println!("  trials: {trials}");
+    println!("  concurrency: {concurrency}");
+    println!("  job_dir: {}", job_dir.display());
+    io::stdout().flush()?;
+
+    Ok(())
+}
+
+fn print_progress(message: &str) -> Result<(), CliError> {
+    println!("  -> {message}");
+    io::stdout().flush()?;
+
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

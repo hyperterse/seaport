@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
@@ -30,6 +30,7 @@ pub(crate) fn resolve_local_registry_dataset(
     dataset: &str,
     registry_path: &Path,
 ) -> Result<ResolvedRegistryDataset, CliError> {
+    progress(&format!("reading registry: {}", registry_path.display()))?;
     let registry_root = registry_path.parent().unwrap_or_else(|| Path::new("."));
     let registry = RegistryFile::from_path(registry_path)?;
 
@@ -46,10 +47,12 @@ pub(crate) fn resolve_remote_registry_dataset(
     registry_url: Option<&str>,
 ) -> Result<ResolvedRegistryDataset, CliError> {
     if use_package_registry(registry_url) {
+        progress("using package registry")?;
         return resolve_package_dataset(dataset);
     }
 
     let registry_url = registry_url.expect("custom registry URL");
+    progress(&format!("fetching registry: {registry_url}"))?;
     let registry = RegistryFile::from_url(registry_url)?;
     let registry_root = url_registry_root(registry_url);
 
@@ -105,6 +108,7 @@ pub(crate) fn resolve_local_registry_task(
     task_name: &str,
     registry_path: &Path,
 ) -> Result<ResolvedRegistryDataset, CliError> {
+    progress(&format!("reading registry: {}", registry_path.display()))?;
     let registry_root = registry_path.parent().unwrap_or_else(|| Path::new("."));
     let registry = RegistryFile::from_path(registry_path)?;
 
@@ -121,10 +125,12 @@ pub(crate) fn resolve_remote_registry_task(
     registry_url: Option<&str>,
 ) -> Result<ResolvedRegistryDataset, CliError> {
     if use_package_registry(registry_url) {
+        progress("using package registry")?;
         return resolve_package_task(task_name);
     }
 
     let registry_url = registry_url.expect("custom registry URL");
+    progress(&format!("fetching registry: {registry_url}"))?;
     let registry = RegistryFile::from_url(registry_url)?;
     let registry_root = url_registry_root(registry_url);
 
@@ -282,7 +288,12 @@ fn use_package_registry(registry_url: Option<&str>) -> bool {
 
 fn resolve_package_dataset(dataset: &str) -> Result<ResolvedRegistryDataset, CliError> {
     let reference = PackageReference::parse(dataset)?;
+    progress(&format!(
+        "querying dataset package: {}",
+        reference.display_with_ref()
+    ))?;
     let dataset_version = resolve_package_dataset_version(&reference)?;
+    progress("loading dataset task list")?;
     let task_versions = package_dataset_tasks(&dataset_version.id)?;
 
     if task_versions.is_empty() {
@@ -292,9 +303,17 @@ fn resolve_package_dataset(dataset: &str) -> Result<ResolvedRegistryDataset, Cli
         )));
     }
 
+    progress(&format!("found {} packaged tasks", task_versions.len()))?;
     let mut task_paths = Vec::with_capacity(task_versions.len());
 
-    for task in &task_versions {
+    for (index, task) in task_versions.iter().enumerate() {
+        progress(&format!(
+            "preparing package task {}/{}: {}/{}",
+            index + 1,
+            task_versions.len(),
+            task.package.org.name,
+            task.package.name
+        ))?;
         task_paths.push(download_package_task(task)?);
     }
 
@@ -306,6 +325,10 @@ fn resolve_package_dataset(dataset: &str) -> Result<ResolvedRegistryDataset, Cli
 
 fn resolve_package_task(task_name: &str) -> Result<ResolvedRegistryDataset, CliError> {
     let reference = PackageReference::parse(task_name)?;
+    progress(&format!(
+        "querying task package: {}",
+        reference.display_with_ref()
+    ))?;
     let task_version = resolve_package_task_version(&reference)?.ok_or_else(|| {
         CliError::usage(format!(
             "task `{}` was not found in the package registry",
@@ -448,6 +471,10 @@ fn download_package_task(task: &PackageTaskVersion) -> Result<PathBuf, CliError>
     let target_dir = package_task_cache_dir(task);
 
     if target_dir.join("task.toml").is_file() {
+        progress(&format!(
+            "cache hit: {}/{}",
+            task.package.org.name, task.package.name
+        ))?;
         return Ok(target_dir);
     }
 
@@ -474,8 +501,20 @@ fn download_package_task(task: &PackageTaskVersion) -> Result<PathBuf, CliError>
     fs::create_dir_all(&unpack_dir)?;
 
     let result = (|| {
+        progress(&format!(
+            "downloading archive: {}/{}",
+            task.package.org.name, task.package.name
+        ))?;
         download_package_archive(&task.archive_path, &archive_path)?;
+        progress(&format!(
+            "validating archive: {}/{}",
+            task.package.org.name, task.package.name
+        ))?;
         validate_archive_paths(&archive_path)?;
+        progress(&format!(
+            "extracting archive: {}/{}",
+            task.package.org.name, task.package.name
+        ))?;
         extract_archive(&archive_path, &unpack_dir)?;
 
         if !unpack_dir.join("task.toml").is_file() {
@@ -489,6 +528,10 @@ fn download_package_task(task: &PackageTaskVersion) -> Result<PathBuf, CliError>
             fs::remove_dir_all(&target_dir)?;
         }
         fs::rename(&unpack_dir, &target_dir)?;
+        progress(&format!(
+            "ready: {}/{}",
+            task.package.org.name, task.package.name
+        ))?;
 
         Ok(target_dir.clone())
     })();
@@ -645,14 +688,18 @@ fn ensure_git_checkout(
             .ok_or_else(|| CliError::io("git cache path has no parent"))?;
         fs::create_dir_all(parent)?;
 
+        progress(&format!("cloning git source: {git_source}"))?;
         let mut clone = Command::new("git");
         clone
             .args(["clone", "--quiet"])
             .arg(git_source)
             .arg(checkout_dir);
         run_git(clone, "clone git-backed registry task")?;
+    } else {
+        progress(&format!("git cache hit: {git_source}"))?;
     }
 
+    progress(&format!("checking out revision: {revision}"))?;
     let mut checkout = Command::new("git");
     checkout
         .arg("-C")
@@ -842,6 +889,13 @@ fn run_command_output(
         ))),
         Err(error) => Err(CliError::io(error.to_string())),
     }
+}
+
+fn progress(message: &str) -> Result<(), CliError> {
+    println!("  -> {message}");
+    io::stdout().flush()?;
+
+    Ok(())
 }
 
 fn url_registry_root(url: &str) -> PathBuf {
