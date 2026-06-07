@@ -1,3 +1,4 @@
+use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
@@ -12,6 +13,7 @@ const CONTAINER_USER: &str = "1000:1000";
 const CONTAINER_MEMORY: &str = "1g";
 const CONTAINER_CPUS: &str = "1.0";
 const CONTAINER_PIDS_LIMIT: &str = "256";
+const DEFAULT_COMPAT_DOCKER_PLATFORM: &str = "linux/amd64";
 const DOCKER_BUILD_TIMEOUT: Duration = Duration::from_secs(600);
 
 pub(crate) struct ScriptOutputs {
@@ -213,6 +215,7 @@ fn run_scripts_in_docker(
                     task_label: runtime.task_label,
                     script: "solution/solve.sh",
                     network: environment.agent_network,
+                    platform: environment.platform.as_deref(),
                     env: &envs.agent,
                     timeout: environment.agent_timeout,
                 })?,
@@ -229,6 +232,7 @@ fn run_scripts_in_docker(
                     task_label: runtime.task_label,
                     agent,
                     network: environment.agent_network,
+                    platform: environment.platform.as_deref(),
                     env: &envs.agent,
                     timeout: environment.agent_timeout,
                 })?,
@@ -243,6 +247,7 @@ fn run_scripts_in_docker(
             task_label: runtime.task_label,
             script: "tests/test.sh",
             network: environment.verifier_network,
+            platform: environment.platform.as_deref(),
             env: &envs.verifier,
             timeout: environment.verifier_timeout,
         })?;
@@ -265,6 +270,7 @@ struct DockerImage {
 struct TaskEnvironment {
     image: String,
     prebuilt_image: bool,
+    platform: Option<String>,
     build_network: DockerNetwork,
     agent_network: DockerNetwork,
     verifier_network: DockerNetwork,
@@ -295,6 +301,7 @@ fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
     let image = explicit_image
         .clone()
         .unwrap_or_else(|| DEFAULT_DOCKER_IMAGE.to_owned());
+    let platform = docker_platform(&task_toml);
     let baseline_network = baseline_network(&task_toml)?;
     let build_timeout = toml_duration_value_with_default(
         &task_toml,
@@ -312,6 +319,7 @@ fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
     Ok(TaskEnvironment {
         image,
         prebuilt_image: explicit_image.is_some(),
+        platform,
         build_network: baseline_network,
         agent_network,
         verifier_network,
@@ -343,6 +351,35 @@ fn phase_network(contents: &str, section: &str) -> Result<Option<DockerNetwork>,
     match toml_section_value(contents, section, "network_mode") {
         Some(value) => parse_network_mode(&format!("{section}.network_mode"), &value).map(Some),
         None => Ok(None),
+    }
+}
+
+fn docker_platform(contents: &str) -> Option<String> {
+    if let Ok(platform) = env::var("SEAPORT_DOCKER_PLATFORM") {
+        return docker_platform_value(&platform);
+    }
+
+    toml_section_value(contents, "environment", "docker_platform")
+        .or_else(|| toml_section_value(contents, "environment", "platform"))
+        .or_else(|| toml_top_level_value(contents, "docker_platform"))
+        .or_else(default_docker_platform)
+}
+
+fn docker_platform_value(platform: &str) -> Option<String> {
+    let platform = platform.trim();
+
+    if platform.is_empty() || platform == "host" || platform == "native" {
+        None
+    } else {
+        Some(platform.to_owned())
+    }
+}
+
+fn default_docker_platform() -> Option<String> {
+    if cfg!(target_arch = "aarch64") {
+        Some(DEFAULT_COMPAT_DOCKER_PLATFORM.to_owned())
+    } else {
+        None
     }
 }
 
@@ -507,17 +544,18 @@ fn prepare_docker_image(
         .parent()
         .ok_or_else(|| CliError::usage("environment/Dockerfile has no parent directory"))?;
     let mut command = Command::new("docker");
-    command
-        .args([
-            "build",
-            "--pull=false",
-            "--network",
-            environment.build_network.as_docker_arg(),
-            "-q",
-            "-t",
-            &tag,
-        ])
-        .arg(environment_dir);
+    command.args([
+        "build",
+        "--pull=false",
+        "--network",
+        environment.build_network.as_docker_arg(),
+    ]);
+
+    if let Some(platform) = environment.platform.as_deref() {
+        command.args(["--platform", platform]);
+    }
+
+    command.args(["-q", "-t", &tag]).arg(environment_dir);
     let timed_output = run_command_with_timeout(
         command,
         environment.build_timeout,
@@ -581,6 +619,7 @@ struct DockerScriptRun<'a> {
     task_label: &'a str,
     script: &'a str,
     network: DockerNetwork,
+    platform: Option<&'a str>,
     env: &'a [(String, String)],
     timeout: Duration,
 }
@@ -594,6 +633,7 @@ struct DockerShellRun<'a> {
     task_label: &'a str,
     agent: &'a ExternalAgent,
     network: DockerNetwork,
+    platform: Option<&'a str>,
     env: &'a [(String, String)],
     timeout: Duration,
 }
@@ -613,6 +653,7 @@ fn run_script_in_docker(run: DockerScriptRun<'_>) -> Result<Output, CliError> {
         logs_root,
         invocation: DockerInvocation::TaskScript(run.script),
         network: run.network,
+        platform: run.platform,
         extra_env: &extra_env,
     });
     let timed_output = run_command_with_timeout(
@@ -665,6 +706,7 @@ fn run_shell_in_docker(run: DockerShellRun<'_>) -> Result<Output, CliError> {
         logs_root,
         invocation: DockerInvocation::ShellCommand(&run.agent.command),
         network: run.network,
+        platform: run.platform,
         extra_env: &extra_env,
     });
     let timed_output = run_command_with_timeout(
@@ -709,6 +751,7 @@ struct DockerRunCommand<'a> {
     logs_root: &'a Path,
     invocation: DockerInvocation<'a>,
     network: DockerNetwork,
+    platform: Option<&'a str>,
     extra_env: &'a [(&'a str, &'a str)],
 }
 
@@ -756,7 +799,13 @@ fn docker_run_command(run: DockerRunCommand<'_>) -> Command {
             run.extra_env
                 .iter()
                 .flat_map(|(name, value)| ["--env".to_owned(), format!("{name}={value}")]),
-        )
+        );
+
+    if let Some(platform) = run.platform {
+        command.args(["--platform", platform]);
+    }
+
+    command
         .arg("--mount")
         .arg(format!(
             "type=bind,source={},target=/app",
@@ -1190,6 +1239,7 @@ mod tests {
             logs_root: Path::new("/tmp/logs"),
             invocation: DockerInvocation::TaskScript("tests/test.sh"),
             network: DockerNetwork::None,
+            platform: Some("linux/amd64"),
             extra_env: &[],
         });
         let args = command_args(command);
@@ -1197,6 +1247,9 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|window| window == ["--network", "none"]));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--platform", "linux/amd64"]));
         assert!(args
             .windows(2)
             .any(|window| window == ["--cap-drop", "ALL"]));
@@ -1271,6 +1324,7 @@ mod tests {
             r#"
 [environment]
 docker_image = "python:3.12"
+docker_platform = "linux/arm64"
 network_mode = "public"
 build_timeout_sec = 7.5
 os = "linux"
@@ -1290,6 +1344,7 @@ network_mode = "public"
 
         assert_eq!(environment.image, "python:3.12");
         assert!(environment.prebuilt_image);
+        assert_eq!(environment.platform.as_deref(), Some("linux/arm64"));
         assert_eq!(environment.build_network, DockerNetwork::Bridge);
         assert_eq!(environment.agent_network, DockerNetwork::None);
         assert_eq!(environment.verifier_network, DockerNetwork::Bridge);
