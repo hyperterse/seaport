@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{mpsc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod registry;
 mod sandbox;
@@ -19,7 +19,7 @@ use registry::{
 };
 use sandbox::{
     prepare_container_writable_dir, run_task_scripts, AgentStep, ExternalAgent, PhaseEnvs,
-    SandboxAgent, SandboxBackend, ScriptOutputs,
+    SandboxAgent, SandboxBackend, ScriptOutputs, TaskScriptRequest,
 };
 use target::{RunTarget, TaskRef, TaskSelection};
 
@@ -226,6 +226,7 @@ fn run_trial(
     agent: AgentKind,
 ) -> Result<TrialOutcome, CliError> {
     let task_name = &task.name;
+    let started = Instant::now();
     let trial_name = trial_dir_name(task_name, attempt, options.attempts);
     let trial_run_id = format!("{run_id}-{trial_name}");
     let trial_dir = job_dir.join(&trial_name);
@@ -244,6 +245,8 @@ fn run_trial(
     fs::create_dir_all(&app_dir)?;
     fs::create_dir_all(&logs_dir)?;
 
+    print_trial_start(task_name, attempt, options, agent);
+
     prepare_container_writable_dir(&app_dir)?;
     prepare_container_writable_dir(&workspace.join("logs"))?;
     prepare_container_writable_dir(&logs_dir)?;
@@ -251,15 +254,16 @@ fn run_trial(
     let sandbox_agent = agent.sandbox_agent(options)?;
     let phase_envs = options.phase_envs();
     let execution: Result<(ScriptOutputs, String), CliError> = (|| {
-        let outputs = run_task_scripts(
-            &task.path,
-            &trial_run_id,
-            &app_dir,
-            &logs_dir,
-            &sandbox_agent,
-            &phase_envs,
-            options.backend,
-        )?;
+        let outputs = run_task_scripts(TaskScriptRequest {
+            task_label: task_name,
+            task_path: &task.path,
+            run_id: &trial_run_id,
+            app_dir: &app_dir,
+            logs_dir: &logs_dir,
+            agent: &sandbox_agent,
+            envs: &phase_envs,
+            backend: options.backend,
+        })?;
         let reward = read_reward(&logs_dir)?;
 
         Ok((outputs, reward))
@@ -298,11 +302,50 @@ fn run_trial(
         );
     }
 
-    println!("task: {task_name}");
-    println!("reward: {}", outcome.reward);
-    println!("passed: {}", outcome.passed);
+    print_trial_finish(task_name, &outcome, started.elapsed());
 
     Ok(outcome)
+}
+
+fn print_trial_start(task_name: &str, attempt: usize, options: &RunOptions, agent: AgentKind) {
+    println!();
+    println!("==> running {task_name}");
+    println!(
+        "    attempt: {attempt}/{}   agent: {}   backend: {}",
+        options.attempts,
+        agent.as_str(options),
+        options.backend.as_str()
+    );
+}
+
+fn print_trial_finish(task_name: &str, outcome: &TrialOutcome, elapsed: Duration) {
+    let result = if outcome.passed { "passed" } else { "failed" };
+
+    println!("<== finished {task_name}");
+    println!(
+        "    result: {result}   reward: {}   elapsed: {}",
+        outcome.reward,
+        format_duration(elapsed)
+    );
+
+    if let Some(error) = outcome.error.as_deref() {
+        println!("    error: {}", first_error_line(error));
+    }
+}
+
+fn first_error_line(error: &str) -> &str {
+    error.lines().next().unwrap_or(error)
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let millis = duration.subsec_millis();
+
+    if seconds >= 60 {
+        format!("{}m {:02}.{:03}s", seconds / 60, seconds % 60, millis)
+    } else {
+        format!("{seconds}.{millis:03}s")
+    }
 }
 
 fn trial_dir_name(task_name: &str, attempt: usize, attempts: usize) -> String {

@@ -1,5 +1,5 @@
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -17,6 +17,17 @@ const DOCKER_BUILD_TIMEOUT: Duration = Duration::from_secs(600);
 pub(crate) struct ScriptOutputs {
     pub(crate) agent: AgentStep,
     pub(crate) verifier: Output,
+}
+
+pub(crate) struct TaskScriptRequest<'a> {
+    pub(crate) task_label: &'a str,
+    pub(crate) task_path: &'a Path,
+    pub(crate) run_id: &'a str,
+    pub(crate) app_dir: &'a Path,
+    pub(crate) logs_dir: &'a Path,
+    pub(crate) agent: &'a SandboxAgent,
+    pub(crate) envs: &'a PhaseEnvs,
+    pub(crate) backend: SandboxBackend,
 }
 
 pub(crate) struct AgentStep {
@@ -66,32 +77,32 @@ pub(crate) struct PhaseEnvs {
     pub(crate) verifier: Vec<(String, String)>,
 }
 
-pub(crate) fn run_task_scripts(
-    task_path: &Path,
-    run_id: &str,
-    app_dir: &Path,
-    logs_dir: &Path,
-    agent: &SandboxAgent,
-    envs: &PhaseEnvs,
-    backend: SandboxBackend,
-) -> Result<ScriptOutputs, CliError> {
-    let environment = task_environment(task_path)?;
-    prepare_task_file_workspace(task_path, app_dir)?;
+pub(crate) fn run_task_scripts(run: TaskScriptRequest<'_>) -> Result<ScriptOutputs, CliError> {
+    let environment = task_environment(run.task_path)?;
+    prepare_task_file_workspace(run.task_path, run.app_dir)?;
+    let runtime = TaskRuntime {
+        task_label: run.task_label,
+        task_path: run.task_path,
+        run_id: run.run_id,
+        app_dir: run.app_dir,
+        logs_dir: run.logs_dir,
+    };
 
-    match backend {
-        SandboxBackend::Docker => run_scripts_in_docker(
-            task_path,
-            run_id,
-            app_dir,
-            logs_dir,
-            agent,
-            envs,
-            &environment,
-        ),
+    match run.backend {
+        SandboxBackend::Docker => run_scripts_in_docker(runtime, run.agent, run.envs, &environment),
         SandboxBackend::UnsafeLocal => {
-            run_scripts_locally(task_path, app_dir, logs_dir, agent, envs, &environment)
+            run_scripts_locally(runtime, run.agent, run.envs, &environment)
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct TaskRuntime<'a> {
+    task_label: &'a str,
+    task_path: &'a Path,
+    run_id: &'a str,
+    app_dir: &'a Path,
+    logs_dir: &'a Path,
 }
 
 #[cfg(unix)]
@@ -176,27 +187,30 @@ fn prepare_container_writable_tree(_path: &Path) -> Result<(), CliError> {
 }
 
 fn run_scripts_in_docker(
-    task_path: &Path,
-    run_id: &str,
-    app_dir: &Path,
-    logs_dir: &Path,
+    runtime: TaskRuntime<'_>,
     agent_kind: &SandboxAgent,
     envs: &PhaseEnvs,
     environment: &TaskEnvironment,
 ) -> Result<ScriptOutputs, CliError> {
     ensure_docker_available()?;
 
-    let image = prepare_docker_image(task_path, run_id, environment)?;
+    let image = prepare_docker_image(
+        runtime.task_label,
+        runtime.task_path,
+        runtime.run_id,
+        environment,
+    )?;
     let result = (|| {
         let agent = match agent_kind {
             SandboxAgent::Oracle => AgentStep::from_output(
                 "solution/solve.sh",
                 run_script_in_docker(DockerScriptRun {
                     image: &image.reference,
-                    run_id,
-                    task_path,
-                    app_dir,
-                    logs_dir,
+                    run_id: runtime.run_id,
+                    task_path: runtime.task_path,
+                    app_dir: runtime.app_dir,
+                    logs_dir: runtime.logs_dir,
+                    task_label: runtime.task_label,
                     script: "solution/solve.sh",
                     network: environment.agent_network,
                     env: &envs.agent,
@@ -208,10 +222,11 @@ fn run_scripts_in_docker(
                 agent.command.clone(),
                 run_shell_in_docker(DockerShellRun {
                     image: &image.reference,
-                    run_id,
-                    task_path,
-                    app_dir,
-                    logs_dir,
+                    run_id: runtime.run_id,
+                    task_path: runtime.task_path,
+                    app_dir: runtime.app_dir,
+                    logs_dir: runtime.logs_dir,
+                    task_label: runtime.task_label,
                     agent,
                     network: environment.agent_network,
                     env: &envs.agent,
@@ -221,10 +236,11 @@ fn run_scripts_in_docker(
         };
         let verifier = run_script_in_docker(DockerScriptRun {
             image: &image.reference,
-            run_id,
-            task_path,
-            app_dir,
-            logs_dir,
+            run_id: runtime.run_id,
+            task_path: runtime.task_path,
+            app_dir: runtime.app_dir,
+            logs_dir: runtime.logs_dir,
+            task_label: runtime.task_label,
             script: "tests/test.sh",
             network: environment.verifier_network,
             env: &envs.verifier,
@@ -472,6 +488,7 @@ fn strip_inline_comment(value: &str) -> &str {
 }
 
 fn prepare_docker_image(
+    task_label: &str,
     task_path: &Path,
     run_id: &str,
     environment: &TaskEnvironment,
@@ -501,7 +518,11 @@ fn prepare_docker_image(
             &tag,
         ])
         .arg(environment_dir);
-    let timed_output = run_command_with_timeout(command, environment.build_timeout)?;
+    let timed_output = run_command_with_timeout(
+        command,
+        environment.build_timeout,
+        Some(CommandLog::new(task_label, "build")),
+    )?;
     let output = timed_output.output;
 
     if timed_output.timed_out {
@@ -557,6 +578,7 @@ struct DockerScriptRun<'a> {
     task_path: &'a Path,
     app_dir: &'a Path,
     logs_dir: &'a Path,
+    task_label: &'a str,
     script: &'a str,
     network: DockerNetwork,
     env: &'a [(String, String)],
@@ -569,6 +591,7 @@ struct DockerShellRun<'a> {
     task_path: &'a Path,
     app_dir: &'a Path,
     logs_dir: &'a Path,
+    task_label: &'a str,
     agent: &'a ExternalAgent,
     network: DockerNetwork,
     env: &'a [(String, String)],
@@ -592,7 +615,11 @@ fn run_script_in_docker(run: DockerScriptRun<'_>) -> Result<Output, CliError> {
         network: run.network,
         extra_env: &extra_env,
     });
-    let timed_output = run_command_with_timeout(command, run.timeout)?;
+    let timed_output = run_command_with_timeout(
+        command,
+        run.timeout,
+        Some(CommandLog::new(run.task_label, script_phase(run.script))),
+    )?;
     let output = timed_output.output;
 
     if timed_output.timed_out {
@@ -640,7 +667,11 @@ fn run_shell_in_docker(run: DockerShellRun<'_>) -> Result<Output, CliError> {
         network: run.network,
         extra_env: &extra_env,
     });
-    let timed_output = run_command_with_timeout(command, run.timeout)?;
+    let timed_output = run_command_with_timeout(
+        command,
+        run.timeout,
+        Some(CommandLog::new(run.task_label, "agent")),
+    )?;
     let output = timed_output.output;
 
     if timed_output.timed_out {
@@ -766,6 +797,16 @@ fn docker_container_name(run_id: &str, script: &str) -> String {
     format!("seaport-{phase}-{run_id}")
 }
 
+fn script_phase(script: &str) -> &'static str {
+    if script.starts_with("solution/") {
+        "solution"
+    } else if script.starts_with("tests/") {
+        "verifier"
+    } else {
+        "script"
+    }
+}
+
 fn cleanup_docker_container(container_name: &str) {
     match Command::new("docker")
         .args(["container", "rm", "-f", container_name])
@@ -807,47 +848,50 @@ fn cleanup_docker_image(image: &str) {
 }
 
 fn run_scripts_locally(
-    task_path: &Path,
-    app_dir: &Path,
-    logs_dir: &Path,
+    runtime: TaskRuntime<'_>,
     agent_kind: &SandboxAgent,
     envs: &PhaseEnvs,
     environment: &TaskEnvironment,
 ) -> Result<ScriptOutputs, CliError> {
-    let verifier = task_path.join("tests").join("test.sh");
+    let verifier = runtime.task_path.join("tests").join("test.sh");
     let agent = match agent_kind {
         SandboxAgent::Oracle => AgentStep::from_output(
             "solution/solve.sh",
-            run_script_locally(
-                &task_path.join("solution").join("solve.sh"),
-                task_path,
-                app_dir,
-                logs_dir,
-                &envs.agent,
-                environment.agent_timeout,
-            )?,
+            run_script_locally(LocalScriptRun {
+                script: &runtime.task_path.join("solution").join("solve.sh"),
+                task_path: runtime.task_path,
+                app_dir: runtime.app_dir,
+                logs_dir: runtime.logs_dir,
+                task_label: runtime.task_label,
+                phase: "solution",
+                env: &envs.agent,
+                timeout: environment.agent_timeout,
+            })?,
         ),
         SandboxAgent::Nop => AgentStep::nop(),
         SandboxAgent::External(agent) => AgentStep::from_output(
             agent.command.clone(),
             run_shell_locally(
                 agent,
-                task_path,
-                app_dir,
-                logs_dir,
+                runtime.task_path,
+                runtime.app_dir,
+                runtime.logs_dir,
+                runtime.task_label,
                 &envs.agent,
                 environment.agent_timeout,
             )?,
         ),
     };
-    let verifier = run_script_locally(
-        &verifier,
-        task_path,
-        app_dir,
-        logs_dir,
-        &envs.verifier,
-        environment.verifier_timeout,
-    )?;
+    let verifier = run_script_locally(LocalScriptRun {
+        script: &verifier,
+        task_path: runtime.task_path,
+        app_dir: runtime.app_dir,
+        logs_dir: runtime.logs_dir,
+        task_label: runtime.task_label,
+        phase: "verifier",
+        env: &envs.verifier,
+        timeout: environment.verifier_timeout,
+    })?;
 
     Ok(ScriptOutputs { agent, verifier })
 }
@@ -857,6 +901,7 @@ fn run_shell_locally(
     task_path: &Path,
     app_dir: &Path,
     logs_dir: &Path,
+    task_label: &str,
     env: &[(String, String)],
     timeout: Duration,
 ) -> Result<Output, CliError> {
@@ -877,7 +922,8 @@ fn run_shell_locally(
         command.env("SEAPORT_MODEL", model);
     }
 
-    let timed_output = run_command_with_timeout(command, timeout)?;
+    let timed_output =
+        run_command_with_timeout(command, timeout, Some(CommandLog::new(task_label, "agent")))?;
     let output = timed_output.output;
 
     if timed_output.timed_out {
@@ -901,38 +947,49 @@ fn run_shell_locally(
     Ok(output)
 }
 
-fn run_script_locally(
-    script: &Path,
-    task_path: &Path,
-    app_dir: &Path,
-    logs_dir: &Path,
-    env: &[(String, String)],
+struct LocalScriptRun<'a> {
+    script: &'a Path,
+    task_path: &'a Path,
+    app_dir: &'a Path,
+    logs_dir: &'a Path,
+    task_label: &'a str,
+    phase: &'a str,
+    env: &'a [(String, String)],
     timeout: Duration,
-) -> Result<Output, CliError> {
+}
+
+fn run_script_locally(run: LocalScriptRun<'_>) -> Result<Output, CliError> {
     let mut command = Command::new("bash");
     command
-        .arg(script)
-        .current_dir(app_dir)
-        .env("APP_DIR", app_dir)
-        .env("LOGS_DIR", logs_dir)
-        .env("SEAPORT_TASK_DIR", task_path)
-        .env("SEAPORT_INSTRUCTION_PATH", task_path.join("instruction.md"));
-    apply_env(&mut command, env);
-    let timed_output = run_command_with_timeout(command, timeout)?;
+        .arg(run.script)
+        .current_dir(run.app_dir)
+        .env("APP_DIR", run.app_dir)
+        .env("LOGS_DIR", run.logs_dir)
+        .env("SEAPORT_TASK_DIR", run.task_path)
+        .env(
+            "SEAPORT_INSTRUCTION_PATH",
+            run.task_path.join("instruction.md"),
+        );
+    apply_env(&mut command, run.env);
+    let timed_output = run_command_with_timeout(
+        command,
+        run.timeout,
+        Some(CommandLog::new(run.task_label, run.phase)),
+    )?;
     let output = timed_output.output;
 
     if timed_output.timed_out {
         return Err(CliError::task_failed(format!(
             "unsafe local script timed out after {:.3}s: {}",
-            timeout.as_secs_f64(),
-            script.display()
+            run.timeout.as_secs_f64(),
+            run.script.display()
         )));
     }
 
     if !output.status.success() {
         return Err(CliError::task_failed(format!(
             "script failed: {} (status: {})\nstdout:\n{}\nstderr:\n{}",
-            script.display(),
+            run.script.display(),
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -959,34 +1016,122 @@ struct TimedOutput {
     timed_out: bool,
 }
 
+#[derive(Clone)]
+struct CommandLog {
+    task: String,
+    phase: String,
+}
+
+impl CommandLog {
+    fn new(task: &str, phase: &str) -> Self {
+        Self {
+            task: task.to_owned(),
+            phase: phase.to_owned(),
+        }
+    }
+
+    fn stream(&self, name: &'static str) -> StreamLog {
+        StreamLog {
+            task: self.task.clone(),
+            phase: self.phase.clone(),
+            stream: name,
+        }
+    }
+}
+
+struct StreamLog {
+    task: String,
+    phase: String,
+    stream: &'static str,
+}
+
 fn run_command_with_timeout(
     mut command: Command,
     timeout: Duration,
+    log: Option<CommandLog>,
 ) -> Result<TimedOutput, CliError> {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| CliError::io("command stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| CliError::io("command stderr was not piped"))?;
+    let stdout_log = log.as_ref().map(|log| log.stream("stdout"));
+    let stderr_log = log.as_ref().map(|log| log.stream("stderr"));
+    let stdout_reader = thread::spawn(move || read_stream(stdout, stdout_log));
+    let stderr_reader = thread::spawn(move || read_stream(stderr, stderr_log));
     let started = Instant::now();
+    let mut timed_out = false;
 
-    loop {
-        if child.try_wait()?.is_some() {
-            return Ok(TimedOutput {
-                output: child.wait_with_output()?,
-                timed_out: false,
-            });
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
 
         if started.elapsed() >= timeout {
             let _ = child.kill();
-            return Ok(TimedOutput {
-                output: child.wait_with_output()?,
-                timed_out: true,
-            });
+            timed_out = true;
+            break child.wait()?;
         }
 
         thread::sleep(Duration::from_millis(25));
+    };
+    let stdout = join_stream_reader(stdout_reader)?;
+    let stderr = join_stream_reader(stderr_reader)?;
+
+    Ok(TimedOutput {
+        output: Output {
+            status,
+            stdout,
+            stderr,
+        },
+        timed_out,
+    })
+}
+
+fn read_stream<R: Read>(stream: R, log: Option<StreamLog>) -> io::Result<Vec<u8>> {
+    let mut reader = BufReader::new(stream);
+    let mut output = Vec::new();
+    let mut line = Vec::new();
+
+    loop {
+        line.clear();
+        let bytes_read = reader.read_until(b'\n', &mut line)?;
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        output.extend_from_slice(&line);
+
+        if let Some(log) = &log {
+            print_stream_line(log, &line);
+        }
     }
+
+    Ok(output)
+}
+
+fn join_stream_reader(
+    handle: thread::JoinHandle<io::Result<Vec<u8>>>,
+) -> Result<Vec<u8>, CliError> {
+    handle
+        .join()
+        .map_err(|_| CliError::io("command stream reader panicked"))?
+        .map_err(CliError::from)
+}
+
+fn print_stream_line(log: &StreamLog, line: &[u8]) {
+    let text = String::from_utf8_lossy(line);
+    let text = text.trim_end_matches(['\r', '\n']);
+
+    println!("[{} | {} | {}] {}", log.task, log.phase, log.stream, text);
 }
 
 fn sanitize_name(value: &str) -> String {
@@ -1099,6 +1244,22 @@ mod tests {
 
         let _ = fs::remove_dir_all(task);
         let _ = fs::remove_dir_all(app);
+    }
+
+    #[test]
+    fn command_runner_streams_and_captures_output() {
+        let mut command = Command::new("bash");
+        command
+            .arg("-lc")
+            .arg("printf 'hello stdout\\n'; printf 'hello stderr\\n' >&2");
+
+        let output = run_command_with_timeout(command, Duration::from_secs(2), None)
+            .expect("command")
+            .output;
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"hello stdout\n");
+        assert_eq!(output.stderr, b"hello stderr\n");
     }
 
     #[test]
