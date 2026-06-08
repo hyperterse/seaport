@@ -309,7 +309,7 @@ fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
         .clone()
         .unwrap_or_else(|| DEFAULT_DOCKER_IMAGE.to_owned());
     let prebuilt_image = explicit_image.is_some();
-    let platform = docker_platform(&task_toml, prebuilt_image);
+    let platform = docker_platform(&task_toml);
     let baseline_network = baseline_network(&task_toml)?;
     let build_timeout = toml_duration_value_with_default(
         &task_toml,
@@ -362,7 +362,7 @@ fn phase_network(contents: &str, section: &str) -> Result<Option<DockerNetwork>,
     }
 }
 
-fn docker_platform(contents: &str, prebuilt_image: bool) -> Option<String> {
+fn docker_platform(contents: &str) -> Option<String> {
     if let Ok(platform) = env::var("SEAPORT_DOCKER_PLATFORM") {
         return docker_platform_value(&platform);
     }
@@ -370,7 +370,7 @@ fn docker_platform(contents: &str, prebuilt_image: bool) -> Option<String> {
     toml_section_value(contents, "environment", "docker_platform")
         .or_else(|| toml_section_value(contents, "environment", "platform"))
         .or_else(|| toml_top_level_value(contents, "docker_platform"))
-        .or_else(|| default_docker_platform(prebuilt_image))
+        .or_else(default_docker_platform)
 }
 
 fn docker_platform_value(platform: &str) -> Option<String> {
@@ -383,8 +383,8 @@ fn docker_platform_value(platform: &str) -> Option<String> {
     }
 }
 
-fn default_docker_platform(prebuilt_image: bool) -> Option<String> {
-    if prebuilt_image && cfg!(target_arch = "aarch64") {
+fn default_docker_platform() -> Option<String> {
+    if cfg!(target_arch = "aarch64") {
         Some(DEFAULT_COMPAT_DOCKER_PLATFORM.to_owned())
     } else {
         None
@@ -833,6 +833,11 @@ fn docker_run_command(run: DockerRunCommand<'_>) -> Command {
         .arg(format!(
             "type=bind,source={},target=/logs",
             run.logs_root.display()
+        ))
+        .arg("--mount")
+        .arg(format!(
+            "type=bind,source={},target=/tests,readonly",
+            run.task_path.join("tests").display()
         ))
         .arg("--mount")
         .arg(format!(
@@ -1313,6 +1318,9 @@ mod tests {
         assert!(args
             .iter()
             .any(|arg| arg == "type=bind,source=/tmp/task,target=/seaport/task,readonly"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "type=bind,source=/tmp/task/tests,target=/tests,readonly"));
     }
 
     #[test]
@@ -1447,8 +1455,8 @@ docker_image = "ubuntu:24.04" # explicit prebuilt image
     }
 
     #[test]
-    fn task_environment_builds_dockerfiles_on_native_platform_by_default() {
-        let task = temp_task_dir("native-dockerfile-platform");
+    fn task_environment_defaults_to_compatible_platform_on_arm_hosts() {
+        let task = temp_task_dir("default-docker-platform");
         fs::create_dir_all(&task).expect("task dir");
         fs::write(
             task.join("task.toml"),
@@ -1462,7 +1470,14 @@ build_timeout_sec = 7.5
         let environment = task_environment(&task).expect("environment");
 
         assert!(!environment.prebuilt_image);
-        assert_eq!(environment.platform, None);
+        if cfg!(target_arch = "aarch64") {
+            assert_eq!(
+                environment.platform.as_deref(),
+                Some(DEFAULT_COMPAT_DOCKER_PLATFORM)
+            );
+        } else {
+            assert_eq!(environment.platform, None);
+        }
 
         let _ = fs::remove_dir_all(task);
     }
