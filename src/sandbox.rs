@@ -1,8 +1,10 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,6 +27,8 @@ const DOCKER_IMAGE_CACHE_NAMESPACE: &str = "seaport-env-cache-v1";
 const DEFAULT_BUILDKIT_BUILDER: &str = "seaport-builder";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
+static DOCKER_AVAILABLE: OnceLock<()> = OnceLock::new();
+static DOCKER_IMAGE_PULLS: OnceLock<ImagePullState> = OnceLock::new();
 
 pub(crate) struct ScriptOutputs {
     pub(crate) agent: AgentStep,
@@ -1105,6 +1109,13 @@ fn ensure_docker_image_available(
         return Ok(());
     }
 
+    let _pull = DockerImagePull::start(image);
+
+    if docker_image_exists(image) {
+        println!("[{task_label} | pull] cache hit: {image}");
+        return Ok(());
+    }
+
     let timed_output = run_docker_pull_with_retries(task_label, image, platform, timeout)?;
 
     if timed_output.timed_out {
@@ -1124,6 +1135,51 @@ fn ensure_docker_image_available(
     }
 
     Ok(())
+}
+
+struct ImagePullState {
+    active: Mutex<HashSet<String>>,
+    ready: Condvar,
+}
+
+impl ImagePullState {
+    fn shared() -> &'static Self {
+        DOCKER_IMAGE_PULLS.get_or_init(|| Self {
+            active: Mutex::new(HashSet::new()),
+            ready: Condvar::new(),
+        })
+    }
+}
+
+struct DockerImagePull {
+    image: String,
+    state: &'static ImagePullState,
+}
+
+impl DockerImagePull {
+    fn start(image: &str) -> Self {
+        let state = ImagePullState::shared();
+        let mut active = state.active.lock().expect("docker image pull state");
+
+        while active.contains(image) {
+            active = state.ready.wait(active).expect("docker image pull wait");
+        }
+
+        active.insert(image.to_owned());
+
+        Self {
+            image: image.to_owned(),
+            state,
+        }
+    }
+}
+
+impl Drop for DockerImagePull {
+    fn drop(&mut self) {
+        let mut active = self.state.active.lock().expect("docker image pull state");
+        active.remove(&self.image);
+        self.state.ready.notify_all();
+    }
 }
 
 fn prepare_docker_image(
@@ -1677,7 +1733,12 @@ fn docker_pull_command(image: &str, platform: Option<&str>) -> Command {
 }
 
 fn ensure_docker_available() -> Result<(), CliError> {
+    if DOCKER_AVAILABLE.get().is_some() {
+        return Ok(());
+    }
+
     if docker_api_ping() {
+        let _ = DOCKER_AVAILABLE.set(());
         return Ok(());
     }
 
@@ -1688,7 +1749,10 @@ fn ensure_docker_available() -> Result<(), CliError> {
         .output();
 
     match output {
-        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) if output.status.success() => {
+            let _ = DOCKER_AVAILABLE.set(());
+            Ok(())
+        }
         Ok(output) => Err(CliError::task_failed(format!(
             "docker backend could not reach the Docker daemon (status: {})\nstdout:\n{}\nstderr:\n{}",
             output.status,
@@ -2624,6 +2688,17 @@ FROM python:3.12-slim
     }
 
     #[test]
+    fn docker_image_pull_guard_releases_image_key() {
+        let image = "seaport-test/image:pull-guard";
+
+        {
+            let _pull = DockerImagePull::start(image);
+        }
+
+        let _pull = DockerImagePull::start(image);
+    }
+
+    #[test]
     fn docker_api_image_path_keeps_registry_reference() {
         assert_eq!(
             docker_api_image_json_path("ghcr.io/acme/image:latest"),
@@ -2635,7 +2710,7 @@ FROM python:3.12-slim
     fn parse_docker_api_response_reads_status_and_body() {
         let response =
             parse_docker_api_response(b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}")
-        .expect("response");
+                .expect("response");
 
         assert_eq!(response.status, 404);
     }
