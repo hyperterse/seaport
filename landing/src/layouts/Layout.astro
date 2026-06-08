@@ -1,0 +1,176 @@
+---
+import "../styles/global.css";
+
+interface Props {
+  title?: string;
+  description?: string;
+}
+
+const {
+  title = "Seaport · know your AI agent actually works",
+  description = "Seaport puts your coding agent through real tasks and tells you how often it succeeds. Write a task, run one command, get a score. Open source and free forever.",
+} = Astro.props;
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="generator" content={Astro.generator} />
+
+    <title>{title}</title>
+    <meta name="description" content={description} />
+
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="website" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body class="font-sans antialiased">
+    <slot />
+
+    <script is:inline>
+      // Fill every `.github-stars-count` pill with the repo's star count.
+      // Cached in localStorage so we only hit the GitHub API on a cache miss.
+      (function () {
+        var KEY = "seaport-gh-stars";
+        var TTL = 6 * 60 * 60 * 1000; // 6 hours
+
+        function fmt(n) {
+          return n >= 1000
+            ? (n / 1000).toFixed(1).replace(/\.0$/, "") + "k"
+            : String(n);
+        }
+
+        function show(n) {
+          document.querySelectorAll(".github-stars-count").forEach(function (el) {
+            el.textContent = fmt(n);
+          });
+          document.querySelectorAll(".github-stars").forEach(function (el) {
+            el.classList.remove("hidden");
+            el.style.display = "inline-flex";
+          });
+        }
+
+        try {
+          var cached = JSON.parse(localStorage.getItem(KEY));
+          if (cached && cached.count && Date.now() - cached.ts < TTL) {
+            show(cached.count);
+            return;
+          }
+        } catch (e) {}
+
+        fetch("https://api.github.com/repos/hyperterse/seaport")
+          .then(function (r) {
+            return r.ok ? r.json() : null;
+          })
+          .then(function (d) {
+            if (!d || typeof d.stargazers_count !== "number") return;
+            show(d.stargazers_count);
+            try {
+              localStorage.setItem(
+                KEY,
+                JSON.stringify({ count: d.stargazers_count, ts: Date.now() })
+              );
+            } catch (e) {}
+          })
+          .catch(function () {});
+      })();
+    </script>
+
+    <script is:inline>
+      // Quality-of-life: copy buttons on code blocks, scroll reveal, heading anchors.
+      (function () {
+        var COPY =
+          '<svg class="ico-copy" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15V5a2 2 0 0 1 2-2h10"></path></svg>';
+        var CHECK =
+          '<svg class="ico-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"></path></svg>';
+
+        function wireCopy(btn, getText) {
+          btn.addEventListener("click", function () {
+            var text = (getText() || "").trim();
+            var done = function () {
+              btn.classList.add("copied");
+              setTimeout(function () {
+                btn.classList.remove("copied");
+              }, 1500);
+            };
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(text).then(done, function () {});
+            }
+          });
+        }
+
+        // Code blocks inside docs prose get a floating copy button.
+        document.querySelectorAll(".docs-prose pre").forEach(function (pre) {
+          var wrap = document.createElement("div");
+          wrap.className = "code-wrap";
+          pre.parentNode.insertBefore(wrap, pre);
+          wrap.appendChild(pre);
+
+          var btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "copy-btn";
+          btn.setAttribute("aria-label", "Copy code");
+          btn.innerHTML = COPY + CHECK;
+          wrap.appendChild(btn);
+
+          var code = pre.querySelector("code") || pre;
+          wireCopy(btn, function () {
+            return code.innerText;
+          });
+        });
+
+        // Terminal components already render their own copy button.
+        document.querySelectorAll("[data-terminal]").forEach(function (term) {
+          var btn = term.querySelector(".copy-btn");
+          var pre = term.querySelector("pre");
+          if (btn && pre)
+            wireCopy(btn, function () {
+              return pre.innerText;
+            });
+        });
+
+        // Hover anchor links on doc headings.
+        document
+          .querySelectorAll(".docs-prose h2[id], .docs-prose h3[id]")
+          .forEach(function (h) {
+            var a = document.createElement("a");
+            a.className = "heading-anchor";
+            a.href = "#" + h.id;
+            a.textContent = "#";
+            a.setAttribute("aria-hidden", "true");
+            a.setAttribute("tabindex", "-1");
+            h.insertBefore(a, h.firstChild);
+          });
+
+        // Gentle scroll reveal.
+        var reveal = document.querySelectorAll("[data-reveal]");
+        if (reveal.length && "IntersectionObserver" in window) {
+          var io = new IntersectionObserver(
+            function (entries) {
+              entries.forEach(function (entry) {
+                if (entry.isIntersecting) {
+                  entry.target.classList.add("is-visible");
+                  io.unobserve(entry.target);
+                }
+              });
+            },
+            { rootMargin: "0px 0px -10% 0px", threshold: 0.05 }
+          );
+          reveal.forEach(function (el) {
+            io.observe(el);
+          });
+        }
+      })();
+    </script>
+  </body>
+</html>

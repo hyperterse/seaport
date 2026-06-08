@@ -1,0 +1,43 @@
+---
+import StarButton from "./StarButton.astro";
+---
+
+<header
+  class="sticky top-0 z-50 border-b border-white/5 bg-ink-950/70 backdrop-blur-xl"
+>
+  <nav class="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
+    <a href="/" class="flex items-center gap-2.5 font-semibold tracking-tight">
+      <span
+        class="flex h-8 w-8 items-center justify-center rounded-lg bg-foam-500/15 text-foam-300"
+      >
+        <svg width="18" height="18" viewBox="0 0 32 32" aria-hidden="true">
+          <path
+            d="M6 22c2.5 0 2.5-2.5 5-2.5S13.5 22 16 22s2.5-2.5 5-2.5S23.5 22 26 22"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2.4"
+            stroke-linecap="round"></path>
+          <path
+            d="M16 5v10m0 0-3.2-3.2M16 15l3.2-3.2"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2.4"
+            stroke-linecap="round"
+            stroke-linejoin="round"></path>
+        </svg>
+      </span>
+      <span class="text-lg">Seaport</span>
+    </a>
+
+    <div class="flex items-center gap-4 sm:gap-6">
+      <a
+        href="/docs"
+        class="text-sm text-neutral-400 transition-colors hover:text-white"
+      >
+        Docs
+      </a>
+
+      <StarButton variant="ghost" size="sm" label="Star" />
+    </div>
+  </nav>
+</header>

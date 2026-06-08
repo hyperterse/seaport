@@ -1,0 +1,89 @@
+---
+const features = [
+  {
+    title: "Drop-in Harbor compatible",
+    body: "Same task format, same datasets, same scripts. Point Seaport at your existing Harbor tasks and they run unchanged. No migration, no rewrite.",
+    icon: "swap",
+  },
+  {
+    title: "Fast by default",
+    body: "Task environments are built and pulled once, then cached and reused. Identical images are never pulled twice, so warm runs start almost instantly.",
+    icon: "bolt",
+  },
+  {
+    title: "Prepares, then runs",
+    body: "A preflight phase resolves, pulls, and builds every environment up front and in parallel, so the run itself is spent on agents, not setup.",
+    icon: "layers",
+  },
+  {
+    title: "Sandboxed by default",
+    body: "Agents run fully isolated, so untrusted code can't touch your machine. Test boldly without worrying about what your agent might do.",
+    icon: "shield",
+  },
+  {
+    title: "Works with any agent",
+    body: "Claude Code, Codex, or your own homegrown agent. If it runs in a terminal, Seaport can evaluate it. Swap agents with a single flag.",
+    icon: "robot",
+  },
+  {
+    title: "Numbers you can trust",
+    body: "Every run is deterministic and lands as clean JSON. Track pass rates over time, compare agents head-to-head, and catch regressions early.",
+    icon: "chart",
+  },
+];
+
+const icons: Record<string, string> = {
+  swap: '<path d="M7 4 3 8l4 4M3 8h13M17 20l4-4-4-4M21 16H8" />',
+  bolt: '<path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" />',
+  shield: '<path d="M12 3l8 3v6c0 4.5-3 7.5-8 9-5-1.5-8-4.5-8-9V6l8-3z" />',
+  robot:
+    '<rect x="4" y="8" width="16" height="11" rx="2.5"/><path d="M12 8V4M9 13h.01M15 13h.01"/>',
+  layers: '<path d="M12 3l9 5-9 5-9-5 9-5zM3 13l9 5 9-5" />',
+  chart: '<path d="M4 20V4M4 20h16M9 16V9M14 16v-4M19 16V7" />',
+};
+---
+
+<section id="features" data-reveal class="border-t border-white/5 py-24">
+  <div class="mx-auto max-w-6xl px-6">
+    <div class="max-w-2xl">
+      <p class="text-sm font-semibold uppercase tracking-widest text-foam-400">
+        Why Seaport
+      </p>
+      <h2 class="mt-3 text-3xl font-bold tracking-tight text-white sm:text-4xl">
+        Everything Harbor does, faster
+      </h2>
+      <p class="mt-4 text-lg text-neutral-400">
+        The same tasks and datasets, on a rebuilt performance core.
+      </p>
+    </div>
+
+    <div class="mt-14 grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
+      {
+        features.map((feature) => (
+          <div class="group rounded-2xl border border-white/10 bg-white/[0.02] p-6 transition-colors hover:border-foam-400/30 hover:bg-white/[0.04]">
+            <div class="flex h-11 w-11 items-center justify-center rounded-xl border border-white/10 bg-foam-500/10 text-foam-300">
+              <svg
+                width="22"
+                height="22"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+                set:html={icons[feature.icon]}
+              />
+            </div>
+            <h3 class="mt-5 text-lg font-semibold text-white">
+              {feature.title}
+            </h3>
+            <p class="mt-2 text-sm leading-relaxed text-neutral-400">
+              {feature.body}
+            </p>
+          </div>
+        ))
+      }
+    </div>
+  </div>
+</section>

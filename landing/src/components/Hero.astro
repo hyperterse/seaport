@@ -1,0 +1,44 @@
+---
+import Terminal from "./Terminal.astro";
+import StarButton from "./StarButton.astro";
+---
+
+<section id="top" class="relative overflow-hidden">
+  <div class="mx-auto max-w-6xl px-6 pb-20 pt-20 md:pt-28">
+    <div class="mx-auto max-w-3xl text-center">
+      <h1
+        class="text-balance text-4xl font-bold leading-[1.05] tracking-tight text-white sm:text-5xl md:text-6xl"
+      >
+        Know your AI agent actually works.
+      </h1>
+
+      <p class="mx-auto mt-6 max-w-md text-pretty text-lg text-neutral-400">
+        A CLI-first framework for sandboxed agent evaluation. Fully Harbor
+        compatible, just faster.
+      </p>
+
+      <div class="mt-9 flex flex-col items-center justify-center gap-3 sm:flex-row">
+        <StarButton variant="primary" class="w-full sm:w-auto" />
+        <a
+          href="/docs/getting-started"
+          class="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-white/5 px-5 py-3 text-sm font-semibold text-white transition-transform hover:scale-[0.98] hover:bg-white/10 sm:w-auto"
+        >
+          Get started
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
+            <path d="M5 12h14M13 6l6 6-6 6" stroke-linecap="round" stroke-linejoin="round"></path>
+          </svg>
+        </a>
+      </div>
+
+      <p class="mt-5 text-xs font-medium text-neutral-500">
+        Harbor compatible · Powered by Rust · Open source
+      </p>
+    </div>
+
+    <div class="mx-auto mt-14 max-w-2xl">
+      <Terminal>
+<span class="text-tide-400">curl</span> -fsSL https://seaport.run/install.sh | bash
+      </Terminal>
+    </div>
+  </div>
+</section>

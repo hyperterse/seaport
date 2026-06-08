@@ -1,0 +1,179 @@
+---
+import Layout from "./Layout.astro";
+import StarButton from "../components/StarButton.astro";
+
+const { frontmatter, headings = [] } = Astro.props;
+
+const toc = headings.filter((h) => h.depth === 2 || h.depth === 3);
+
+const sections = [
+  {
+    heading: "Overview",
+    links: [
+      { label: "Introduction", href: "/docs" },
+      { label: "Getting started", href: "/docs/getting-started" },
+    ],
+  },
+  {
+    heading: "Guides",
+    links: [
+      { label: "Writing tasks", href: "/docs/tasks" },
+      { label: "Agents", href: "/docs/agents" },
+      { label: "Sandboxing", href: "/docs/sandboxing" },
+      { label: "Harbor compatibility", href: "/docs/harbor" },
+      { label: "Job output", href: "/docs/output" },
+    ],
+  },
+  {
+    heading: "Reference",
+    links: [
+      { label: "CLI reference", href: "/docs/cli" },
+      { label: "Performance", href: "/docs/performance" },
+      { label: "Architecture", href: "/docs/architecture" },
+    ],
+  },
+];
+
+const current = (Astro.url.pathname.replace(/\/+$/, "") || "/docs").toLowerCase();
+const title = frontmatter?.title
+  ? `${frontmatter.title} · Seaport docs`
+  : "Seaport docs";
+---
+
+<Layout title={title} description={frontmatter?.description}>
+  <div class="min-h-screen">
+    <header
+      class="sticky top-0 z-50 border-b border-white/5 bg-ink-950/70 backdrop-blur-xl"
+    >
+      <div class="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
+        <a href="/" class="flex items-center gap-2.5 font-semibold tracking-tight">
+          <span
+            class="flex h-8 w-8 items-center justify-center rounded-lg bg-foam-500/15 text-foam-300"
+          >
+            <svg width="18" height="18" viewBox="0 0 32 32" aria-hidden="true">
+              <path
+                d="M6 22c2.5 0 2.5-2.5 5-2.5S13.5 22 16 22s2.5-2.5 5-2.5S23.5 22 26 22"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2.4"
+                stroke-linecap="round"></path>
+              <path
+                d="M16 5v10m0 0-3.2-3.2M16 15l3.2-3.2"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2.4"
+                stroke-linecap="round"
+                stroke-linejoin="round"></path>
+            </svg>
+          </span>
+          <span class="text-lg">Seaport</span>
+          <span class="text-sm font-normal text-neutral-500">docs</span>
+        </a>
+        <div class="flex items-center gap-4 sm:gap-6">
+          <a
+            href="/"
+            class="hidden text-sm text-neutral-400 transition-colors hover:text-white sm:block"
+            >Home</a
+          >
+          <StarButton variant="ghost" size="sm" label="Star" />
+        </div>
+      </div>
+    </header>
+
+    <div
+      class="mx-auto flex max-w-7xl flex-col gap-10 px-6 py-10 lg:flex-row lg:gap-12 lg:py-14"
+    >
+      <aside class="lg:w-56 lg:shrink-0">
+        <nav class="lg:sticky lg:top-24 space-y-7">
+          {
+            sections.map((section) => (
+              <div>
+                <p class="text-xs font-semibold uppercase tracking-widest text-neutral-600">
+                  {section.heading}
+                </p>
+                <ul class="mt-3 space-y-1">
+                  {section.links.map((link) => {
+                    const active = current === link.href.toLowerCase();
+                    return (
+                      <li>
+                        <a
+                          href={link.href}
+                          aria-current={active ? "page" : undefined}
+                          class:list={[
+                            "block rounded-lg px-3 py-1.5 text-sm transition-colors",
+                            active
+                              ? "bg-foam-500/10 font-medium text-foam-300"
+                              : "text-neutral-400 hover:bg-white/5 hover:text-white",
+                          ]}
+                        >
+                          {link.label}
+                        </a>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            ))
+          }
+        </nav>
+      </aside>
+
+      <main class="docs-prose min-w-0 max-w-2xl flex-1">
+        <slot />
+      </main>
+
+      {
+        toc.length > 0 && (
+          <aside class="hidden xl:block xl:w-52 xl:shrink-0">
+            <div class="sticky top-24">
+              <p class="mb-3 pl-[0.95rem] text-[0.7rem] font-medium uppercase tracking-[0.14em] text-neutral-500">
+                On this page
+              </p>
+              <nav class="docs-toc">
+                {toc.map((h) => (
+                  <a href={`#${h.slug}`} data-toc-link class={`depth-${h.depth}`}>
+                    {h.text}
+                  </a>
+                ))}
+              </nav>
+            </div>
+          </aside>
+        )
+      }
+    </div>
+  </div>
+
+  <script>
+    const links = Array.from(
+      document.querySelectorAll<HTMLAnchorElement>("[data-toc-link]")
+    );
+    if (links.length) {
+      const byId = new Map(
+        links.map((link) => [link.getAttribute("href")!.slice(1), link])
+      );
+      const headings = links
+        .map((link) => document.getElementById(link.getAttribute("href")!.slice(1)))
+        .filter((el): el is HTMLElement => Boolean(el));
+
+      let activeId = "";
+      const setActive = (id: string) => {
+        if (id === activeId) return;
+        activeId = id;
+        for (const link of links) link.removeAttribute("aria-current");
+        byId.get(id)?.setAttribute("aria-current", "true");
+      };
+
+      const observer = new IntersectionObserver(
+        (entries) => {
+          const visible = entries
+            .filter((entry) => entry.isIntersecting)
+            .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+          if (visible[0]) setActive(visible[0].target.id);
+        },
+        { rootMargin: "0px 0px -70% 0px", threshold: 1 }
+      );
+
+      for (const heading of headings) observer.observe(heading);
+    }
+  </script>
+</Layout>

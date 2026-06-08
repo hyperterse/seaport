@@ -1,0 +1,56 @@
+---
+interface Props {
+  variant?: "primary" | "ghost";
+  size?: "sm" | "md";
+  label?: string;
+  class?: string;
+}
+
+const {
+  variant = "primary",
+  size = "md",
+  label = "Star on GitHub",
+  class: extra = "",
+} = Astro.props;
+
+const repo = "https://github.com/hyperterse/seaport";
+
+const base =
+  "inline-flex items-center justify-center gap-2 rounded-lg font-semibold transition-transform hover:scale-[0.98]";
+
+const sizes = {
+  sm: "px-4 py-2 text-sm",
+  md: "px-5 py-3 text-sm",
+};
+
+const variants = {
+  primary: "bg-foam-500/15 text-foam-300 hover:bg-foam-500/25",
+  ghost: "bg-white/5 text-white hover:bg-white/10",
+};
+
+const pill =
+  variant === "primary"
+    ? "bg-foam-500/20 text-foam-300"
+    : "bg-white/10 text-neutral-100";
+---
+
+<a
+  href={repo}
+  class:list={[base, sizes[size], variants[variant], extra]}
+  aria-label="Star Seaport on GitHub"
+>
+  {label}
+  <span
+    class:list={[
+      "github-stars hidden items-center gap-1 rounded-full px-2 py-0.5 text-xs font-semibold tabular-nums",
+      pill,
+    ]}
+  >
+    <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path
+        d="M12 2.4l2.92 5.92 6.53.95-4.72 4.6 1.11 6.51L12 17.84 6.16 20.9l1.11-6.51-4.72-4.6 6.53-.95L12 2.4z"
+      ></path>
+    </svg>
+    <span class="github-stars-count"></span>
+  </span>
+</a>

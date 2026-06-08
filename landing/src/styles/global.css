@@ -1,0 +1,391 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", "Menlo",
+    monospace;
+
+  /* neutral monochrome base */
+  --color-ink-950: #0a0a0a;
+  --color-ink-900: #111111;
+  --color-ink-800: #181818;
+  --color-ink-700: #242424;
+
+  /* single accent: cyan (foam and tide collapse to one hue) */
+  --color-foam-300: #5eead4;
+  --color-foam-400: #2dd4bf;
+  --color-foam-500: #14b8a6;
+  --color-foam-600: #0d9488;
+
+  --color-tide-400: #2dd4bf;
+  --color-tide-500: #14b8a6;
+}
+
+html {
+  scroll-behavior: smooth;
+  color-scheme: dark;
+}
+
+body {
+  background-color: var(--color-ink-950);
+  color: #ededed;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow-x: clip;
+}
+
+::selection {
+  background-color: var(--color-foam-500);
+  color: var(--color-ink-950);
+}
+
+/* documentation prose */
+.docs-prose {
+  color: #b5b5b5;
+  font-size: 0.975rem;
+  line-height: 1.75;
+}
+
+.docs-prose > :first-child {
+  margin-top: 0;
+}
+
+.docs-prose h1 {
+  color: #fff;
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  margin-bottom: 0.75rem;
+}
+
+.docs-prose h2 {
+  color: #fff;
+  font-size: 1.35rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin-top: 2.75rem;
+  margin-bottom: 0.75rem;
+  padding-top: 1.75rem;
+  border-top: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.docs-prose h3 {
+  color: #fff;
+  font-size: 1.075rem;
+  font-weight: 600;
+  margin-top: 2rem;
+  margin-bottom: 0.5rem;
+}
+
+.docs-prose p,
+.docs-prose ul,
+.docs-prose ol {
+  margin-top: 0.85rem;
+  margin-bottom: 0.85rem;
+}
+
+.docs-prose ul,
+.docs-prose ol {
+  padding-left: 1.35rem;
+}
+
+.docs-prose ul {
+  list-style: disc;
+}
+
+.docs-prose ol {
+  list-style: decimal;
+}
+
+.docs-prose li {
+  margin-top: 0.3rem;
+}
+
+.docs-prose li::marker {
+  color: var(--color-foam-500);
+}
+
+.docs-prose a {
+  color: var(--color-foam-400);
+  text-decoration: none;
+  border-bottom: 1px solid rgba(45, 212, 191, 0.35);
+  transition: border-color 0.15s;
+}
+
+.docs-prose a:hover {
+  border-bottom-color: var(--color-foam-400);
+}
+
+.docs-prose strong {
+  color: #fff;
+  font-weight: 600;
+}
+
+.docs-prose code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  color: var(--color-foam-300);
+  background-color: rgba(255, 255, 255, 0.06);
+  padding: 0.15em 0.4em;
+  border-radius: 0.35rem;
+}
+
+.docs-prose :is(h1, h2, h3) {
+  scroll-margin-top: 5.5rem;
+}
+
+.docs-prose pre {
+  margin: 1.25rem 0;
+  padding: 1rem 1.15rem;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 0.75rem;
+  overflow-x: auto;
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+
+.docs-prose .code-wrap {
+  position: relative;
+  margin: 1.25rem 0;
+}
+
+.docs-prose .code-wrap pre {
+  margin: 0;
+}
+
+.docs-prose pre.astro-code {
+  background-color: var(--color-ink-900) !important;
+}
+
+.docs-prose pre code {
+  color: inherit;
+  background: none;
+  padding: 0;
+  font-size: inherit;
+}
+
+.docs-prose blockquote {
+  margin: 1.25rem 0;
+  padding: 0.25rem 0 0.25rem 1rem;
+  border-left: 2px solid var(--color-foam-500);
+  color: #8a8a8a;
+}
+
+.docs-prose hr {
+  margin: 2.5rem 0;
+  border: 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.docs-prose table {
+  width: 100%;
+  margin: 1.25rem 0;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+  display: block;
+  overflow-x: auto;
+}
+
+.docs-prose th {
+  text-align: left;
+  font-weight: 600;
+  color: #fff;
+  padding: 0.6rem 0.85rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+  white-space: nowrap;
+}
+
+.docs-prose td {
+  padding: 0.55rem 0.85rem;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  vertical-align: top;
+}
+
+.docs-prose td code {
+  white-space: nowrap;
+}
+
+/* callouts / admonitions */
+.callout {
+  margin: 1.5rem 0;
+  padding: 0.95rem 1.1rem;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-left-width: 3px;
+  border-radius: 0.6rem;
+  background-color: rgba(255, 255, 255, 0.025);
+  font-size: 0.92rem;
+}
+
+.callout > :first-child {
+  margin-top: 0;
+}
+
+.callout > :last-child {
+  margin-bottom: 0;
+}
+
+.callout::before {
+  content: attr(data-label);
+  display: block;
+  margin-bottom: 0.35rem;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.callout-note {
+  border-left-color: #5a5a5a;
+}
+.callout-note::before {
+  color: #cfcfcf;
+}
+
+.callout-tip {
+  border-left-color: var(--color-tide-500);
+}
+.callout-tip::before {
+  color: var(--color-tide-400);
+}
+
+.callout-warning {
+  border-left-color: #f59e0b;
+}
+.callout-warning::before {
+  color: #fbbf24;
+}
+
+.callout-danger {
+  border-left-color: #f43f5e;
+}
+.callout-danger::before {
+  color: #fb7185;
+}
+
+/* on-this-page table of contents */
+.docs-toc {
+  border-left: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.docs-toc a {
+  display: block;
+  margin-left: -1px;
+  padding: 0.28rem 0 0.28rem 0.95rem;
+  border-left: 2px solid transparent;
+  color: #8f8f8f;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  transition:
+    color 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.docs-toc a:hover {
+  color: #ededed;
+}
+
+.docs-toc a.depth-3 {
+  padding-left: 1.7rem;
+  font-size: 0.785rem;
+  color: #6e6e6e;
+}
+
+.docs-toc a[aria-current="true"] {
+  color: var(--color-foam-300);
+  border-left-color: var(--color-foam-400);
+}
+
+/* copy-to-clipboard button on code blocks */
+.copy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.85rem;
+  height: 1.85rem;
+  border: 0;
+  border-radius: 0.45rem;
+  color: #8a8a8a;
+  background-color: rgba(255, 255, 255, 0.05);
+  cursor: pointer;
+  transition:
+    color 0.15s ease,
+    background-color 0.15s ease,
+    opacity 0.15s ease;
+}
+
+.copy-btn:hover {
+  color: #ededed;
+  background-color: rgba(255, 255, 255, 0.1);
+}
+
+.copy-btn.copied {
+  color: var(--color-tide-400);
+}
+
+.copy-btn .ico-check {
+  display: none;
+}
+
+.copy-btn.copied .ico-copy {
+  display: none;
+}
+
+.copy-btn.copied .ico-check {
+  display: inline;
+}
+
+.docs-prose .code-wrap .copy-btn {
+  position: absolute;
+  top: 0.55rem;
+  right: 0.55rem;
+  opacity: 0;
+}
+
+.docs-prose .code-wrap:hover .copy-btn,
+.docs-prose .code-wrap .copy-btn:focus-visible {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .docs-prose .code-wrap .copy-btn {
+    opacity: 1;
+  }
+}
+
+/* hover anchor links on doc headings */
+.docs-prose :is(h2, h3) {
+  position: relative;
+}
+
+.heading-anchor {
+  position: absolute;
+  left: -1.15rem;
+  border: 0 !important;
+  color: var(--color-foam-500);
+  font-weight: 400;
+  text-decoration: none;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.docs-prose :is(h2, h3):hover .heading-anchor,
+.heading-anchor:focus-visible {
+  opacity: 1;
+}
+
+/* gentle scroll reveal */
+@media (prefers-reduced-motion: no-preference) {
+  [data-reveal] {
+    opacity: 0;
+    transform: translateY(12px);
+    transition:
+      opacity 0.6s ease,
+      transform 0.6s ease;
+  }
+
+  [data-reveal].is-visible {
+    opacity: 1;
+    transform: none;
+  }
+}

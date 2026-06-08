@@ -1,0 +1,86 @@
+---
+const repo = "https://github.com/hyperterse/seaport";
+const links = [
+  { label: "Documentation", href: "/docs" },
+  { label: "Benchmarks", href: `${repo}/tree/main/benchmarks` },
+];
+---
+
+<footer class="border-t border-white/5 py-14">
+  <div class="mx-auto max-w-6xl px-6">
+    <div class="flex flex-col gap-10 sm:flex-row sm:items-start sm:justify-between">
+      <div class="max-w-sm">
+        <div class="flex items-center gap-2.5 font-semibold">
+          <span
+            class="flex h-8 w-8 items-center justify-center rounded-lg bg-foam-500/15 text-foam-300"
+          >
+            <svg width="18" height="18" viewBox="0 0 32 32" aria-hidden="true">
+              <path
+                d="M6 22c2.5 0 2.5-2.5 5-2.5S13.5 22 16 22s2.5-2.5 5-2.5S23.5 22 26 22"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2.4"
+                stroke-linecap="round"></path>
+              <path
+                d="M16 5v10m0 0-3.2-3.2M16 15l3.2-3.2"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2.4"
+                stroke-linecap="round"
+                stroke-linejoin="round"></path>
+            </svg>
+          </span>
+          <span class="text-lg">Seaport</span>
+        </div>
+        <p class="mt-4 max-w-sm text-sm leading-relaxed text-neutral-500">
+          The simplest way to test your AI coding agent and know it actually
+          works. Powered by Rust, open source, and free forever.
+        </p>
+      </div>
+
+      {
+        (
+          <nav class="flex gap-8">
+            {links.map((link) => (
+              <a
+                href={link.href}
+                class="text-sm text-neutral-400 transition-colors hover:text-white"
+              >
+                {link.label}
+              </a>
+            ))}
+          </nav>
+        )
+      }
+    </div>
+
+    <div
+      class="mt-12 flex flex-col items-center justify-between gap-4 border-t border-white/5 pt-8 sm:flex-row"
+    >
+      <p class="text-sm text-neutral-500">
+        © {new Date().getFullYear()} Seaport · MIT licensed
+      </p>
+      <a
+        href={repo}
+        class="inline-flex items-center gap-2 text-sm text-neutral-400 transition-colors hover:text-white"
+      >
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <path
+            d="M12 .5C5.7.5.5 5.7.5 12c0 5.1 3.3 9.4 7.9 10.9.6.1.8-.2.8-.5v-2c-3.2.7-3.9-1.4-3.9-1.4-.5-1.3-1.3-1.7-1.3-1.7-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.7 1.3 3.4 1 .1-.8.4-1.3.8-1.6-2.6-.3-5.3-1.3-5.3-5.7 0-1.3.5-2.3 1.2-3.1-.1-.3-.5-1.5.1-3.1 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0C17.3 4.7 18.3 5 18.3 5c.6 1.6.2 2.8.1 3.1.8.8 1.2 1.8 1.2 3.1 0 4.4-2.7 5.4-5.3 5.7.4.4.8 1.1.8 2.2v3.3c0 .3.2.6.8.5 4.6-1.5 7.9-5.8 7.9-10.9C23.5 5.7 18.3.5 12 .5Z"
+          ></path>
+        </svg>
+        hyperterse/seaport
+        <span
+          class="github-stars hidden items-center gap-1 rounded-full bg-white/10 px-2 py-0.5 text-xs font-semibold tabular-nums text-neutral-100"
+        >
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path
+              d="M12 2.4l2.92 5.92 6.53.95-4.72 4.6 1.11 6.51L12 17.84 6.16 20.9l1.11-6.51-4.72-4.6 6.53-.95L12 2.4z"
+            ></path>
+          </svg>
+          <span class="github-stars-count"></span>
+        </span>
+      </a>
+    </div>
+  </div>
+</footer>
