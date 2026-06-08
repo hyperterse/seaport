@@ -286,10 +286,17 @@ enum DockerNetwork {
 }
 
 impl DockerNetwork {
-    fn as_docker_arg(self) -> &'static str {
+    fn as_docker_run_arg(self) -> &'static str {
         match self {
             Self::None => "none",
             Self::Bridge => "bridge",
+        }
+    }
+
+    fn as_docker_build_arg(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Bridge => "default",
         }
     }
 }
@@ -588,7 +595,7 @@ fn docker_build_command(
         "--progress=plain",
         "--pull=false",
         "--network",
-        environment.build_network.as_docker_arg(),
+        environment.build_network.as_docker_build_arg(),
     ]);
 
     if let Some(platform) = environment.platform.as_deref() {
@@ -775,7 +782,7 @@ fn docker_run_command(run: DockerRunCommand<'_>) -> Command {
             "--name",
             run.container_name,
             "--network",
-            run.network.as_docker_arg(),
+            run.network.as_docker_run_arg(),
             "--cap-drop",
             "ALL",
             "--security-opt",
@@ -1328,6 +1335,9 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|window| window == ["--progress=plain", "--pull=false"]));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--network", "default"]));
         assert!(!args.iter().any(|arg| arg == "-q"));
     }
 
