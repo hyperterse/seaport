@@ -197,6 +197,10 @@ fn prepare_cobol_copybook_aliases(app_dir: &Path) -> Result<(), CliError> {
 
     for copybook in copybooks {
         create_copybook_aliases(&copybook)?;
+
+        if copybook.parent().is_some_and(|parent| parent != app_dir) {
+            create_copybook_aliases_in_dir(&copybook, app_dir)?;
+        }
     }
 
     Ok(())
@@ -231,6 +235,11 @@ fn create_copybook_aliases(copybook: &Path) -> Result<(), CliError> {
     let parent = copybook
         .parent()
         .ok_or_else(|| CliError::usage("copybook path has no parent directory"))?;
+
+    create_copybook_aliases_in_dir(copybook, parent)
+}
+
+fn create_copybook_aliases_in_dir(copybook: &Path, target_dir: &Path) -> Result<(), CliError> {
     let stem = copybook
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -244,7 +253,7 @@ fn create_copybook_aliases(copybook: &Path) -> Result<(), CliError> {
 
     for stem in stems {
         for extension in extensions {
-            let alias = parent.join(format!("{stem}{extension}"));
+            let alias = target_dir.join(format!("{stem}{extension}"));
 
             if alias != copybook && !alias.exists() {
                 fs::copy(copybook, alias)?;
@@ -1794,6 +1803,10 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(copybook_dir.join("RECLAIM.COB")).expect("cob alias"),
+            "01 RECLAIM-REC.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(app.join("RECLAIM.COB")).expect("workspace root cob alias"),
             "01 RECLAIM-REC.\n"
         );
         assert_eq!(
