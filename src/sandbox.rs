@@ -301,7 +301,8 @@ fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
     let image = explicit_image
         .clone()
         .unwrap_or_else(|| DEFAULT_DOCKER_IMAGE.to_owned());
-    let platform = docker_platform(&task_toml);
+    let prebuilt_image = explicit_image.is_some();
+    let platform = docker_platform(&task_toml, prebuilt_image);
     let baseline_network = baseline_network(&task_toml)?;
     let build_timeout = toml_duration_value_with_default(
         &task_toml,
@@ -318,7 +319,7 @@ fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
 
     Ok(TaskEnvironment {
         image,
-        prebuilt_image: explicit_image.is_some(),
+        prebuilt_image,
         platform,
         build_network: baseline_network,
         agent_network,
@@ -354,7 +355,7 @@ fn phase_network(contents: &str, section: &str) -> Result<Option<DockerNetwork>,
     }
 }
 
-fn docker_platform(contents: &str) -> Option<String> {
+fn docker_platform(contents: &str, prebuilt_image: bool) -> Option<String> {
     if let Ok(platform) = env::var("SEAPORT_DOCKER_PLATFORM") {
         return docker_platform_value(&platform);
     }
@@ -362,7 +363,7 @@ fn docker_platform(contents: &str) -> Option<String> {
     toml_section_value(contents, "environment", "docker_platform")
         .or_else(|| toml_section_value(contents, "environment", "platform"))
         .or_else(|| toml_top_level_value(contents, "docker_platform"))
-        .or_else(default_docker_platform)
+        .or_else(|| default_docker_platform(prebuilt_image))
 }
 
 fn docker_platform_value(platform: &str) -> Option<String> {
@@ -375,8 +376,8 @@ fn docker_platform_value(platform: &str) -> Option<String> {
     }
 }
 
-fn default_docker_platform() -> Option<String> {
-    if cfg!(target_arch = "aarch64") {
+fn default_docker_platform(prebuilt_image: bool) -> Option<String> {
+    if prebuilt_image && cfg!(target_arch = "aarch64") {
         Some(DEFAULT_COMPAT_DOCKER_PLATFORM.to_owned())
     } else {
         None
@@ -1374,6 +1375,27 @@ docker_image = "ubuntu:24.04" # explicit prebuilt image
         assert_eq!(environment.agent_network, DockerNetwork::Bridge);
         assert_eq!(environment.verifier_network, DockerNetwork::Bridge);
         assert_eq!(environment.build_timeout, DOCKER_BUILD_TIMEOUT);
+
+        let _ = fs::remove_dir_all(task);
+    }
+
+    #[test]
+    fn task_environment_builds_dockerfiles_on_native_platform_by_default() {
+        let task = temp_task_dir("native-dockerfile-platform");
+        fs::create_dir_all(&task).expect("task dir");
+        fs::write(
+            task.join("task.toml"),
+            r#"
+[environment]
+build_timeout_sec = 7.5
+"#,
+        )
+        .expect("task toml");
+
+        let environment = task_environment(&task).expect("environment");
+
+        assert!(!environment.prebuilt_image);
+        assert_eq!(environment.platform, None);
 
         let _ = fs::remove_dir_all(task);
     }
