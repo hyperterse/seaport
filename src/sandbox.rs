@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -544,19 +544,7 @@ fn prepare_docker_image(
     let environment_dir = dockerfile
         .parent()
         .ok_or_else(|| CliError::usage("environment/Dockerfile has no parent directory"))?;
-    let mut command = Command::new("docker");
-    command.args([
-        "build",
-        "--pull=false",
-        "--network",
-        environment.build_network.as_docker_arg(),
-    ]);
-
-    if let Some(platform) = environment.platform.as_deref() {
-        command.args(["--platform", platform]);
-    }
-
-    command.args(["-q", "-t", &tag]).arg(environment_dir);
+    let command = docker_build_command(&tag, environment_dir, environment);
     let timed_output = run_command_with_timeout(
         command,
         environment.build_timeout,
@@ -587,6 +575,28 @@ fn prepare_docker_image(
         reference: tag,
         remove_after_run: true,
     })
+}
+
+fn docker_build_command(
+    tag: &str,
+    environment_dir: &Path,
+    environment: &TaskEnvironment,
+) -> Command {
+    let mut command = Command::new("docker");
+    command.args([
+        "build",
+        "--progress=plain",
+        "--pull=false",
+        "--network",
+        environment.build_network.as_docker_arg(),
+    ]);
+
+    if let Some(platform) = environment.platform.as_deref() {
+        command.args(["--platform", platform]);
+    }
+
+    command.args(["-t", tag]).arg(environment_dir);
+    command
 }
 
 fn ensure_docker_available() -> Result<(), CliError> {
@@ -1100,6 +1110,10 @@ fn run_command_with_timeout(
     timeout: Duration,
     log: Option<CommandLog>,
 ) -> Result<TimedOutput, CliError> {
+    if let Some(log) = &log {
+        print_phase_start(log, timeout);
+    }
+
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1182,6 +1196,26 @@ fn print_stream_line(log: &StreamLog, line: &[u8]) {
     let text = text.trim_end_matches(['\r', '\n']);
 
     println!("[{} | {} | {}] {}", log.task, log.phase, log.stream, text);
+}
+
+fn print_phase_start(log: &CommandLog, timeout: Duration) {
+    println!(
+        "[{} | {}] starting; timeout {}",
+        log.task,
+        log.phase,
+        format_duration(timeout)
+    );
+    let _ = io::stdout().flush();
+}
+
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+
+    if seconds >= 60 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 fn sanitize_name(value: &str) -> String {
@@ -1272,6 +1306,29 @@ mod tests {
         assert!(args
             .iter()
             .any(|arg| arg == "type=bind,source=/tmp/task,target=/seaport/task,readonly"));
+    }
+
+    #[test]
+    fn docker_build_command_streams_plain_progress() {
+        let environment = TaskEnvironment {
+            image: "ubuntu:24.04".to_owned(),
+            prebuilt_image: false,
+            platform: None,
+            build_network: DockerNetwork::Bridge,
+            agent_network: DockerNetwork::Bridge,
+            verifier_network: DockerNetwork::Bridge,
+            build_timeout: Duration::from_secs(60),
+            agent_timeout: Duration::from_secs(60),
+            verifier_timeout: Duration::from_secs(60),
+        };
+        let command =
+            docker_build_command("seaport-task-test", Path::new("/tmp/env"), &environment);
+        let args = command_args(command);
+
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--progress=plain", "--pull=false"]));
+        assert!(!args.iter().any(|arg| arg == "-q"));
     }
 
     #[test]
