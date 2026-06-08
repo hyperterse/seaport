@@ -2197,6 +2197,7 @@ fn docker_socket_path() -> Option<PathBuf> {
         .or_else(|| candidates.into_iter().next())
 }
 
+#[cfg(unix)]
 fn parse_docker_api_response(response: &[u8]) -> io::Result<DockerApiResponse> {
     let header_end = response
         .windows(4)
@@ -2791,6 +2792,7 @@ FROM python:3.12-slim
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn parse_docker_api_response_reads_status_and_body() {
         let response =
