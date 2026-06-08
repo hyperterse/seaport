@@ -50,17 +50,20 @@ Measure the trusted local harness path instead:
 python3 benchmarks/run.py --seaport-backend unsafe-local --iterations 5
 ```
 
-## Compare Seaport And Harbor
+## Benchmark Seaport And Harbor
 
-Use `benchmarks/compare.sh` to run the same CLI command through Seaport and
-Harbor. The script forwards every argument you pass to both tools.
+Use `benchmarks/benchmark.sh` to run the same CLI command through Seaport or
+Harbor. The first argument selects the tool, and every argument after that is
+forwarded unchanged.
 
 ```sh
-benchmarks/compare.sh run -d factory-ai/legacy-bench
+benchmarks/benchmark.sh seaport run -d factory-ai/legacy-bench
+benchmarks/benchmark.sh harbor run -d factory-ai/legacy-bench
 ```
 
-By default it runs each tool 10 times and writes per-run logs plus
-`report.json` and `report.md` under `benchmarks/results/`.
+By default it runs the selected tool 10 times and writes per-run logs plus
+`report.json` and `report.md` under `benchmarks/results/`. Run it once for
+Seaport and once for Harbor when you want an apples-to-apples local comparison.
 
 Useful environment variables:
 
@@ -70,10 +73,12 @@ Useful environment variables:
 - `HARBOR_BIN=harbor` selects the Harbor executable.
 
 There is also a manual GitHub Actions workflow named `benchmark`. Run it from
-the Actions tab, provide a dataset name, and it will execute:
+the Actions tab, provide a dataset name, and it will run separate Seaport and
+Harbor jobs:
 
 ```sh
-benchmarks/compare.sh run -d "$DATASET"
+benchmarks/benchmark.sh seaport run -d "$DATASET"
+benchmarks/benchmark.sh harbor run -d "$DATASET"
 ```
 
 The runner writes:

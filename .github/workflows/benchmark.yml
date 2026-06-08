@@ -20,8 +20,8 @@ permissions:
   contents: read
 
 jobs:
-  compare:
-    name: compare seaport and harbor
+  seaport:
+    name: benchmark seaport
     runs-on: ubuntu-latest
     timeout-minutes: 240
 
@@ -33,25 +33,15 @@ jobs:
       - name: Build Seaport
         run: cargo build --release --locked
 
-      - name: Install Harbor
-        run: |
-          set -euo pipefail
-          python3 -m pip install --user --upgrade pip
-          python3 -m pip install --user harbor
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Check tools
-        run: |
-          set -euo pipefail
-          ./target/release/seaport --help
-          harbor --help
+      - name: Check Seaport
+        run: ./target/release/seaport --help
 
       - name: Run benchmark
         env:
           BENCH_DATASET: ${{ inputs.dataset }}
           BENCH_EXTRA_ARGS: ${{ inputs.extra_args }}
           SEAPORT_BENCH_ITERATIONS: ${{ inputs.iterations }}
-          SEAPORT_BENCH_OUTPUT_DIR: benchmarks/results/github-action
+          SEAPORT_BENCH_OUTPUT_DIR: benchmarks/results/github-action/seaport
         run: |
           set -euo pipefail
           args=(run -d "$BENCH_DATASET")
@@ -62,12 +52,56 @@ jobs:
             args+=("${extra_args[@]}")
           fi
 
-          ./benchmarks/compare.sh "${args[@]}"
+          ./benchmarks/benchmark.sh seaport "${args[@]}"
 
       - name: Upload benchmark logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: seaport-harbor-benchmark
-          path: benchmarks/results/github-action/
+          name: benchmark-seaport
+          path: benchmarks/results/github-action/seaport/
+          if-no-files-found: ignore
+
+  harbor:
+    name: benchmark harbor
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Harbor
+        run: |
+          set -euo pipefail
+          python3 -m pip install --user --upgrade pip
+          python3 -m pip install --user harbor
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Check Harbor
+        run: harbor --help
+
+      - name: Run benchmark
+        env:
+          BENCH_DATASET: ${{ inputs.dataset }}
+          BENCH_EXTRA_ARGS: ${{ inputs.extra_args }}
+          SEAPORT_BENCH_ITERATIONS: ${{ inputs.iterations }}
+          SEAPORT_BENCH_OUTPUT_DIR: benchmarks/results/github-action/harbor
+        run: |
+          set -euo pipefail
+          args=(run -d "$BENCH_DATASET")
+
+          if [[ -n "$BENCH_EXTRA_ARGS" ]]; then
+            # shellcheck disable=SC2206
+            extra_args=( $BENCH_EXTRA_ARGS )
+            args+=("${extra_args[@]}")
+          fi
+
+          ./benchmarks/benchmark.sh harbor "${args[@]}"
+
+      - name: Upload benchmark logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-harbor
+          path: benchmarks/results/github-action/harbor/
           if-no-files-found: ignore
