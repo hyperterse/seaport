@@ -14,6 +14,8 @@ const DEFAULT_CONTAINER_CPUS: &str = "1.0";
 const CONTAINER_PIDS_LIMIT: &str = "256";
 const DEFAULT_TMPFS_SIZE: &str = "256m";
 const DEFAULT_COMPAT_DOCKER_PLATFORM: &str = "linux/amd64";
+const DOCKER_BUILD_ATTEMPTS: usize = 3;
+const DOCKER_BUILD_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DOCKER_BUILD_TIMEOUT: Duration = Duration::from_secs(600);
 const DOCKER_WORKSPACE_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -786,12 +788,8 @@ fn prepare_docker_image(
     let environment_dir = dockerfile
         .parent()
         .ok_or_else(|| CliError::usage("environment/Dockerfile has no parent directory"))?;
-    let command = docker_build_command(&tag, environment_dir, environment);
-    let timed_output = run_command_with_timeout(
-        command,
-        environment.build_timeout,
-        Some(CommandLog::new(task_label, "build")),
-    )?;
+    let timed_output =
+        run_docker_build_with_retries(task_label, &tag, environment_dir, environment)?;
     let output = timed_output.output;
 
     if timed_output.timed_out {
@@ -817,6 +815,61 @@ fn prepare_docker_image(
         reference: tag,
         remove_after_run: true,
     })
+}
+
+fn run_docker_build_with_retries(
+    task_label: &str,
+    tag: &str,
+    environment_dir: &Path,
+    environment: &TaskEnvironment,
+) -> Result<TimedOutput, CliError> {
+    let mut attempt = 1;
+
+    loop {
+        let timed_output = run_command_with_timeout(
+            docker_build_command(tag, environment_dir, environment),
+            environment.build_timeout,
+            Some(CommandLog::new(task_label, "build")),
+        )?;
+
+        if timed_output.output.status.success()
+            || timed_output.timed_out
+            || attempt >= DOCKER_BUILD_ATTEMPTS
+            || !docker_build_transient_failure(&timed_output.output)
+        {
+            return Ok(timed_output);
+        }
+
+        attempt += 1;
+        println!(
+            "[{task_label} | build] transient docker build failure; retrying attempt {attempt}/{DOCKER_BUILD_ATTEMPTS} in {}",
+            format_duration(DOCKER_BUILD_RETRY_DELAY)
+        );
+        thread::sleep(DOCKER_BUILD_RETRY_DELAY);
+    }
+}
+
+fn docker_build_transient_failure(output: &Output) -> bool {
+    let output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .to_ascii_lowercase();
+
+    [
+        "502 bad gateway",
+        "503 service unavailable",
+        "504 gateway timeout",
+        "failed to fetch anonymous token",
+        "tls handshake timeout",
+        "i/o timeout",
+        "temporary failure",
+        "connection reset",
+        "unexpected status from get request",
+    ]
+    .iter()
+    .any(|pattern| output.contains(pattern))
 }
 
 fn docker_build_command(
@@ -1595,6 +1648,17 @@ mod tests {
             .windows(2)
             .any(|window| window == ["--network", "default"]));
         assert!(!args.iter().any(|arg| arg == "-q"));
+    }
+
+    #[test]
+    fn docker_build_transient_failure_detects_registry_gateway_errors() {
+        let output = Command::new("bash")
+            .arg("-lc")
+            .arg("printf 'failed to fetch anonymous token: 502 Bad Gateway\\n' >&2; exit 1")
+            .output()
+            .expect("output");
+
+        assert!(docker_build_transient_failure(&output));
     }
 
     #[test]
