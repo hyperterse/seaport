@@ -4,7 +4,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::CliError;
 
@@ -18,6 +18,9 @@ const DOCKER_BUILD_ATTEMPTS: usize = 3;
 const DOCKER_BUILD_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DOCKER_BUILD_TIMEOUT: Duration = Duration::from_secs(600);
 const DOCKER_WORKSPACE_TIMEOUT: Duration = Duration::from_secs(120);
+const DOCKER_IMAGE_CACHE_NAMESPACE: &str = "seaport-env-cache-v1";
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x100000001b3;
 
 pub(crate) struct ScriptOutputs {
     pub(crate) agent: AgentStep,
@@ -272,12 +275,7 @@ fn run_scripts_in_docker(
 ) -> Result<ScriptOutputs, CliError> {
     ensure_docker_available()?;
 
-    let image = prepare_docker_image(
-        runtime.task_label,
-        runtime.task_path,
-        runtime.run_id,
-        environment,
-    )?;
+    let image = prepare_docker_image(runtime.task_label, runtime.task_path, environment)?;
     let image_platform = image.platform.as_deref();
     let result = (|| {
         seed_docker_app_workspace(
@@ -286,6 +284,7 @@ fn run_scripts_in_docker(
             &image.reference,
             runtime.app_dir,
             image_platform,
+            image.cache_key.as_deref(),
         )?;
         prepare_task_file_workspace(runtime.task_path, runtime.app_dir)?;
         prepare_cobol_copybook_aliases(runtime.app_dir)?;
@@ -356,6 +355,7 @@ struct DockerImage {
     reference: String,
     remove_after_run: bool,
     platform: Option<String>,
+    cache_key: Option<String>,
 }
 
 struct TaskEnvironment {
@@ -682,7 +682,14 @@ fn seed_docker_app_workspace(
     image: &str,
     app_dir: &Path,
     platform: Option<&str>,
+    cache_key: Option<&str>,
 ) -> Result<(), CliError> {
+    if let Some(cache_key) = cache_key {
+        if try_seed_app_workspace_from_cache(task_label, cache_key, app_dir)? {
+            return Ok(());
+        }
+    }
+
     let container_name = docker_container_name(run_id, "workspace");
     let create_output = run_command_with_timeout(
         docker_create_workspace_command(&container_name, image, platform),
@@ -724,6 +731,10 @@ fn seed_docker_app_workspace(
 
     if !copy_output.output.status.success() {
         if docker_copy_missing_app(&copy_output.output) {
+            if let Some(cache_key) = cache_key {
+                best_effort_store_app_workspace_cache(task_label, cache_key, app_dir);
+            }
+
             return Ok(());
         }
 
@@ -735,7 +746,123 @@ fn seed_docker_app_workspace(
         )));
     }
 
+    prepare_container_writable_tree(app_dir)?;
+
+    if let Some(cache_key) = cache_key {
+        best_effort_store_app_workspace_cache(task_label, cache_key, app_dir);
+    }
+
+    Ok(())
+}
+
+fn try_seed_app_workspace_from_cache(
+    task_label: &str,
+    cache_key: &str,
+    app_dir: &Path,
+) -> Result<bool, CliError> {
+    let cache_dir = app_workspace_cache_dir(cache_key);
+
+    if !cache_dir.is_dir() {
+        return Ok(false);
+    }
+
+    match copy_app_workspace_from_cache_dir(&cache_dir, app_dir) {
+        Ok(()) => {
+            println!("[{task_label} | workspace] cache hit");
+            Ok(true)
+        }
+        Err(error) => {
+            eprintln!(
+                "seaport: warning: could not read workspace cache {}: {error}",
+                cache_dir.display()
+            );
+            reset_directory(app_dir)?;
+            Ok(false)
+        }
+    }
+}
+
+fn copy_app_workspace_from_cache_dir(cache_dir: &Path, app_dir: &Path) -> Result<(), CliError> {
+    copy_dir_all(cache_dir, app_dir)?;
     prepare_container_writable_tree(app_dir)
+}
+
+fn best_effort_store_app_workspace_cache(task_label: &str, cache_key: &str, app_dir: &Path) {
+    let cache_dir = app_workspace_cache_dir(cache_key);
+
+    if cache_dir.is_dir() {
+        return;
+    }
+
+    match store_app_workspace_cache_dir(&cache_dir, app_dir) {
+        Ok(()) => println!("[{task_label} | workspace] cached seeded /app"),
+        Err(error) => eprintln!(
+            "seaport: warning: could not write workspace cache {}: {error}",
+            cache_dir.display()
+        ),
+    }
+}
+
+fn store_app_workspace_cache_dir(cache_dir: &Path, app_dir: &Path) -> Result<(), CliError> {
+    if cache_dir.is_dir() {
+        return Ok(());
+    }
+
+    let parent = cache_dir
+        .parent()
+        .ok_or_else(|| CliError::io("workspace cache path has no parent directory"))?;
+    fs::create_dir_all(parent)?;
+
+    let staging = unique_cache_staging_dir(parent, "workspace")?;
+    copy_dir_all(app_dir, &staging)?;
+
+    match fs::rename(&staging, cache_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if cache_dir.is_dir() => {
+            let _ = fs::remove_dir_all(&staging);
+            eprintln!(
+                "seaport: warning: another worker populated workspace cache {} first: {error}",
+                cache_dir.display()
+            );
+            Ok(())
+        }
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            Err(CliError::from(error))
+        }
+    }
+}
+
+fn reset_directory(path: &Path) -> Result<(), CliError> {
+    if path.exists() {
+        fs::remove_dir_all(path)?;
+    }
+
+    fs::create_dir_all(path)?;
+    prepare_container_writable_dir(path)
+}
+
+fn app_workspace_cache_dir(cache_key: &str) -> PathBuf {
+    env::var_os("SEAPORT_WORKSPACE_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| seaport_cache_root().join("workspaces"))
+        .join(cache_key)
+}
+
+fn seaport_cache_root() -> PathBuf {
+    env::var_os("SEAPORT_CACHE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/seaport")))
+        .unwrap_or_else(|| env::temp_dir().join("seaport-cache"))
+}
+
+fn unique_cache_staging_dir(parent: &Path, prefix: &str) -> Result<PathBuf, CliError> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| CliError::io(format!("system clock before Unix epoch: {error}")))?
+        .as_nanos();
+
+    Ok(parent.join(format!("{prefix}-{}-{nanos}.tmp", std::process::id())))
 }
 
 fn docker_create_workspace_command(
@@ -780,7 +907,6 @@ fn docker_copy_missing_app(output: &Output) -> bool {
 fn prepare_docker_image(
     task_label: &str,
     task_path: &Path,
-    run_id: &str,
     environment: &TaskEnvironment,
 ) -> Result<DockerImage, CliError> {
     let dockerfile = task_path.join("environment").join("Dockerfile");
@@ -800,10 +926,10 @@ fn prepare_docker_image(
             reference: environment.image.clone(),
             remove_after_run: false,
             platform,
+            cache_key: None,
         });
     }
 
-    let tag = format!("seaport-task-{run_id}");
     let environment_dir = dockerfile
         .parent()
         .ok_or_else(|| CliError::usage("environment/Dockerfile has no parent directory"))?;
@@ -815,9 +941,26 @@ fn prepare_docker_image(
     }
 
     let mut build_platform = platform;
+    let mut cached_image =
+        cached_docker_image(environment_dir, environment, build_platform.as_deref())?;
+
+    if docker_image_exists(&cached_image.reference) {
+        println!(
+            "[{task_label} | build] cache hit: {}",
+            cached_image.reference
+        );
+
+        return Ok(DockerImage {
+            reference: cached_image.reference,
+            remove_after_run: false,
+            platform: build_platform,
+            cache_key: Some(cached_image.cache_key),
+        });
+    }
+
     let mut timed_output = run_docker_build_with_retries(
         task_label,
-        &tag,
+        &cached_image.reference,
         environment_dir,
         environment,
         build_platform.as_deref(),
@@ -825,22 +968,39 @@ fn prepare_docker_image(
 
     if should_retry_build_with_compat_platform(&timed_output, build_platform.as_deref()) {
         build_platform = Some(DEFAULT_COMPAT_DOCKER_PLATFORM.to_owned());
+        cached_image =
+            cached_docker_image(environment_dir, environment, build_platform.as_deref())?;
         println!(
             "[{task_label} | build] native docker build is not available for this image; retrying with {DEFAULT_COMPAT_DOCKER_PLATFORM}"
         );
-        timed_output = run_docker_build_with_retries(
-            task_label,
-            &tag,
-            environment_dir,
-            environment,
-            build_platform.as_deref(),
-        )?;
+
+        if docker_image_exists(&cached_image.reference) {
+            println!(
+                "[{task_label} | build] cache hit: {}",
+                cached_image.reference
+            );
+
+            return Ok(DockerImage {
+                reference: cached_image.reference,
+                remove_after_run: false,
+                platform: build_platform,
+                cache_key: Some(cached_image.cache_key),
+            });
+        } else {
+            timed_output = run_docker_build_with_retries(
+                task_label,
+                &cached_image.reference,
+                environment_dir,
+                environment,
+                build_platform.as_deref(),
+            )?;
+        }
     }
 
     let output = timed_output.output;
 
     if timed_output.timed_out {
-        cleanup_docker_image(&tag);
+        cleanup_docker_image(&cached_image.reference);
         return Err(CliError::task_failed(format!(
             "docker image build timed out after {:.3}s for {}",
             environment.build_timeout.as_secs_f64(),
@@ -859,10 +1019,115 @@ fn prepare_docker_image(
     }
 
     Ok(DockerImage {
-        reference: tag,
-        remove_after_run: true,
+        reference: cached_image.reference,
+        remove_after_run: false,
         platform: build_platform,
+        cache_key: Some(cached_image.cache_key),
     })
+}
+
+struct CachedDockerImage {
+    reference: String,
+    cache_key: String,
+}
+
+fn cached_docker_image(
+    environment_dir: &Path,
+    environment: &TaskEnvironment,
+    platform: Option<&str>,
+) -> Result<CachedDockerImage, CliError> {
+    let cache_key = docker_environment_cache_key(environment_dir, environment, platform)?;
+
+    Ok(CachedDockerImage {
+        reference: format!("seaport-env-cache:{cache_key}"),
+        cache_key,
+    })
+}
+
+fn docker_environment_cache_key(
+    environment_dir: &Path,
+    environment: &TaskEnvironment,
+    platform: Option<&str>,
+) -> Result<String, CliError> {
+    let mut hash = FNV_OFFSET_BASIS;
+
+    hash_cache_str(&mut hash, DOCKER_IMAGE_CACHE_NAMESPACE);
+    hash_cache_str(&mut hash, platform.unwrap_or("native"));
+    hash_cache_str(&mut hash, environment.build_network.as_docker_build_arg());
+    hash_directory(&mut hash, environment_dir, environment_dir)?;
+
+    Ok(format!("{hash:016x}"))
+}
+
+fn hash_directory(hash: &mut u64, root: &Path, directory: &Path) -> Result<(), CliError> {
+    let mut entries = fs::read_dir(directory)?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    entries.sort();
+
+    for entry_path in entries {
+        let metadata = fs::symlink_metadata(&entry_path)?;
+        let file_type = metadata.file_type();
+        let relative_path = cache_relative_path(root, &entry_path)?;
+
+        if file_type.is_dir() {
+            hash_cache_str(hash, "dir");
+            hash_cache_str(hash, &relative_path);
+            hash_directory(hash, root, &entry_path)?;
+        } else if file_type.is_file() {
+            hash_cache_str(hash, "file");
+            hash_cache_str(hash, &relative_path);
+            hash_cache_bytes(hash, &fs::read(&entry_path)?);
+        } else if file_type.is_symlink() {
+            hash_cache_str(hash, "symlink");
+            hash_cache_str(hash, &relative_path);
+            hash_cache_str(hash, &fs::read_link(&entry_path)?.to_string_lossy());
+        } else {
+            return Err(CliError::usage(format!(
+                "unsupported file in docker build context: {}",
+                entry_path.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn cache_relative_path(root: &Path, path: &Path) -> Result<String, CliError> {
+    let relative = path.strip_prefix(root).map_err(|error| {
+        CliError::io(format!(
+            "could not compute cache path for {} relative to {}: {error}",
+            path.display(),
+            root.display()
+        ))
+    })?;
+
+    Ok(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn hash_cache_str(hash: &mut u64, value: &str) {
+    hash_cache_bytes(hash, value.as_bytes());
+}
+
+fn hash_cache_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
+
+    *hash ^= 0xff;
+    *hash = hash.wrapping_mul(FNV_PRIME);
+}
+
+fn docker_image_exists(reference: &str) -> bool {
+    Command::new("docker")
+        .args(["image", "inspect", reference])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 fn infer_compat_platform(task_path: &Path) -> Result<Option<CompatPlatformInference>, CliError> {
@@ -1835,6 +2100,52 @@ mod tests {
     }
 
     #[test]
+    fn docker_environment_cache_key_tracks_platform_and_context() {
+        let environment = TaskEnvironment {
+            image: "ubuntu:24.04".to_owned(),
+            prebuilt_image: false,
+            platform: None,
+            resources: DockerResources::default(),
+            build_network: DockerNetwork::Bridge,
+            agent_network: DockerNetwork::Bridge,
+            verifier_network: DockerNetwork::Bridge,
+            build_timeout: Duration::from_secs(60),
+            agent_timeout: Duration::from_secs(60),
+            verifier_timeout: Duration::from_secs(60),
+        };
+        let task = temp_task_dir("docker-cache-key");
+        let environment_dir = task.join("environment");
+        fs::create_dir_all(&environment_dir).expect("environment dir");
+        fs::write(
+            environment_dir.join("Dockerfile"),
+            "FROM ubuntu:24.04\nWORKDIR /app\n",
+        )
+        .expect("dockerfile");
+
+        let native_key =
+            docker_environment_cache_key(&environment_dir, &environment, None).expect("native key");
+        let same_native_key =
+            docker_environment_cache_key(&environment_dir, &environment, None).expect("same key");
+        let amd64_key =
+            docker_environment_cache_key(&environment_dir, &environment, Some("linux/amd64"))
+                .expect("amd64 key");
+
+        fs::write(
+            environment_dir.join("Dockerfile"),
+            "FROM ubuntu:24.04\nWORKDIR /workspace\n",
+        )
+        .expect("updated dockerfile");
+        let changed_key = docker_environment_cache_key(&environment_dir, &environment, None)
+            .expect("changed key");
+
+        assert_eq!(native_key, same_native_key);
+        assert_ne!(native_key, amd64_key);
+        assert_ne!(native_key, changed_key);
+
+        let _ = fs::remove_dir_all(task);
+    }
+
+    #[test]
     fn docker_build_transient_failure_detects_registry_gateway_errors() {
         let output = Command::new("bash")
             .arg("-lc")
@@ -1947,6 +2258,33 @@ mod tests {
             copy_args,
             ["cp", "seaport-workspace-test:/app/.", "/tmp/app"]
         );
+    }
+
+    #[test]
+    fn app_workspace_cache_round_trips_seeded_files() {
+        let cache_root = temp_task_dir("workspace-cache-root");
+        let source = temp_task_dir("workspace-cache-source");
+        let target = temp_task_dir("workspace-cache-target");
+        let cache_dir = cache_root.join("cache-key");
+
+        fs::create_dir_all(source.join("src")).expect("source dir");
+        fs::write(
+            source.join("src").join("main.c"),
+            "int main(void) { return 0; }\n",
+        )
+        .expect("source file");
+
+        store_app_workspace_cache_dir(&cache_dir, &source).expect("store cache");
+        copy_app_workspace_from_cache_dir(&cache_dir, &target).expect("copy cache");
+
+        assert_eq!(
+            fs::read_to_string(target.join("src").join("main.c")).expect("cached file"),
+            "int main(void) { return 0; }\n"
+        );
+
+        let _ = fs::remove_dir_all(cache_root);
+        let _ = fs::remove_dir_all(source);
+        let _ = fs::remove_dir_all(target);
     }
 
     #[test]
