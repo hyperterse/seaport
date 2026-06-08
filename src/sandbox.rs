@@ -15,6 +15,7 @@ const CONTAINER_CPUS: &str = "1.0";
 const CONTAINER_PIDS_LIMIT: &str = "256";
 const DEFAULT_COMPAT_DOCKER_PLATFORM: &str = "linux/amd64";
 const DOCKER_BUILD_TIMEOUT: Duration = Duration::from_secs(600);
+const DOCKER_WORKSPACE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(crate) struct ScriptOutputs {
     pub(crate) agent: AgentStep,
@@ -81,7 +82,6 @@ pub(crate) struct PhaseEnvs {
 
 pub(crate) fn run_task_scripts(run: TaskScriptRequest<'_>) -> Result<ScriptOutputs, CliError> {
     let environment = task_environment(run.task_path)?;
-    prepare_task_file_workspace(run.task_path, run.app_dir)?;
     let runtime = TaskRuntime {
         task_label: run.task_label,
         task_path: run.task_path,
@@ -93,6 +93,7 @@ pub(crate) fn run_task_scripts(run: TaskScriptRequest<'_>) -> Result<ScriptOutpu
     match run.backend {
         SandboxBackend::Docker => run_scripts_in_docker(runtime, run.agent, run.envs, &environment),
         SandboxBackend::UnsafeLocal => {
+            prepare_task_file_workspace(run.task_path, run.app_dir)?;
             run_scripts_locally(runtime, run.agent, run.envs, &environment)
         }
     }
@@ -203,6 +204,15 @@ fn run_scripts_in_docker(
         environment,
     )?;
     let result = (|| {
+        seed_docker_app_workspace(
+            runtime.task_label,
+            runtime.run_id,
+            &image.reference,
+            runtime.app_dir,
+            environment.platform.as_deref(),
+        )?;
+        prepare_task_file_workspace(runtime.task_path, runtime.app_dir)?;
+
         let agent = match agent_kind {
             SandboxAgent::Oracle => AgentStep::from_output(
                 "solution/solve.sh",
@@ -530,6 +540,107 @@ fn strip_inline_comment(value: &str) -> &str {
     }
 
     value
+}
+
+fn seed_docker_app_workspace(
+    task_label: &str,
+    run_id: &str,
+    image: &str,
+    app_dir: &Path,
+    platform: Option<&str>,
+) -> Result<(), CliError> {
+    let container_name = docker_container_name(run_id, "workspace");
+    let create_output = run_command_with_timeout(
+        docker_create_workspace_command(&container_name, image, platform),
+        DOCKER_WORKSPACE_TIMEOUT,
+        Some(CommandLog::new(task_label, "workspace")),
+    )?;
+
+    if create_output.timed_out {
+        cleanup_docker_container(&container_name);
+        return Err(CliError::task_failed(format!(
+            "docker workspace container creation timed out after {:.3}s",
+            DOCKER_WORKSPACE_TIMEOUT.as_secs_f64()
+        )));
+    }
+
+    if !create_output.output.status.success() {
+        cleanup_docker_container(&container_name);
+        return Err(CliError::task_failed(format!(
+            "docker workspace container creation failed (status: {})\nstdout:\n{}\nstderr:\n{}",
+            create_output.output.status,
+            String::from_utf8_lossy(&create_output.output.stdout),
+            String::from_utf8_lossy(&create_output.output.stderr)
+        )));
+    }
+
+    let copy_output = run_command_with_timeout(
+        docker_copy_workspace_command(&container_name, app_dir),
+        DOCKER_WORKSPACE_TIMEOUT,
+        Some(CommandLog::new(task_label, "workspace")),
+    )?;
+    cleanup_docker_container(&container_name);
+
+    if copy_output.timed_out {
+        return Err(CliError::task_failed(format!(
+            "docker workspace copy timed out after {:.3}s",
+            DOCKER_WORKSPACE_TIMEOUT.as_secs_f64()
+        )));
+    }
+
+    if !copy_output.output.status.success() {
+        if docker_copy_missing_app(&copy_output.output) {
+            return Ok(());
+        }
+
+        return Err(CliError::task_failed(format!(
+            "docker workspace copy failed (status: {})\nstdout:\n{}\nstderr:\n{}",
+            copy_output.output.status,
+            String::from_utf8_lossy(&copy_output.output.stdout),
+            String::from_utf8_lossy(&copy_output.output.stderr)
+        )));
+    }
+
+    prepare_container_writable_tree(app_dir)
+}
+
+fn docker_create_workspace_command(
+    container_name: &str,
+    image: &str,
+    platform: Option<&str>,
+) -> Command {
+    let mut command = Command::new("docker");
+    command.args(["create", "--name", container_name]);
+
+    if let Some(platform) = platform {
+        command.args(["--platform", platform]);
+    }
+
+    command.arg(image);
+    command
+}
+
+fn docker_copy_workspace_command(container_name: &str, app_dir: &Path) -> Command {
+    let mut command = Command::new("docker");
+    command
+        .arg("cp")
+        .arg(format!("{container_name}:/app/."))
+        .arg(app_dir);
+    command
+}
+
+fn docker_copy_missing_app(output: &Output) -> bool {
+    let output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .to_ascii_lowercase();
+
+    output.contains("/app")
+        && (output.contains("could not find")
+            || output.contains("no such file")
+            || output.contains("not found"))
 }
 
 fn prepare_docker_image(
@@ -1347,6 +1458,31 @@ mod tests {
             .windows(2)
             .any(|window| window == ["--network", "default"]));
         assert!(!args.iter().any(|arg| arg == "-q"));
+    }
+
+    #[test]
+    fn docker_workspace_commands_copy_image_app_tree() {
+        let create = docker_create_workspace_command(
+            "seaport-workspace-test",
+            "seaport-task-test",
+            Some("linux/amd64"),
+        );
+        let copy = docker_copy_workspace_command("seaport-workspace-test", Path::new("/tmp/app"));
+
+        let create_args = command_args(create);
+        let copy_args = command_args(copy);
+
+        assert!(create_args
+            .windows(2)
+            .any(|window| window == ["--platform", "linux/amd64"]));
+        assert_eq!(
+            create_args.last().map(String::as_str),
+            Some("seaport-task-test")
+        );
+        assert_eq!(
+            copy_args,
+            ["cp", "seaport-workspace-test:/app/.", "/tmp/app"]
+        );
     }
 
     #[test]
