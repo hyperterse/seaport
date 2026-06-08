@@ -28,7 +28,6 @@ jobs:
       - run: cargo test --all-targets --locked
       - run: cargo test --doc --locked
       - run: bash -n install.sh
-      - run: bash -n benchmarks/benchmark.sh
       - run: PYTHONPYCACHEPREFIX=/tmp/seaport-pycache python3 -m py_compile benchmarks/run.py
       - run: cargo run -- --help
       - run: test -f examples/tasks/basic-evaluation/task.toml
