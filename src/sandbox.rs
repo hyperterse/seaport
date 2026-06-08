@@ -371,6 +371,12 @@ struct TaskEnvironment {
     verifier_timeout: Duration,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompatPlatformInference {
+    platform: &'static str,
+    reason: &'static str,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DockerResources {
     cpus: String,
@@ -783,7 +789,11 @@ fn prepare_docker_image(
     } else {
         None
     };
-    let platform = environment.platform.clone().or(inferred_platform);
+    let platform = environment.platform.clone().or_else(|| {
+        inferred_platform
+            .as_ref()
+            .map(|inference| inference.platform.to_owned())
+    });
 
     if environment.prebuilt_image || !dockerfile.is_file() {
         return Ok(DockerImage {
@@ -797,9 +807,10 @@ fn prepare_docker_image(
     let environment_dir = dockerfile
         .parent()
         .ok_or_else(|| CliError::usage("environment/Dockerfile has no parent directory"))?;
-    if platform.is_some() && environment.platform.is_none() {
+    if let Some(inference) = inferred_platform {
         println!(
-            "[{task_label} | build] x86 assembly detected; using {DEFAULT_COMPAT_DOCKER_PLATFORM}"
+            "[{task_label} | build] {}; using {}",
+            inference.reason, inference.platform
         );
     }
 
@@ -854,16 +865,47 @@ fn prepare_docker_image(
     })
 }
 
-fn infer_compat_platform(task_path: &Path) -> Result<Option<String>, CliError> {
-    if compat_docker_platform_available() && task_contains_x86_assembly(task_path)? {
-        Ok(Some(DEFAULT_COMPAT_DOCKER_PLATFORM.to_owned()))
-    } else {
-        Ok(None)
+fn infer_compat_platform(task_path: &Path) -> Result<Option<CompatPlatformInference>, CliError> {
+    if !compat_docker_platform_available() {
+        return Ok(None);
     }
+
+    if task_contains_x86_assembly(task_path)? {
+        return Ok(Some(CompatPlatformInference {
+            platform: DEFAULT_COMPAT_DOCKER_PLATFORM,
+            reason: "x86 assembly detected",
+        }));
+    }
+
+    if task_uses_legacy_java7_toolchain(task_path)? {
+        return Ok(Some(CompatPlatformInference {
+            platform: DEFAULT_COMPAT_DOCKER_PLATFORM,
+            reason: "legacy Java 7 toolchain requires amd64 on this host",
+        }));
+    }
+
+    Ok(None)
 }
 
 fn task_contains_x86_assembly(task_path: &Path) -> Result<bool, CliError> {
     path_contains_x86_assembly(&task_path.join("environment"))
+}
+
+fn task_uses_legacy_java7_toolchain(task_path: &Path) -> Result<bool, CliError> {
+    dockerfile_uses_legacy_java7_toolchain(&task_path.join("environment").join("Dockerfile"))
+}
+
+fn dockerfile_uses_legacy_java7_toolchain(dockerfile: &Path) -> Result<bool, CliError> {
+    if !dockerfile.is_file() {
+        return Ok(false);
+    }
+
+    let contents = fs::read(dockerfile)?;
+    let contents = String::from_utf8_lossy(&contents).to_ascii_lowercase();
+
+    Ok(["zulu7-jdk", "openjdk-7-jdk", "openjdk-7-jre"]
+        .iter()
+        .any(|package| contents.contains(package)))
 }
 
 fn path_contains_x86_assembly(path: &Path) -> Result<bool, CliError> {
@@ -1828,10 +1870,56 @@ mod tests {
         let platform = infer_compat_platform(&task).expect("platform");
 
         if cfg!(target_arch = "aarch64") {
-            assert_eq!(platform.as_deref(), Some(DEFAULT_COMPAT_DOCKER_PLATFORM));
+            assert_eq!(
+                platform.map(|inference| inference.platform),
+                Some(DEFAULT_COMPAT_DOCKER_PLATFORM)
+            );
         } else {
             assert_eq!(platform, None);
         }
+
+        let _ = fs::remove_dir_all(task);
+    }
+
+    #[test]
+    fn infer_compat_platform_detects_legacy_java7_toolchains_on_arm_hosts() {
+        let task = temp_task_dir("java7-platform");
+        let environment_dir = task.join("environment");
+        fs::create_dir_all(&environment_dir).expect("environment dir");
+        fs::write(
+            environment_dir.join("Dockerfile"),
+            "FROM ubuntu:24.04\nRUN apt-get update && apt-get install -y zulu7-jdk\n",
+        )
+        .expect("dockerfile");
+
+        let platform = infer_compat_platform(&task).expect("platform");
+
+        if cfg!(target_arch = "aarch64") {
+            let inference = platform.expect("compat platform");
+            assert_eq!(inference.platform, DEFAULT_COMPAT_DOCKER_PLATFORM);
+            assert_eq!(
+                inference.reason,
+                "legacy Java 7 toolchain requires amd64 on this host"
+            );
+        } else {
+            assert_eq!(platform, None);
+        }
+
+        let _ = fs::remove_dir_all(task);
+    }
+
+    #[test]
+    fn dockerfile_uses_legacy_java7_toolchain_detects_java7_packages() {
+        let task = temp_task_dir("java7-dockerfile");
+        let dockerfile = task.join("environment").join("Dockerfile");
+        fs::create_dir_all(dockerfile.parent().expect("dockerfile parent")).expect("task dir");
+        fs::write(
+            &dockerfile,
+            "FROM ubuntu:24.04\nRUN apt-get install -y openjdk-7-jdk\n",
+        )
+        .expect("dockerfile");
+
+        assert!(dockerfile_uses_legacy_java7_toolchain(&dockerfile).expect("detect"));
 
         let _ = fs::remove_dir_all(task);
     }
