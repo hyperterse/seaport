@@ -389,15 +389,17 @@ cargo run -- run --help
 cargo run -- init --task acme/example
 ```
 
-Create a release by pushing a semantic version tag:
+Create a release by running the `release` workflow from a branch:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+gh workflow run release.yml --ref main
 ```
 
-The release workflow builds Linux, macOS, and Windows archives, publishes them
-to GitHub Releases, and uploads `checksums.txt`.
+The release workflow installs the root Bun release tooling, uses `release-it`
+with `@release-it/conventional-changelog` to bump `package.json`, write
+`CHANGELOG.md`, commit, tag, and push as the configured GitHub App, syncs that
+version to `Cargo.toml` and `Cargo.lock`, builds Linux, macOS, and Windows
+archives, publishes them to GitHub Releases, and uploads `checksums.txt`.
 
 ## Project Layout
 

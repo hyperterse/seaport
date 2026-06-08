@@ -1,4 +1,6 @@
 /target/
+/node_modules/
+/release-notes.md
 /benchmarks/results/latest.json
 /benchmarks/results/latest.md
 /benchmarks/results/*/

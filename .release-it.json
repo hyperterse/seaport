@@ -1,0 +1,33 @@
+{
+  "$schema": "https://unpkg.com/release-it@20/schema/release-it.json",
+  "git": {
+    "commitMessage": "chore(release): v${version}",
+    "tagName": "v${version}",
+    "requireBranch": false,
+    "requireCleanWorkingDir": true
+  },
+  "github": {
+    "release": false
+  },
+  "npm": {
+    "publish": false
+  },
+  "hooks": {
+    "after:bump": "bun .github/scripts/sync-cargo-version.ts",
+    "before:git:release": [
+      "cargo fmt --all -- --check",
+      "cargo test --all-targets --locked",
+      "cargo test --doc --locked",
+      "bun .github/scripts/release-metadata.ts",
+      "git add package.json Cargo.toml Cargo.lock CHANGELOG.md"
+    ]
+  },
+  "plugins": {
+    "@release-it/conventional-changelog": {
+      "infile": "CHANGELOG.md",
+      "preset": {
+        "name": "conventionalcommits"
+      }
+    }
+  }
+}
