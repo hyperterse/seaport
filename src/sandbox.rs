@@ -778,12 +778,18 @@ fn prepare_docker_image(
     environment: &TaskEnvironment,
 ) -> Result<DockerImage, CliError> {
     let dockerfile = task_path.join("environment").join("Dockerfile");
+    let inferred_platform = if environment.platform.is_none() {
+        infer_compat_platform(task_path)?
+    } else {
+        None
+    };
+    let platform = environment.platform.clone().or(inferred_platform);
 
     if environment.prebuilt_image || !dockerfile.is_file() {
         return Ok(DockerImage {
             reference: environment.image.clone(),
             remove_after_run: false,
-            platform: environment.platform.clone(),
+            platform,
         });
     }
 
@@ -791,7 +797,13 @@ fn prepare_docker_image(
     let environment_dir = dockerfile
         .parent()
         .ok_or_else(|| CliError::usage("environment/Dockerfile has no parent directory"))?;
-    let mut build_platform = environment.platform.clone();
+    if platform.is_some() && environment.platform.is_none() {
+        println!(
+            "[{task_label} | build] x86 assembly detected; using {DEFAULT_COMPAT_DOCKER_PLATFORM}"
+        );
+    }
+
+    let mut build_platform = platform;
     let mut timed_output = run_docker_build_with_retries(
         task_label,
         &tag,
@@ -840,6 +852,68 @@ fn prepare_docker_image(
         remove_after_run: true,
         platform: build_platform,
     })
+}
+
+fn infer_compat_platform(task_path: &Path) -> Result<Option<String>, CliError> {
+    if compat_docker_platform_available() && task_contains_x86_assembly(task_path)? {
+        Ok(Some(DEFAULT_COMPAT_DOCKER_PLATFORM.to_owned()))
+    } else {
+        Ok(None)
+    }
+}
+
+fn task_contains_x86_assembly(task_path: &Path) -> Result<bool, CliError> {
+    path_contains_x86_assembly(&task_path.join("environment"))
+}
+
+fn path_contains_x86_assembly(path: &Path) -> Result<bool, CliError> {
+    if !path.is_dir() {
+        return Ok(false);
+    }
+
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let file_type = entry.file_type()?;
+
+        if file_type.is_dir() {
+            if path_contains_x86_assembly(&entry_path)? {
+                return Ok(true);
+            }
+        } else if file_type.is_file() && is_assembly_source(&entry_path) {
+            let source = fs::read(&entry_path)?;
+
+            if assembly_source_mentions_x86(&source) {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+fn is_assembly_source(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("s") || extension.eq_ignore_ascii_case("asm")
+        })
+}
+
+fn assembly_source_mentions_x86(source: &[u8]) -> bool {
+    let source = String::from_utf8_lossy(source).to_ascii_lowercase();
+
+    [
+        ".intel_syntax",
+        "%rax",
+        "%eax",
+        "%rip",
+        " rax",
+        " eax",
+        " syscall",
+    ]
+    .iter()
+    .any(|marker| source.contains(marker))
 }
 
 fn run_docker_build_with_retries(
@@ -1738,6 +1812,28 @@ mod tests {
             .expect("output");
 
         assert!(docker_build_needs_compat_platform(&output));
+    }
+
+    #[test]
+    fn infer_compat_platform_detects_x86_assembly_on_arm_hosts() {
+        let task = temp_task_dir("x86-assembly-platform");
+        let source_dir = task.join("environment").join("src");
+        fs::create_dir_all(&source_dir).expect("source dir");
+        fs::write(
+            source_dir.join("main.s"),
+            ".intel_syntax noprefix\nmov rax, 60\nsyscall\n",
+        )
+        .expect("assembly source");
+
+        let platform = infer_compat_platform(&task).expect("platform");
+
+        if cfg!(target_arch = "aarch64") {
+            assert_eq!(platform.as_deref(), Some(DEFAULT_COMPAT_DOCKER_PLATFORM));
+        } else {
+            assert_eq!(platform, None);
+        }
+
+        let _ = fs::remove_dir_all(task);
     }
 
     #[test]
