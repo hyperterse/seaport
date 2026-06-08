@@ -138,7 +138,7 @@ body {
 .docs-prose pre {
   margin: 1.25rem 0;
   padding: 1rem 1.15rem;
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  border: 0;
   border-radius: 0.75rem;
   overflow-x: auto;
   font-size: 0.85rem;
@@ -209,12 +209,11 @@ body {
 /* callouts / admonitions */
 .callout {
   margin: 1.5rem 0;
-  padding: 0.95rem 1.1rem;
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-left-width: 3px;
+  padding: 0.95rem 1.1rem 1rem;
+  border: 0;
   border-radius: 0.6rem;
-  background-color: rgba(255, 255, 255, 0.025);
   font-size: 0.92rem;
+  color: #eaeaea;
 }
 
 .callout > :first-child {
@@ -223,6 +222,10 @@ body {
 
 .callout > :last-child {
   margin-bottom: 0;
+}
+
+.callout :is(p, ul, ol, li) {
+  color: inherit;
 }
 
 .callout::before {
@@ -236,28 +239,31 @@ body {
 }
 
 .callout-note {
-  border-left-color: #5a5a5a;
+  background-color: rgba(255, 255, 255, 0.05);
 }
 .callout-note::before {
-  color: #cfcfcf;
+  color: #d4d4d4;
 }
 
 .callout-tip {
-  border-left-color: var(--color-tide-500);
+  background-color: rgba(45, 212, 191, 0.1);
+  color: #d7f7f1;
 }
 .callout-tip::before {
-  color: var(--color-tide-400);
+  color: #5eead4;
 }
 
 .callout-warning {
-  border-left-color: #f59e0b;
+  background-color: rgba(245, 158, 11, 0.12);
+  color: #fceccf;
 }
 .callout-warning::before {
   color: #fbbf24;
 }
 
 .callout-danger {
-  border-left-color: #f43f5e;
+  background-color: rgba(244, 63, 94, 0.12);
+  color: #ffd9df;
 }
 .callout-danger::before {
   color: #fb7185;
