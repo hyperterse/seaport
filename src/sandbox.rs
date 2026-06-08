@@ -9,6 +9,7 @@ use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::logging::LogMode;
 use crate::CliError;
 
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
@@ -32,34 +33,12 @@ static DOCKER_AVAILABLE: OnceLock<()> = OnceLock::new();
 static DOCKER_IMAGE_PULLS: OnceLock<ImagePullState> = OnceLock::new();
 static SANDBOX_LOG_MODE: AtomicU8 = AtomicU8::new(LogMode::Concise as u8);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub(crate) enum LogMode {
-    Concise = 0,
-    Verbose = 1,
-    Quiet = 2,
-}
-
-impl LogMode {
-    fn current() -> Self {
-        match SANDBOX_LOG_MODE.load(Ordering::Relaxed) {
-            value if value == Self::Verbose as u8 => Self::Verbose,
-            value if value == Self::Quiet as u8 => Self::Quiet,
-            _ => Self::Concise,
-        }
-    }
-
-    fn prints_events(self) -> bool {
-        !matches!(self, Self::Quiet)
-    }
-
-    fn streams_lines(self) -> bool {
-        matches!(self, Self::Verbose)
-    }
-}
-
 pub(crate) fn set_log_mode(mode: LogMode) {
     SANDBOX_LOG_MODE.store(mode as u8, Ordering::Relaxed);
+}
+
+fn log_mode() -> LogMode {
+    LogMode::from_u8(SANDBOX_LOG_MODE.load(Ordering::Relaxed))
 }
 
 pub(crate) struct ScriptOutputs {
@@ -2419,7 +2398,7 @@ impl CommandLog {
         Self {
             task: task.to_owned(),
             phase: phase.to_owned(),
-            mode: LogMode::current(),
+            mode: log_mode(),
         }
     }
 
@@ -2527,7 +2506,7 @@ fn join_stream_reader(
 }
 
 fn print_stream_line(log: &StreamLog, line: &[u8]) {
-    if !log.mode.streams_lines() {
+    if !log.mode.is_verbose() {
         return;
     }
 
@@ -2544,7 +2523,7 @@ fn print_stream_line(log: &StreamLog, line: &[u8]) {
 }
 
 fn print_phase_start(log: &CommandLog, timeout: Duration) {
-    if !log.mode.prints_events() {
+    if !log.mode.is_verbose() {
         return;
     }
 
@@ -2558,7 +2537,7 @@ fn print_phase_start(log: &CommandLog, timeout: Duration) {
 }
 
 fn print_backend_event(task_label: &str, phase: &str, message: &str) {
-    if LogMode::current() == LogMode::Verbose {
+    if log_mode().is_verbose() {
         println!(
             "    {:<44} {:<9} {}",
             fit_log_text(task_label, 44),
@@ -2569,7 +2548,7 @@ fn print_backend_event(task_label: &str, phase: &str, message: &str) {
 }
 
 fn print_backend_notice(task_label: &str, phase: &str, message: &str) {
-    if LogMode::current().prints_events() {
+    if log_mode().is_verbose() {
         println!(
             "  · {:<44} {:<9} {}",
             fit_log_text(task_label, 44),

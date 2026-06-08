@@ -3,11 +3,13 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::logging::LogMode;
 use crate::CliError;
 
 const DEFAULT_JSON_REGISTRY_URL: &str =
@@ -23,6 +25,15 @@ const DATASET_VERSION_TAG_SELECT: &str =
 const DATASET_VERSION_SELECT: &str = "*,package:package_id!inner(name,type,org:org_id!inner(name))";
 const DATASET_TASK_SELECT: &str =
     "task_version:task_version_id(content_hash,archive_path,package:package_id(name,org:org_id(name)))";
+static REGISTRY_LOG_MODE: AtomicU8 = AtomicU8::new(LogMode::Concise as u8);
+
+pub(crate) fn set_log_mode(mode: LogMode) {
+    REGISTRY_LOG_MODE.store(mode as u8, Ordering::Relaxed);
+}
+
+fn log_mode() -> LogMode {
+    LogMode::from_u8(REGISTRY_LOG_MODE.load(Ordering::Relaxed))
+}
 
 #[derive(Debug)]
 pub(crate) struct ResolvedRegistryDataset {
@@ -51,7 +62,7 @@ pub(crate) fn resolve_remote_registry_dataset(
     registry_url: Option<&str>,
 ) -> Result<ResolvedRegistryDataset, CliError> {
     if use_package_registry(registry_url) {
-        progress("using package registry")?;
+        verbose_progress("using package registry")?;
         return resolve_package_dataset(dataset);
     }
 
@@ -129,7 +140,7 @@ pub(crate) fn resolve_remote_registry_task(
     registry_url: Option<&str>,
 ) -> Result<ResolvedRegistryDataset, CliError> {
     if use_package_registry(registry_url) {
-        progress("using package registry")?;
+        verbose_progress("using package registry")?;
         return resolve_package_task(task_name);
     }
 
@@ -292,12 +303,12 @@ fn use_package_registry(registry_url: Option<&str>) -> bool {
 
 fn resolve_package_dataset(dataset: &str) -> Result<ResolvedRegistryDataset, CliError> {
     let reference = PackageReference::parse(dataset)?;
-    progress(&format!(
+    verbose_progress(&format!(
         "querying dataset package: {}",
         reference.display_with_ref()
     ))?;
     let dataset_version = resolve_package_dataset_version(&reference)?;
-    progress("loading dataset task list")?;
+    verbose_progress("loading dataset task list")?;
     let task_versions = package_dataset_tasks(&dataset_version.id)?;
 
     if task_versions.is_empty() {
@@ -307,11 +318,11 @@ fn resolve_package_dataset(dataset: &str) -> Result<ResolvedRegistryDataset, Cli
         )));
     }
 
-    progress(&format!("found {} packaged tasks", task_versions.len()))?;
+    progress(&format!("preparing {} packaged tasks", task_versions.len()))?;
     let mut task_paths = Vec::with_capacity(task_versions.len());
 
     for (index, task) in task_versions.iter().enumerate() {
-        progress(&format!(
+        verbose_progress(&format!(
             "preparing package task {}/{}: {}/{}",
             index + 1,
             task_versions.len(),
@@ -329,7 +340,7 @@ fn resolve_package_dataset(dataset: &str) -> Result<ResolvedRegistryDataset, Cli
 
 fn resolve_package_task(task_name: &str) -> Result<ResolvedRegistryDataset, CliError> {
     let reference = PackageReference::parse(task_name)?;
-    progress(&format!(
+    verbose_progress(&format!(
         "querying task package: {}",
         reference.display_with_ref()
     ))?;
@@ -475,7 +486,7 @@ fn download_package_task(task: &PackageTaskVersion) -> Result<PathBuf, CliError>
     let target_dir = package_task_cache_dir(task);
 
     if target_dir.join("task.toml").is_file() {
-        progress(&format!(
+        verbose_progress(&format!(
             "cache hit: {}/{}",
             task.package.org.name, task.package.name
         ))?;
@@ -506,16 +517,16 @@ fn download_package_task(task: &PackageTaskVersion) -> Result<PathBuf, CliError>
 
     let result = (|| {
         progress(&format!(
-            "downloading archive: {}/{}",
+            "downloading package task: {}/{}",
             task.package.org.name, task.package.name
         ))?;
         download_package_archive(&task.archive_path, &archive_path)?;
-        progress(&format!(
+        verbose_progress(&format!(
             "validating archive: {}/{}",
             task.package.org.name, task.package.name
         ))?;
         validate_archive_paths(&archive_path)?;
-        progress(&format!(
+        verbose_progress(&format!(
             "extracting archive: {}/{}",
             task.package.org.name, task.package.name
         ))?;
@@ -532,7 +543,7 @@ fn download_package_task(task: &PackageTaskVersion) -> Result<PathBuf, CliError>
             fs::remove_dir_all(&target_dir)?;
         }
         fs::rename(&unpack_dir, &target_dir)?;
-        progress(&format!(
+        verbose_progress(&format!(
             "ready: {}/{}",
             task.package.org.name, task.package.name
         ))?;
@@ -700,10 +711,10 @@ fn ensure_git_checkout(
             .arg(checkout_dir);
         run_git(clone, "clone git-backed registry task")?;
     } else {
-        progress(&format!("git cache hit: {git_source}"))?;
+        verbose_progress(&format!("git cache hit: {git_source}"))?;
     }
 
-    progress(&format!("checking out revision: {revision}"))?;
+    verbose_progress(&format!("checking out revision: {revision}"))?;
     let mut checkout = Command::new("git");
     checkout
         .arg("-C")
@@ -964,8 +975,20 @@ fn command_failed(action: &str, output: &std::process::Output) -> CliError {
 }
 
 fn progress(message: &str) -> Result<(), CliError> {
+    if !log_mode().prints_events() {
+        return Ok(());
+    }
+
     println!("  -> {message}");
     io::stdout().flush()?;
+
+    Ok(())
+}
+
+fn verbose_progress(message: &str) -> Result<(), CliError> {
+    if log_mode().is_verbose() {
+        progress(message)?;
+    }
 
     Ok(())
 }

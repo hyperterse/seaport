@@ -10,18 +10,21 @@ use std::sync::{mpsc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod logging;
 mod registry;
 mod sandbox;
 mod target;
 
+use logging::LogMode;
 use registry::{
     resolve_git_task_source, resolve_local_registry_dataset, resolve_local_registry_task,
     resolve_remote_registry_dataset, resolve_remote_registry_task,
+    set_log_mode as set_registry_log_mode,
 };
 use sandbox::{
     ensure_sandbox_backend_available, preflight_task_environment, prepare_container_writable_dir,
-    run_task_scripts, set_log_mode, AgentStep, ExternalAgent, LogMode, PhaseEnvs, SandboxAgent,
-    SandboxBackend, ScriptOutputs, TaskScriptRequest,
+    run_task_scripts, set_log_mode as set_sandbox_log_mode, AgentStep, ExternalAgent, PhaseEnvs,
+    SandboxAgent, SandboxBackend, ScriptOutputs, TaskScriptRequest,
 };
 use target::{RunTarget, TaskRef, TaskSelection};
 
@@ -60,7 +63,8 @@ fn run_eval(args: &[String]) -> Result<(), CliError> {
     }
 
     let options = RunOptions::parse(args)?;
-    set_log_mode(options.log_mode);
+    set_registry_log_mode(options.log_mode);
+    set_sandbox_log_mode(options.log_mode);
 
     if !options.has_run_source() {
         return Err(CliError::usage(
@@ -259,6 +263,7 @@ fn preflight_target(target: &RunTarget, options: &RunOptions) -> Result<Duration
     let concurrency = phase.concurrency(options.concurrency, target.tasks.len());
 
     print_phase_header(phase, target.tasks.len(), concurrency, options)?;
+    print_phase_progress(phase, 0, target.tasks.len(), started.elapsed(), options)?;
 
     let work = Mutex::new(scheduled_task_indices(&target.tasks));
     let (sender, receiver) = mpsc::channel();
@@ -377,6 +382,7 @@ fn run_trial_plans(
     let started = Instant::now();
 
     print_phase_header(phase, plans.len(), concurrency, options)?;
+    print_phase_progress(phase, 0, plans.len(), started.elapsed(), options)?;
 
     let work = Mutex::new(scheduled_trial_indices(plans));
     let (sender, receiver) = mpsc::channel();
@@ -620,6 +626,10 @@ fn print_trial_start(
     agent: AgentKind,
 ) -> Result<(), CliError> {
     if options.log_mode != LogMode::Quiet {
+        if options.log_mode != LogMode::Verbose {
+            return Ok(());
+        }
+
         println!(
             "  {} {}  attempt {attempt}/{}  {}",
             blue("->"),
@@ -637,6 +647,8 @@ fn print_trial_finish(outcome: &TrialOutcome, options: &RunOptions) -> Result<()
     if options.log_mode == LogMode::Quiet {
         return Ok(());
     }
+
+    clear_live_progress_line(options)?;
 
     let status = if outcome.passed {
         green("✓")
@@ -734,7 +746,7 @@ fn print_phase_progress(
         RunPhase::Execution => "32",
     };
 
-    println!(
+    let line = format!(
         "{:<13} {}  {:>3}/{:<3} {}",
         phase.title(),
         progress_bar(completed, total, PROGRESS_BAR_WIDTH, color),
@@ -742,9 +754,31 @@ fn print_phase_progress(
         total,
         dim(&format_duration(elapsed))
     );
+
+    if live_progress_enabled(options) {
+        print!("\r\x1b[2K{line}");
+        if completed >= total {
+            println!();
+        }
+    } else if completed >= total || options.log_mode == LogMode::Verbose {
+        println!("{line}");
+    }
     io::stdout().flush()?;
 
     Ok(())
+}
+
+fn clear_live_progress_line(options: &RunOptions) -> Result<(), CliError> {
+    if live_progress_enabled(options) {
+        print!("\r\x1b[2K");
+        io::stdout().flush()?;
+    }
+
+    Ok(())
+}
+
+fn live_progress_enabled(options: &RunOptions) -> bool {
+    options.log_mode == LogMode::Concise && io::stdout().is_terminal()
 }
 
 struct RunBox<'a> {
