@@ -39,13 +39,41 @@ A preflight failure is never fatal. If an image fails to build or pull, that tas
 
 Preflight runs at most four environments in parallel regardless of `-n`, since it is bound by Docker and the network rather than CPU.
 
-## Benchmarking against Harbor
+## Benchmark results
 
-Seaport ships a head-to-head benchmark that runs the same command through both tools. See [Harbor compatibility](/docs/harbor) for the full walkthrough.
+The same command, run through both tools on the same machine. Two shapes tell the story: a tiny oracle task that isolates pure harness overhead, and a full legacy dataset where real task work dominates.
+
+| Benchmark | Seaport | Harbor | Speedup |
+| --- | ---: | ---: | ---: |
+| Oracle task (harness overhead) | **1.67s** | 15.99s | **9.6×** |
+| `factory-ai/legacy-bench`, full dataset | **54.7s** | 100.7s | **1.8×** |
+
+Mean wall-clock per run. Measured on macOS arm64, Docker 29.4.0 via OrbStack, Harbor 0.13.1, against Seaport's hardened Docker backend.
+
+:::note
+The oracle task is intentionally tiny, so it measures harness overhead, not model quality or image complexity. That is where Seaport pulls furthest ahead. On a full dataset the agent and verifier work is shared by both tools, so the gap narrows to the part Seaport actually controls. Numbers depend on cache warmth and your machine, so run them yourself.
+:::
+
+## Benchmark them side by side
+
+Seaport ships a harness that runs the same command through each tool and reports the comparison. The first argument selects the tool; everything after it is forwarded unchanged.
 
 ```sh
 benchmarks/benchmark.sh seaport run -d factory-ai/legacy-bench
 benchmarks/benchmark.sh harbor  run -d factory-ai/legacy-bench
 ```
 
-Each writes per-run logs plus `report.json` and `report.md` under `benchmarks/results/`. There is also a manual `benchmark` GitHub Actions workflow that runs both tools on a dataset you choose.
+By default it runs each tool ten times and writes per-run logs plus `report.json` and `report.md` under `benchmarks/results/`. A few environment variables tune it:
+
+| Variable | Effect |
+| --- | --- |
+| `SEAPORT_BENCH_ITERATIONS` | Runs per tool. Defaults to `10`. |
+| `SEAPORT_BENCH_OUTPUT_DIR` | Where reports are written. |
+| `SEAPORT_BIN` | Path to the Seaport binary. |
+| `HARBOR_BIN` | Path to the Harbor binary. |
+
+:::note
+The report only declares Seaport faster when both tools complete at least one successful run on the same task. If Harbor is not installed, Docker is unavailable, or the task fails, it records that instead of fabricating a comparison.
+:::
+
+There is also a manual `benchmark` GitHub Actions workflow that runs Seaport and Harbor as separate jobs on a dataset you choose, and uploads both sets of logs.
