@@ -808,7 +808,7 @@ fn try_seed_app_workspace_from_cache(
 }
 
 fn copy_app_workspace_from_cache_dir(cache_dir: &Path, app_dir: &Path) -> Result<(), CliError> {
-    copy_dir_all(cache_dir, app_dir)?;
+    copy_app_workspace_snapshot(cache_dir, app_dir)?;
     prepare_container_writable_tree(app_dir)
 }
 
@@ -839,7 +839,7 @@ fn store_app_workspace_cache_dir(cache_dir: &Path, app_dir: &Path) -> Result<(),
     fs::create_dir_all(parent)?;
 
     let staging = unique_cache_staging_dir(parent, "workspace")?;
-    copy_dir_all(app_dir, &staging)?;
+    copy_app_workspace_snapshot(app_dir, &staging)?;
 
     match fs::rename(&staging, cache_dir) {
         Ok(()) => Ok(()),
@@ -888,6 +888,51 @@ fn unique_cache_staging_dir(parent: &Path, prefix: &str) -> Result<PathBuf, CliE
         .as_nanos();
 
     Ok(parent.join(format!("{prefix}-{}-{nanos}.tmp", std::process::id())))
+}
+
+fn copy_app_workspace_snapshot(source: &Path, target: &Path) -> Result<(), CliError> {
+    if try_clone_app_workspace_snapshot(source, target)? {
+        return Ok(());
+    }
+
+    copy_dir_all(source, target)
+}
+
+fn try_clone_app_workspace_snapshot(source: &Path, target: &Path) -> Result<bool, CliError> {
+    let Some(mut command) = workspace_snapshot_clone_command(source, target) else {
+        return Ok(false);
+    };
+
+    fs::create_dir_all(target)?;
+
+    match command.output() {
+        Ok(output) if output.status.success() => Ok(true),
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(CliError::from(error)),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn workspace_snapshot_clone_command(source: &Path, target: &Path) -> Option<Command> {
+    let mut command = Command::new("cp");
+    command.arg("-cR").arg(source.join(".")).arg(target);
+    Some(command)
+}
+
+#[cfg(target_os = "linux")]
+fn workspace_snapshot_clone_command(source: &Path, target: &Path) -> Option<Command> {
+    let mut command = Command::new("cp");
+    command
+        .args(["-a", "--reflink=auto"])
+        .arg(source.join("."))
+        .arg(target);
+    Some(command)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn workspace_snapshot_clone_command(_source: &Path, _target: &Path) -> Option<Command> {
+    None
 }
 
 fn docker_create_workspace_command(
@@ -940,10 +985,11 @@ fn preflight_docker_task_environment(
     } else {
         None
     };
-    let platform = environment
-        .platform
-        .as_deref()
-        .or_else(|| inferred_platform.as_ref().map(|inference| inference.platform));
+    let platform = environment.platform.as_deref().or_else(|| {
+        inferred_platform
+            .as_ref()
+            .map(|inference| inference.platform)
+    });
 
     if environment.prebuilt_image || !dockerfile.is_file() {
         ensure_docker_image_available(
@@ -958,7 +1004,10 @@ fn preflight_docker_task_environment(
     pull_dockerfile_base_images(task_label, &dockerfile, platform, environment.build_timeout)?;
     let image = prepare_docker_image(task_label, task_path, environment)?;
 
-    println!("[{task_label} | preflight] environment ready: {}", image.reference);
+    println!(
+        "[{task_label} | preflight] environment ready: {}",
+        image.reference
+    );
 
     Ok(())
 }
@@ -2588,10 +2637,9 @@ FROM python:3.12-slim
 
     #[test]
     fn parse_docker_api_response_reads_status_and_body() {
-        let response = parse_docker_api_response(
-            b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}",
-        )
-        .expect("response");
+        let response =
+            parse_docker_api_response(b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}")
+                .expect("response");
 
         assert_eq!(response.status, 404);
         assert_eq!(response.body, b"{}");
@@ -2783,6 +2831,34 @@ FROM python:3.12-slim
         let _ = fs::remove_dir_all(cache_root);
         let _ = fs::remove_dir_all(source);
         let _ = fs::remove_dir_all(target);
+    }
+
+    #[test]
+    fn workspace_snapshot_clone_command_uses_platform_copy_on_write() {
+        let command =
+            workspace_snapshot_clone_command(Path::new("/tmp/source"), Path::new("/tmp/target"));
+
+        #[cfg(target_os = "macos")]
+        {
+            let args = command_args(command.expect("macos clone command"));
+
+            assert_eq!(args, ["-cR", "/tmp/source/.", "/tmp/target"]);
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let args = command_args(command.expect("linux clone command"));
+
+            assert_eq!(
+                args,
+                ["-a", "--reflink=auto", "/tmp/source/.", "/tmp/target"]
+            );
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            assert!(command.is_none());
+        }
     }
 
     #[test]
