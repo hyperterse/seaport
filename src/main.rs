@@ -1252,7 +1252,7 @@ fn default_concurrency() -> usize {
     thread::available_parallelism()
         .map(|parallelism| parallelism.get())
         .unwrap_or(4)
-        .clamp(1, 8)
+        .clamp(1, 16)
 }
 
 impl RunOptions {
@@ -1568,7 +1568,7 @@ mod tests {
     fn default_concurrency_is_positive_and_bounded() {
         let concurrency = default_concurrency();
 
-        assert!((1..=8).contains(&concurrency));
+        assert!((1..=16).contains(&concurrency));
     }
 
     #[test]
