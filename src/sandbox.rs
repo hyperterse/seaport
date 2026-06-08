@@ -16,6 +16,8 @@ const DEFAULT_TMPFS_SIZE: &str = "256m";
 const DEFAULT_COMPAT_DOCKER_PLATFORM: &str = "linux/amd64";
 const DOCKER_BUILD_ATTEMPTS: usize = 3;
 const DOCKER_BUILD_RETRY_DELAY: Duration = Duration::from_secs(2);
+const DOCKER_PULL_ATTEMPTS: usize = 3;
+const DOCKER_PULL_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DOCKER_BUILD_TIMEOUT: Duration = Duration::from_secs(600);
 const DOCKER_WORKSPACE_TIMEOUT: Duration = Duration::from_secs(120);
 const DOCKER_IMAGE_CACHE_NAMESPACE: &str = "seaport-env-cache-v1";
@@ -101,6 +103,27 @@ pub(crate) fn run_task_scripts(run: TaskScriptRequest<'_>) -> Result<ScriptOutpu
             prepare_task_file_workspace(run.task_path, run.app_dir)?;
             run_scripts_locally(runtime, run.agent, run.envs, &environment)
         }
+    }
+}
+
+pub(crate) fn ensure_sandbox_backend_available(backend: SandboxBackend) -> Result<(), CliError> {
+    match backend {
+        SandboxBackend::Docker => ensure_docker_available(),
+        SandboxBackend::UnsafeLocal => Ok(()),
+    }
+}
+
+pub(crate) fn preflight_task_environment(
+    task_label: &str,
+    task_path: &Path,
+    backend: SandboxBackend,
+) -> Result<(), CliError> {
+    match backend {
+        SandboxBackend::Docker => {
+            let environment = task_environment(task_path)?;
+            preflight_docker_task_environment(task_label, task_path, &environment)
+        }
+        SandboxBackend::UnsafeLocal => Ok(()),
     }
 }
 
@@ -904,6 +927,154 @@ fn docker_copy_missing_app(output: &Output) -> bool {
             || output.contains("not found"))
 }
 
+fn preflight_docker_task_environment(
+    task_label: &str,
+    task_path: &Path,
+    environment: &TaskEnvironment,
+) -> Result<(), CliError> {
+    let dockerfile = task_path.join("environment").join("Dockerfile");
+    let inferred_platform = if environment.platform.is_none() {
+        infer_compat_platform(task_path)?
+    } else {
+        None
+    };
+    let platform = environment
+        .platform
+        .as_deref()
+        .or_else(|| inferred_platform.as_ref().map(|inference| inference.platform));
+
+    if environment.prebuilt_image || !dockerfile.is_file() {
+        ensure_docker_image_available(
+            task_label,
+            &environment.image,
+            platform,
+            environment.build_timeout,
+        )?;
+        return Ok(());
+    }
+
+    pull_dockerfile_base_images(task_label, &dockerfile, platform, environment.build_timeout)?;
+    let image = prepare_docker_image(task_label, task_path, environment)?;
+
+    println!("[{task_label} | preflight] environment ready: {}", image.reference);
+
+    Ok(())
+}
+
+fn pull_dockerfile_base_images(
+    task_label: &str,
+    dockerfile: &Path,
+    platform: Option<&str>,
+    timeout: Duration,
+) -> Result<(), CliError> {
+    for image in dockerfile_base_images(dockerfile)? {
+        ensure_docker_image_available(task_label, &image, platform, timeout)?;
+    }
+
+    Ok(())
+}
+
+fn dockerfile_base_images(dockerfile: &Path) -> Result<Vec<String>, CliError> {
+    let contents = fs::read_to_string(dockerfile)?;
+    let mut images = Vec::new();
+    let mut stage_aliases = Vec::new();
+
+    for line in contents.lines() {
+        let line = strip_dockerfile_comment(line).trim();
+
+        if line.is_empty() {
+            continue;
+        }
+
+        let mut words = line.split_whitespace().collect::<Vec<_>>();
+        let Some(first) = words.first() else {
+            continue;
+        };
+
+        if !first.eq_ignore_ascii_case("FROM") {
+            continue;
+        }
+
+        words.remove(0);
+
+        while words.first().is_some_and(|word| word.starts_with("--")) {
+            words.remove(0);
+        }
+
+        let Some(image) = words.first().copied() else {
+            continue;
+        };
+
+        if !image.eq_ignore_ascii_case("scratch")
+            && !image.contains('$')
+            && !stage_aliases.iter().any(|alias: &String| alias == image)
+            && !images.iter().any(|existing| existing == image)
+        {
+            images.push(image.to_owned());
+        }
+
+        if words
+            .get(1)
+            .is_some_and(|keyword| keyword.eq_ignore_ascii_case("AS"))
+        {
+            if let Some(alias) = words.get(2) {
+                stage_aliases.push((*alias).to_owned());
+            }
+        }
+    }
+
+    Ok(images)
+}
+
+fn strip_dockerfile_comment(line: &str) -> &str {
+    let mut escaped = false;
+
+    for (index, character) in line.char_indices() {
+        if character == '#' && !escaped {
+            return &line[..index];
+        }
+
+        escaped = character == '\\' && !escaped;
+        if character != '\\' {
+            escaped = false;
+        }
+    }
+
+    line
+}
+
+fn ensure_docker_image_available(
+    task_label: &str,
+    image: &str,
+    platform: Option<&str>,
+    timeout: Duration,
+) -> Result<(), CliError> {
+    if docker_image_exists(image) {
+        println!("[{task_label} | pull] cache hit: {image}");
+        return Ok(());
+    }
+
+    let timed_output = run_docker_pull_with_retries(task_label, image, platform, timeout)?;
+
+    if timed_output.timed_out {
+        return Err(CliError::task_failed(format!(
+            "docker image pull timed out after {:.3}s for {image}",
+            timeout.as_secs_f64()
+        )));
+    }
+
+    if !timed_output.output.status.success() {
+        return Err(CliError::task_failed(format!(
+            "docker image pull failed for {image} (status: {})\nstdout:\n{}\nstderr:\n{}",
+            timed_output.output.status,
+            String::from_utf8_lossy(&timed_output.output.stdout),
+            String::from_utf8_lossy(&timed_output.output.stderr)
+        )));
+    }
+
+    Ok(())
+}
+
 fn prepare_docker_image(
     task_label: &str,
     task_path: &Path,
@@ -1256,6 +1427,38 @@ fn run_docker_build_with_retries(
     }
 }
 
+fn run_docker_pull_with_retries(
+    task_label: &str,
+    image: &str,
+    platform: Option<&str>,
+    timeout: Duration,
+) -> Result<TimedOutput, CliError> {
+    let mut attempt = 1;
+
+    loop {
+        let timed_output = run_command_with_timeout(
+            docker_pull_command(image, platform),
+            timeout,
+            Some(CommandLog::new(task_label, "pull")),
+        )?;
+
+        if timed_output.output.status.success()
+            || timed_output.timed_out
+            || attempt >= DOCKER_PULL_ATTEMPTS
+            || !docker_build_transient_failure(&timed_output.output)
+        {
+            return Ok(timed_output);
+        }
+
+        attempt += 1;
+        println!(
+            "[{task_label} | pull] transient docker pull failure; retrying attempt {attempt}/{DOCKER_PULL_ATTEMPTS} in {}",
+            format_duration(DOCKER_PULL_RETRY_DELAY)
+        );
+        thread::sleep(DOCKER_PULL_RETRY_DELAY);
+    }
+}
+
 fn should_retry_build_with_compat_platform(
     timed_output: &TimedOutput,
     platform: Option<&str>,
@@ -1333,6 +1536,18 @@ fn docker_build_command(
     }
 
     command.args(["-t", tag]).arg(environment_dir);
+    command
+}
+
+fn docker_pull_command(image: &str, platform: Option<&str>) -> Command {
+    let mut command = Command::new("docker");
+    command.arg("pull");
+
+    if let Some(platform) = platform {
+        command.args(["--platform", platform]);
+    }
+
+    command.arg(image);
     command
 }
 
@@ -2097,6 +2312,39 @@ mod tests {
             .windows(2)
             .any(|window| window == ["--network", "default"]));
         assert!(!args.iter().any(|arg| arg == "-q"));
+    }
+
+    #[test]
+    fn dockerfile_base_images_skip_stage_aliases_and_dynamic_images() {
+        let task = temp_task_dir("dockerfile-base-images");
+        let dockerfile = task.join("Dockerfile");
+        fs::create_dir_all(&task).expect("task dir");
+        fs::write(
+            &dockerfile,
+            "\
+FROM --platform=$TARGETPLATFORM ubuntu:24.04 AS base
+FROM base AS build
+FROM ${RUNTIME_IMAGE}
+FROM scratch AS empty
+FROM python:3.12-slim
+",
+        )
+        .expect("dockerfile");
+
+        let images = dockerfile_base_images(&dockerfile).expect("images");
+
+        assert_eq!(images, ["ubuntu:24.04", "python:3.12-slim"]);
+
+        let _ = fs::remove_file(dockerfile);
+        let _ = fs::remove_dir_all(task);
+    }
+
+    #[test]
+    fn docker_pull_command_honors_platform() {
+        let command = docker_pull_command("ubuntu:24.04", Some("linux/amd64"));
+        let args = command_args(command);
+
+        assert_eq!(args, ["pull", "--platform", "linux/amd64", "ubuntu:24.04"]);
     }
 
     #[test]

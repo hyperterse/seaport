@@ -19,8 +19,9 @@ use registry::{
     resolve_remote_registry_dataset, resolve_remote_registry_task,
 };
 use sandbox::{
-    prepare_container_writable_dir, run_task_scripts, AgentStep, ExternalAgent, PhaseEnvs,
-    SandboxAgent, SandboxBackend, ScriptOutputs, TaskScriptRequest,
+    ensure_sandbox_backend_available, preflight_task_environment, prepare_container_writable_dir,
+    run_task_scripts, AgentStep, ExternalAgent, PhaseEnvs, SandboxAgent, SandboxBackend,
+    ScriptOutputs, TaskScriptRequest,
 };
 use target::{RunTarget, TaskRef, TaskSelection};
 
@@ -132,6 +133,7 @@ fn run_target(target: &RunTarget, options: &RunOptions, agent: AgentKind) -> Res
     let concurrency = options.concurrency.min(plans.len().max(1));
 
     print_target_ready(target, &job_dir, plans.len(), concurrency)?;
+    preflight_target(target, options, concurrency)?;
 
     let outcomes = run_trial_plans(&plans, &job_dir, &run_id, options, agent, concurrency)?;
 
@@ -209,6 +211,76 @@ fn print_progress(message: &str) -> Result<(), CliError> {
     io::stdout().flush()?;
 
     Ok(())
+}
+
+fn preflight_target(
+    target: &RunTarget,
+    options: &RunOptions,
+    concurrency: usize,
+) -> Result<(), CliError> {
+    if target.tasks.is_empty() || options.backend == SandboxBackend::UnsafeLocal {
+        return Ok(());
+    }
+
+    ensure_sandbox_backend_available(options.backend)?;
+
+    let concurrency = phase_concurrency(concurrency, target.tasks.len(), 4);
+
+    println!();
+    println!("Preflight");
+    println!("  phase: resolve/pull/build");
+    println!("  tasks: {}", target.tasks.len());
+    println!("  concurrency: {concurrency}");
+    io::stdout().flush()?;
+
+    let work = Mutex::new((0..target.tasks.len()).collect::<VecDeque<_>>());
+    let (sender, receiver) = mpsc::channel();
+
+    thread::scope(|scope| {
+        for _ in 0..concurrency {
+            let sender = sender.clone();
+            let work = &work;
+
+            scope.spawn(move || loop {
+                let index = {
+                    let mut work = work.lock().expect("preflight queue");
+                    work.pop_front()
+                };
+                let Some(index) = index else {
+                    break;
+                };
+                let task = &target.tasks[index];
+                let result = preflight_task_environment(&task.name, &task.path, options.backend);
+
+                if sender.send((index, result)).is_err() {
+                    break;
+                }
+            });
+        }
+    });
+
+    drop(sender);
+
+    for (index, result) in receiver {
+        match result {
+            Ok(()) => {
+                println!("[{} | preflight] ready", target.tasks[index].name);
+            }
+            Err(error) if error.is_task_failure() => {
+                eprintln!(
+                    "seaport: warning: preflight failed for {}; task will retry during execution: {error}",
+                    target.tasks[index].name
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(())
+}
+
+fn phase_concurrency(requested: usize, item_count: usize, cap: usize) -> usize {
+    requested.max(1).min(item_count.max(1)).min(cap.max(1))
 }
 
 #[derive(Clone, Copy)]
@@ -1569,6 +1641,14 @@ mod tests {
         let concurrency = default_concurrency();
 
         assert!((1..=16).contains(&concurrency));
+    }
+
+    #[test]
+    fn phase_concurrency_is_bounded_by_work_and_cap() {
+        assert_eq!(phase_concurrency(16, 10, 4), 4);
+        assert_eq!(phase_concurrency(2, 10, 4), 2);
+        assert_eq!(phase_concurrency(16, 2, 4), 2);
+        assert_eq!(phase_concurrency(0, 0, 0), 1);
     }
 
     #[test]
