@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -29,6 +30,37 @@ const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 static DOCKER_AVAILABLE: OnceLock<()> = OnceLock::new();
 static DOCKER_IMAGE_PULLS: OnceLock<ImagePullState> = OnceLock::new();
+static SANDBOX_LOG_MODE: AtomicU8 = AtomicU8::new(LogMode::Concise as u8);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum LogMode {
+    Concise = 0,
+    Verbose = 1,
+    Quiet = 2,
+}
+
+impl LogMode {
+    fn current() -> Self {
+        match SANDBOX_LOG_MODE.load(Ordering::Relaxed) {
+            value if value == Self::Verbose as u8 => Self::Verbose,
+            value if value == Self::Quiet as u8 => Self::Quiet,
+            _ => Self::Concise,
+        }
+    }
+
+    fn prints_events(self) -> bool {
+        !matches!(self, Self::Quiet)
+    }
+
+    fn streams_lines(self) -> bool {
+        matches!(self, Self::Verbose)
+    }
+}
+
+pub(crate) fn set_log_mode(mode: LogMode) {
+    SANDBOX_LOG_MODE.store(mode as u8, Ordering::Relaxed);
+}
 
 pub(crate) struct ScriptOutputs {
     pub(crate) agent: AgentStep,
@@ -797,7 +829,7 @@ fn try_seed_app_workspace_from_cache(
 
     match copy_app_workspace_from_cache_dir(&cache_dir, app_dir) {
         Ok(()) => {
-            println!("[{task_label} | workspace] cache hit");
+            print_backend_event(task_label, "workspace", "cache hit");
             Ok(true)
         }
         Err(error) => {
@@ -824,7 +856,7 @@ fn best_effort_store_app_workspace_cache(task_label: &str, cache_key: &str, app_
     }
 
     match store_app_workspace_cache_dir(&cache_dir, app_dir) {
-        Ok(()) => println!("[{task_label} | workspace] cached seeded /app"),
+        Ok(()) => print_backend_event(task_label, "workspace", "cached seeded /app"),
         Err(error) => eprintln!(
             "seaport: warning: could not write workspace cache {}: {error}",
             cache_dir.display()
@@ -1008,9 +1040,10 @@ fn preflight_docker_task_environment(
     pull_dockerfile_base_images(task_label, &dockerfile, platform, environment.build_timeout)?;
     let image = prepare_docker_image(task_label, task_path, environment)?;
 
-    println!(
-        "[{task_label} | preflight] environment ready: {}",
-        image.reference
+    print_backend_event(
+        task_label,
+        "preflight",
+        &format!("environment ready: {}", image.reference),
     );
 
     Ok(())
@@ -1105,14 +1138,14 @@ fn ensure_docker_image_available(
     timeout: Duration,
 ) -> Result<(), CliError> {
     if docker_image_exists(image) {
-        println!("[{task_label} | pull] cache hit: {image}");
+        print_backend_event(task_label, "pull", &format!("cache hit: {image}"));
         return Ok(());
     }
 
     let _pull = DockerImagePull::start(image);
 
     if docker_image_exists(image) {
-        println!("[{task_label} | pull] cache hit: {image}");
+        print_backend_event(task_label, "pull", &format!("cache hit: {image}"));
         return Ok(());
     }
 
@@ -1212,9 +1245,10 @@ fn prepare_docker_image(
         .parent()
         .ok_or_else(|| CliError::usage("environment/Dockerfile has no parent directory"))?;
     if let Some(inference) = inferred_platform {
-        println!(
-            "[{task_label} | build] {}; using {}",
-            inference.reason, inference.platform
+        print_backend_notice(
+            task_label,
+            "build",
+            &format!("{}; using {}", inference.reason, inference.platform),
         );
     }
 
@@ -1223,9 +1257,10 @@ fn prepare_docker_image(
         cached_docker_image(environment_dir, environment, build_platform.as_deref())?;
 
     if docker_image_exists(&cached_image.reference) {
-        println!(
-            "[{task_label} | build] cache hit: {}",
-            cached_image.reference
+        print_backend_event(
+            task_label,
+            "build",
+            &format!("cache hit: {}", cached_image.reference),
         );
 
         return Ok(DockerImage {
@@ -1248,14 +1283,19 @@ fn prepare_docker_image(
         build_platform = Some(DEFAULT_COMPAT_DOCKER_PLATFORM.to_owned());
         cached_image =
             cached_docker_image(environment_dir, environment, build_platform.as_deref())?;
-        println!(
-            "[{task_label} | build] native docker build is not available for this image; retrying with {DEFAULT_COMPAT_DOCKER_PLATFORM}"
+        print_backend_notice(
+            task_label,
+            "build",
+            &format!(
+                "native docker build is not available for this image; retrying with {DEFAULT_COMPAT_DOCKER_PLATFORM}"
+            ),
         );
 
         if docker_image_exists(&cached_image.reference) {
-            println!(
-                "[{task_label} | build] cache hit: {}",
-                cached_image.reference
+            print_backend_event(
+                task_label,
+                "build",
+                &format!("cache hit: {}", cached_image.reference),
             );
 
             return Ok(DockerImage {
@@ -1532,9 +1572,13 @@ fn run_docker_build_with_retries(
         }
 
         attempt += 1;
-        println!(
-            "[{task_label} | build] transient docker build failure; retrying attempt {attempt}/{DOCKER_BUILD_ATTEMPTS} in {}",
-            format_duration(DOCKER_BUILD_RETRY_DELAY)
+        print_backend_notice(
+            task_label,
+            "build",
+            &format!(
+                "transient docker build failure; retrying attempt {attempt}/{DOCKER_BUILD_ATTEMPTS} in {}",
+                format_duration(DOCKER_BUILD_RETRY_DELAY)
+            ),
         );
         thread::sleep(DOCKER_BUILD_RETRY_DELAY);
     }
@@ -1564,9 +1608,13 @@ fn run_docker_pull_with_retries(
         }
 
         attempt += 1;
-        println!(
-            "[{task_label} | pull] transient docker pull failure; retrying attempt {attempt}/{DOCKER_PULL_ATTEMPTS} in {}",
-            format_duration(DOCKER_PULL_RETRY_DELAY)
+        print_backend_notice(
+            task_label,
+            "pull",
+            &format!(
+                "transient docker pull failure; retrying attempt {attempt}/{DOCKER_PULL_ATTEMPTS} in {}",
+                format_duration(DOCKER_PULL_RETRY_DELAY)
+            ),
         );
         thread::sleep(DOCKER_PULL_RETRY_DELAY);
     }
@@ -1663,7 +1711,11 @@ fn ensure_seaport_buildkit_builder(task_label: &str) -> Result<(), CliError> {
         return Ok(());
     }
 
-    println!("[{task_label} | builder] creating BuildKit builder: {builder}");
+    print_backend_notice(
+        task_label,
+        "builder",
+        &format!("creating BuildKit builder: {builder}"),
+    );
     let timed_output = run_command_with_timeout(
         docker_buildx_create_command(&builder),
         DOCKER_BUILDER_TIMEOUT,
@@ -2359,6 +2411,7 @@ struct TimedOutput {
 struct CommandLog {
     task: String,
     phase: String,
+    mode: LogMode,
 }
 
 impl CommandLog {
@@ -2366,6 +2419,7 @@ impl CommandLog {
         Self {
             task: task.to_owned(),
             phase: phase.to_owned(),
+            mode: LogMode::current(),
         }
     }
 
@@ -2374,6 +2428,7 @@ impl CommandLog {
             task: self.task.clone(),
             phase: self.phase.clone(),
             stream: name,
+            mode: self.mode,
         }
     }
 }
@@ -2382,6 +2437,7 @@ struct StreamLog {
     task: String,
     phase: String,
     stream: &'static str,
+    mode: LogMode,
 }
 
 fn run_command_with_timeout(
@@ -2471,20 +2527,70 @@ fn join_stream_reader(
 }
 
 fn print_stream_line(log: &StreamLog, line: &[u8]) {
+    if !log.mode.streams_lines() {
+        return;
+    }
+
     let text = String::from_utf8_lossy(line);
     let text = text.trim_end_matches(['\r', '\n']);
 
-    println!("[{} | {} | {}] {}", log.task, log.phase, log.stream, text);
+    println!(
+        "    {:<44} {:<9} {:<6} {}",
+        fit_log_text(&log.task, 44),
+        log.phase,
+        log.stream,
+        text
+    );
 }
 
 fn print_phase_start(log: &CommandLog, timeout: Duration) {
+    if !log.mode.prints_events() {
+        return;
+    }
+
     println!(
-        "[{} | {}] starting; timeout {}",
-        log.task,
+        "  · {:<44} {:<9} timeout {}",
+        fit_log_text(&log.task, 44),
         log.phase,
         format_duration(timeout)
     );
     let _ = io::stdout().flush();
+}
+
+fn print_backend_event(task_label: &str, phase: &str, message: &str) {
+    if LogMode::current() == LogMode::Verbose {
+        println!(
+            "    {:<44} {:<9} {}",
+            fit_log_text(task_label, 44),
+            phase,
+            message
+        );
+    }
+}
+
+fn print_backend_notice(task_label: &str, phase: &str, message: &str) {
+    if LogMode::current().prints_events() {
+        println!(
+            "  · {:<44} {:<9} {}",
+            fit_log_text(task_label, 44),
+            phase,
+            message
+        );
+    }
+}
+
+fn fit_log_text(value: &str, width: usize) -> String {
+    let length = value.chars().count();
+
+    if length <= width {
+        format!("{value:<width$}")
+    } else if width <= 3 {
+        value.chars().take(width).collect()
+    } else {
+        let mut trimmed = value.chars().take(width - 3).collect::<String>();
+        trimmed.push_str("...");
+        trimmed
+    }
 }
 
 fn format_duration(duration: Duration) -> String {

@@ -3,7 +3,7 @@ use std::env;
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::{mpsc, Mutex};
@@ -20,14 +20,17 @@ use registry::{
 };
 use sandbox::{
     ensure_sandbox_backend_available, preflight_task_environment, prepare_container_writable_dir,
-    run_task_scripts, AgentStep, ExternalAgent, PhaseEnvs, SandboxAgent, SandboxBackend,
-    ScriptOutputs, TaskScriptRequest,
+    run_task_scripts, set_log_mode, AgentStep, ExternalAgent, LogMode, PhaseEnvs, SandboxAgent,
+    SandboxBackend, ScriptOutputs, TaskScriptRequest,
 };
 use target::{RunTarget, TaskRef, TaskSelection};
 
 const EXIT_USAGE: i32 = 2;
 const EXIT_UNIMPLEMENTED: i32 = 3;
 const EXIT_TASK_FAILED: i32 = 4;
+const PROGRESS_BAR_WIDTH: usize = 30;
+const TASK_LABEL_WIDTH: usize = 56;
+const FAILURE_TAIL_LINES: usize = 8;
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -57,6 +60,7 @@ fn run_eval(args: &[String]) -> Result<(), CliError> {
     }
 
     let options = RunOptions::parse(args)?;
+    set_log_mode(options.log_mode);
 
     if !options.has_run_source() {
         return Err(CliError::usage(
@@ -86,7 +90,7 @@ fn resolve_run_target(options: &RunOptions) -> Result<RunTarget, CliError> {
             .path
             .as_deref()
             .ok_or_else(|| CliError::usage("--task-git-url requires `-p <path-in-repo>`"))?;
-        print_progress(&format!("resolving git task: {git_url} @ {path}"))?;
+        print_progress(options, &format!("resolving git task: {git_url} @ {path}"))?;
         let task_path =
             resolve_git_task_source(git_url, options.task_git_commit.as_deref(), Path::new(path))?;
 
@@ -94,12 +98,12 @@ fn resolve_run_target(options: &RunOptions) -> Result<RunTarget, CliError> {
     }
 
     if let Some(path) = options.path.as_deref() {
-        print_progress(&format!("loading local target: {path}"))?;
+        print_progress(options, &format!("loading local target: {path}"))?;
         return RunTarget::from_path(Path::new(path), &options.selection);
     }
 
     if let Some(task) = options.task.as_deref() {
-        print_progress(&format!("resolving registered task: {task}"))?;
+        print_progress(options, &format!("resolving registered task: {task}"))?;
         let resolved = match options.registry_path.as_deref() {
             Some(registry_path) => resolve_local_registry_task(task, Path::new(registry_path))?,
             None => resolve_remote_registry_task(task, options.registry_url.as_deref())?,
@@ -112,7 +116,7 @@ fn resolve_run_target(options: &RunOptions) -> Result<RunTarget, CliError> {
         .dataset
         .as_deref()
         .ok_or_else(|| CliError::usage("run requires either `-p <path>` or `-d <dataset>`"))?;
-    print_progress(&format!("resolving dataset: {dataset}"))?;
+    print_progress(options, &format!("resolving dataset: {dataset}"))?;
     let resolved = match options.registry_path.as_deref() {
         Some(registry_path) => resolve_local_registry_dataset(dataset, Path::new(registry_path))?,
         None => resolve_remote_registry_dataset(dataset, options.registry_url.as_deref())?,
@@ -122,6 +126,7 @@ fn resolve_run_target(options: &RunOptions) -> Result<RunTarget, CliError> {
 }
 
 fn run_target(target: &RunTarget, options: &RunOptions, agent: AgentKind) -> Result<(), CliError> {
+    let run_started = Instant::now();
     let run_id = timestamp_id()?;
     let job_root = options
         .jobs_dir
@@ -132,10 +137,12 @@ fn run_target(target: &RunTarget, options: &RunOptions, agent: AgentKind) -> Res
     let plans = trial_plans(target, options);
     let concurrency = RunPhase::Execution.concurrency(options.concurrency, plans.len());
 
-    print_target_ready(target, &job_dir, plans.len(), concurrency)?;
-    preflight_target(target, options)?;
+    print_target_ready(target, &job_dir, plans.len(), concurrency, options, agent)?;
+    let preflight_elapsed = preflight_target(target, options)?;
 
+    let execution_started = Instant::now();
     let outcomes = run_trial_plans(&plans, &job_dir, &run_id, options, agent, concurrency)?;
+    let execution_elapsed = execution_started.elapsed();
 
     fs::write(
         job_dir.join("config.json"),
@@ -146,10 +153,17 @@ fn run_target(target: &RunTarget, options: &RunOptions, agent: AgentKind) -> Res
     let passed = outcomes.iter().all(|outcome| outcome.passed);
     let passed_count = outcomes.iter().filter(|outcome| outcome.passed).count();
 
-    println!("job_dir: {}", job_dir.display());
-    println!("target: {}", target.name);
-    println!("tasks: {passed_count}/{}", outcomes.len());
-    println!("passed: {passed}");
+    print_run_summary(RunSummary {
+        passed,
+        passed_count,
+        total_count: outcomes.len(),
+        reward: aggregate_reward(&outcomes),
+        job_dir: &job_dir,
+        preflight_elapsed,
+        execution_elapsed,
+        total_elapsed: run_started.elapsed(),
+        options,
+    })?;
 
     if passed {
         Ok(())
@@ -163,12 +177,17 @@ fn run_target(target: &RunTarget, options: &RunOptions, agent: AgentKind) -> Res
 }
 
 fn print_run_start(options: &RunOptions, agent: AgentKind) -> Result<(), CliError> {
-    println!("Seaport run");
-    println!("  source: {}", run_source_label(options));
-    println!("  agent: {}", agent.as_str(options));
-    println!("  backend: {}", options.backend.as_str());
-    println!("  attempts: {}", options.attempts);
-    println!("  requested concurrency: {}", options.concurrency);
+    if options.log_mode == LogMode::Quiet {
+        return Ok(());
+    }
+
+    println!(
+        "{} {} · {} · {}",
+        bold("Seaport"),
+        run_source_label(options),
+        agent.as_str(options),
+        options.backend.as_str()
+    );
     io::stdout().flush()?;
 
     Ok(())
@@ -193,29 +212,45 @@ fn print_target_ready(
     job_dir: &Path,
     trials: usize,
     concurrency: usize,
+    options: &RunOptions,
+    agent: AgentKind,
 ) -> Result<(), CliError> {
-    println!();
-    println!("Target ready");
-    println!("  target: {}", target.name);
-    println!("  tasks: {}", target.tasks.len());
-    println!("  trials: {trials}");
-    println!("  concurrency: {concurrency}");
-    println!("  job_dir: {}", job_dir.display());
-    io::stdout().flush()?;
-
-    Ok(())
-}
-
-fn print_progress(message: &str) -> Result<(), CliError> {
-    println!("  -> {message}");
-    io::stdout().flush()?;
-
-    Ok(())
-}
-
-fn preflight_target(target: &RunTarget, options: &RunOptions) -> Result<(), CliError> {
-    if target.tasks.is_empty() || options.backend == SandboxBackend::UnsafeLocal {
+    if options.log_mode == LogMode::Quiet {
         return Ok(());
+    }
+
+    println!();
+    print_run_box(RunBox {
+        title: "Seaport",
+        target: &target.name,
+        agent: agent.as_str(options),
+        backend: options.backend.as_str(),
+        tasks: target.tasks.len(),
+        trials,
+        concurrency,
+        job_dir,
+    });
+    io::stdout().flush()?;
+
+    Ok(())
+}
+
+fn print_progress(options: &RunOptions, message: &str) -> Result<(), CliError> {
+    if options.log_mode == LogMode::Quiet {
+        return Ok(());
+    }
+
+    println!("  {} {message}", blue("->"));
+    io::stdout().flush()?;
+
+    Ok(())
+}
+
+fn preflight_target(target: &RunTarget, options: &RunOptions) -> Result<Duration, CliError> {
+    let started = Instant::now();
+
+    if target.tasks.is_empty() || options.backend == SandboxBackend::UnsafeLocal {
+        return Ok(started.elapsed());
     }
 
     ensure_sandbox_backend_available(options.backend)?;
@@ -223,12 +258,7 @@ fn preflight_target(target: &RunTarget, options: &RunOptions) -> Result<(), CliE
     let phase = RunPhase::Preflight;
     let concurrency = phase.concurrency(options.concurrency, target.tasks.len());
 
-    println!();
-    println!("{}", phase.title());
-    println!("  phase: {}", phase.label());
-    println!("  tasks: {}", target.tasks.len());
-    println!("  concurrency: {concurrency}");
-    io::stdout().flush()?;
+    print_phase_header(phase, target.tasks.len(), concurrency, options)?;
 
     let work = Mutex::new(scheduled_task_indices(&target.tasks));
     let (sender, receiver) = mpsc::channel();
@@ -258,11 +288,13 @@ fn preflight_target(target: &RunTarget, options: &RunOptions) -> Result<(), CliE
 
     drop(sender);
 
+    let mut completed = 0;
+
     for (index, result) in receiver {
+        completed += 1;
+
         match result {
-            Ok(()) => {
-                println!("[{} | preflight] ready", target.tasks[index].name);
-            }
+            Ok(()) => {}
             Err(error) if error.is_task_failure() => {
                 eprintln!(
                     "seaport: warning: preflight failed for {}; task will retry during execution: {error}",
@@ -271,9 +303,17 @@ fn preflight_target(target: &RunTarget, options: &RunOptions) -> Result<(), CliE
             }
             Err(error) => return Err(error),
         }
+
+        print_phase_progress(
+            phase,
+            completed,
+            target.tasks.len(),
+            started.elapsed(),
+            options,
+        )?;
     }
 
-    Ok(())
+    Ok(started.elapsed())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -333,6 +373,11 @@ fn run_trial_plans(
     agent: AgentKind,
     concurrency: usize,
 ) -> Result<Vec<TrialOutcome>, CliError> {
+    let phase = RunPhase::Execution;
+    let started = Instant::now();
+
+    print_phase_header(phase, plans.len(), concurrency, options)?;
+
     let work = Mutex::new(scheduled_trial_indices(plans));
     let (sender, receiver) = mpsc::channel();
 
@@ -362,9 +407,16 @@ fn run_trial_plans(
     drop(sender);
 
     let mut outcomes = (0..plans.len()).map(|_| None).collect::<Vec<_>>();
+    let mut completed = 0;
 
     for (index, result) in receiver {
-        outcomes[index] = Some(result?);
+        let outcome = result?;
+
+        completed += 1;
+        print_trial_finish(&outcome, options)?;
+        print_phase_progress(phase, completed, plans.len(), started.elapsed(), options)?;
+
+        outcomes[index] = Some(outcome);
     }
 
     outcomes
@@ -499,7 +551,7 @@ fn run_trial(
     fs::create_dir_all(&app_dir)?;
     fs::create_dir_all(&logs_dir)?;
 
-    print_trial_start(task_name, attempt, options, agent);
+    print_trial_start(task_name, attempt, options, agent)?;
 
     prepare_container_writable_dir(&app_dir)?;
     prepare_container_writable_dir(&workspace.join("logs"))?;
@@ -523,7 +575,7 @@ fn run_trial(
         Ok((outputs, reward))
     })();
 
-    let outcome = match execution {
+    let mut outcome = match execution {
         Ok((outputs, reward)) => record_completed_trial(TrialRecord {
             task_name,
             attempt,
@@ -549,6 +601,8 @@ fn run_trial(
         Err(error) => return Err(error),
     };
 
+    outcome.elapsed = started.elapsed();
+
     if let Err(error) = fs::remove_dir_all(&workspace) {
         eprintln!(
             "seaport: warning: could not remove workspace {}: {error}",
@@ -556,39 +610,352 @@ fn run_trial(
         );
     }
 
-    print_trial_finish(task_name, &outcome, started.elapsed());
-
     Ok(outcome)
 }
 
-fn print_trial_start(task_name: &str, attempt: usize, options: &RunOptions, agent: AgentKind) {
-    println!();
-    println!("==> running {task_name}");
-    println!(
-        "    attempt: {attempt}/{}   agent: {}   backend: {}",
-        options.attempts,
-        agent.as_str(options),
-        options.backend.as_str()
-    );
+fn print_trial_start(
+    task_name: &str,
+    attempt: usize,
+    options: &RunOptions,
+    agent: AgentKind,
+) -> Result<(), CliError> {
+    if options.log_mode != LogMode::Quiet {
+        println!(
+            "  {} {}  attempt {attempt}/{}  {}",
+            blue("->"),
+            fit_text(task_name, TASK_LABEL_WIDTH),
+            options.attempts,
+            dim(agent.as_str(options))
+        );
+        io::stdout().flush()?;
+    }
+
+    Ok(())
 }
 
-fn print_trial_finish(task_name: &str, outcome: &TrialOutcome, elapsed: Duration) {
-    let result = if outcome.passed { "passed" } else { "failed" };
+fn print_trial_finish(outcome: &TrialOutcome, options: &RunOptions) -> Result<(), CliError> {
+    if options.log_mode == LogMode::Quiet {
+        return Ok(());
+    }
 
-    println!("<== finished {task_name}");
+    let status = if outcome.passed {
+        green("✓")
+    } else {
+        red("!")
+    };
+    let result = if outcome.passed {
+        green("passed")
+    } else {
+        red("failed")
+    };
+
     println!(
-        "    result: {result}   reward: {}   elapsed: {}",
+        "  {} {}  {}  reward {}  {}",
+        status,
+        fit_text(&outcome.task_name, TASK_LABEL_WIDTH),
+        result,
         outcome.reward,
-        format_duration(elapsed)
+        dim(&format_duration(outcome.elapsed))
     );
 
-    if let Some(error) = outcome.error.as_deref() {
-        println!("    error: {}", first_error_line(error));
+    if !outcome.passed {
+        print_failure_tail(outcome);
     }
+
+    io::stdout().flush()?;
+
+    Ok(())
 }
 
 fn first_error_line(error: &str) -> &str {
     error.lines().next().unwrap_or(error)
+}
+
+fn print_failure_tail(outcome: &TrialOutcome) {
+    if let Some(error) = outcome.error.as_deref() {
+        println!("    {} {}", red("error:"), first_error_line(error));
+    }
+
+    if !outcome.stderr_tail.is_empty() {
+        println!("    {}", red("stderr tail"));
+        for line in &outcome.stderr_tail {
+            println!("      {}", dim(line));
+        }
+    } else if !outcome.stdout_tail.is_empty() {
+        println!("    {}", blue("stdout tail"));
+        for line in &outcome.stdout_tail {
+            println!("      {}", dim(line));
+        }
+    }
+
+    println!(
+        "    {} {}/verifier/test-stderr.txt",
+        dim("logs:"),
+        outcome.trial_dir.display()
+    );
+}
+
+fn print_phase_header(
+    phase: RunPhase,
+    tasks: usize,
+    concurrency: usize,
+    options: &RunOptions,
+) -> Result<(), CliError> {
+    if options.log_mode == LogMode::Quiet {
+        return Ok(());
+    }
+
+    println!();
+    println!(
+        "{} {}  {} tasks  concurrency {}",
+        bold(phase.title()),
+        dim(phase.label()),
+        tasks,
+        concurrency
+    );
+    io::stdout().flush()?;
+
+    Ok(())
+}
+
+fn print_phase_progress(
+    phase: RunPhase,
+    completed: usize,
+    total: usize,
+    elapsed: Duration,
+    options: &RunOptions,
+) -> Result<(), CliError> {
+    if options.log_mode == LogMode::Quiet {
+        return Ok(());
+    }
+
+    let color = match phase {
+        RunPhase::Preflight => "34",
+        RunPhase::Execution => "32",
+    };
+
+    println!(
+        "{:<13} {}  {:>3}/{:<3} {}",
+        phase.title(),
+        progress_bar(completed, total, PROGRESS_BAR_WIDTH, color),
+        completed,
+        total,
+        dim(&format_duration(elapsed))
+    );
+    io::stdout().flush()?;
+
+    Ok(())
+}
+
+struct RunBox<'a> {
+    title: &'a str,
+    target: &'a str,
+    agent: &'a str,
+    backend: &'a str,
+    tasks: usize,
+    trials: usize,
+    concurrency: usize,
+    job_dir: &'a Path,
+}
+
+fn print_run_box(run: RunBox<'_>) {
+    let width = 78;
+    let inner = width - 4;
+    let title = format!(" {} ", run.title);
+    let top = format!("┌{title}{}┐", "─".repeat(inner - title.chars().count() + 2));
+    let right = format!("{} · {}        {} tasks", run.agent, run.backend, run.tasks);
+    let meta = format!("trials {} · concurrency {}", run.trials, run.concurrency);
+
+    println!("{}", blue(&top));
+    println!(
+        "{}",
+        box_line(&right_aligned_text(run.target, &right, inner), inner)
+    );
+    println!("{}", box_line(&run.job_dir.display().to_string(), inner));
+    println!("{}", box_line(&meta, inner));
+    println!("{}", blue(&format!("└{}┘", "─".repeat(inner + 2))));
+}
+
+fn box_line(content: &str, width: usize) -> String {
+    format!("│ {} │", fit_text(content, width))
+}
+
+fn right_aligned_text(left: &str, right: &str, width: usize) -> String {
+    let right_len = right.chars().count();
+    let min_gap = 2;
+
+    if right_len + min_gap >= width {
+        return fit_text(left, width);
+    }
+
+    let left_width = width - right_len - min_gap;
+    format!(
+        "{}{}{}",
+        fit_text(left, left_width),
+        " ".repeat(min_gap),
+        right
+    )
+}
+
+struct RunSummary<'a> {
+    passed: bool,
+    passed_count: usize,
+    total_count: usize,
+    reward: String,
+    job_dir: &'a Path,
+    preflight_elapsed: Duration,
+    execution_elapsed: Duration,
+    total_elapsed: Duration,
+    options: &'a RunOptions,
+}
+
+fn print_run_summary(summary: RunSummary<'_>) -> Result<(), CliError> {
+    if summary.options.log_mode == LogMode::Quiet {
+        println!(
+            "{} {}/{} reward {} elapsed {}",
+            if summary.passed { "passed" } else { "failed" },
+            summary.passed_count,
+            summary.total_count,
+            summary.reward,
+            format_duration(summary.total_elapsed)
+        );
+        return Ok(());
+    }
+
+    let status = if summary.passed {
+        green("✓")
+    } else {
+        red("!")
+    };
+    let label = if summary.passed {
+        green("passed")
+    } else {
+        red("failed")
+    };
+
+    println!();
+    println!("{}", bold("Summary"));
+    println!(
+        "  {} {} {}/{}       reward {}       elapsed {}",
+        status,
+        label,
+        summary.passed_count,
+        summary.total_count,
+        green(&summary.reward),
+        bold(&format_duration(summary.total_elapsed))
+    );
+    println!(
+        "  {} preflight {}       execution {}",
+        dim("phases:"),
+        dim(&format_duration(summary.preflight_elapsed)),
+        dim(&format_duration(summary.execution_elapsed))
+    );
+    println!("  {} {}", dim("job_dir:"), summary.job_dir.display());
+    io::stdout().flush()?;
+
+    Ok(())
+}
+
+fn progress_bar(completed: usize, total: usize, width: usize, color: &str) -> String {
+    let total = total.max(1);
+    let completed = completed.min(total);
+    let filled = width * completed / total;
+    let empty = width.saturating_sub(filled);
+
+    format!(
+        "{}{}",
+        ansi(color, &"█".repeat(filled)),
+        dim(&"░".repeat(empty))
+    )
+}
+
+fn tail_lines_bytes(bytes: &[u8], limit: usize) -> Vec<String> {
+    tail_lines_text(&String::from_utf8_lossy(bytes), limit)
+}
+
+fn tail_lines_text(text: &str, limit: usize) -> Vec<String> {
+    let lines = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(limit);
+
+    lines.into_iter().skip(start).collect()
+}
+
+fn failure_output_tail(message: &str, stream: &str, limit: usize) -> Option<Vec<String>> {
+    let section = failure_output_section(message, stream)?;
+    let tail = tail_lines_text(section, limit);
+
+    if tail.is_empty() {
+        None
+    } else {
+        Some(tail)
+    }
+}
+
+fn failure_output_section<'a>(message: &'a str, stream: &str) -> Option<&'a str> {
+    let marker = format!("\n{stream}:\n");
+    let start = message.find(&marker)? + marker.len();
+    let section = &message[start..];
+
+    if stream == "stdout" {
+        if let Some(end) = section.find("\nstderr:\n") {
+            return Some(&section[..end]);
+        }
+    }
+
+    Some(section)
+}
+
+fn fit_text(value: &str, width: usize) -> String {
+    let length = value.chars().count();
+
+    if length <= width {
+        format!("{value:<width$}")
+    } else if width <= 3 {
+        value.chars().take(width).collect()
+    } else {
+        let mut trimmed = value.chars().take(width - 3).collect::<String>();
+        trimmed.push_str("...");
+        trimmed
+    }
+}
+
+fn bold(text: &str) -> String {
+    ansi("1", text)
+}
+
+fn dim(text: &str) -> String {
+    ansi("2", text)
+}
+
+fn green(text: &str) -> String {
+    ansi("32", text)
+}
+
+fn red(text: &str) -> String {
+    ansi("31", text)
+}
+
+fn blue(text: &str) -> String {
+    ansi("34", text)
+}
+
+fn ansi(code: &str, text: &str) -> String {
+    if color_enabled() {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+fn color_enabled() -> bool {
+    io::stdout().is_terminal()
+        && env::var_os("NO_COLOR").is_none()
+        && env::var_os("SEAPORT_NO_COLOR").is_none()
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -719,6 +1086,10 @@ struct TrialOutcome {
     reward: String,
     passed: bool,
     error: Option<String>,
+    stdout_tail: Vec<String>,
+    stderr_tail: Vec<String>,
+    trial_dir: PathBuf,
+    elapsed: Duration,
 }
 
 struct TrialRecord<'a> {
@@ -748,6 +1119,13 @@ struct TrialFailure<'a> {
 fn record_completed_trial(record: TrialRecord<'_>) -> Result<TrialOutcome, CliError> {
     let reward = record.reward.trim().to_owned();
     let passed = reward == "1" || reward == "1.0";
+    let stdout_tail = tail_lines_bytes(&record.outputs.verifier.stdout, FAILURE_TAIL_LINES);
+    let stderr_tail = tail_lines_bytes(&record.outputs.verifier.stderr, FAILURE_TAIL_LINES);
+    let error = if passed {
+        None
+    } else {
+        Some(format!("verifier returned reward {reward}"))
+    };
 
     fs::write(
         record.agent_dir.join("trajectory.json"),
@@ -770,7 +1148,7 @@ fn record_completed_trial(record: TrialRecord<'_>) -> Result<TrialOutcome, CliEr
         options: record.options,
         passed,
         reward: &reward,
-        error: None,
+        error: error.as_deref(),
     })?;
 
     Ok(TrialOutcome {
@@ -778,7 +1156,11 @@ fn record_completed_trial(record: TrialRecord<'_>) -> Result<TrialOutcome, CliEr
         attempt: record.attempt,
         reward,
         passed,
-        error: None,
+        error,
+        stdout_tail,
+        stderr_tail,
+        trial_dir: record.trial_dir.to_path_buf(),
+        elapsed: Duration::ZERO,
     })
 }
 
@@ -818,6 +1200,12 @@ fn record_failed_trial(failure: TrialFailure<'_>) -> Result<TrialOutcome, CliErr
         attempt: failure.attempt,
         reward: reward.to_owned(),
         passed: false,
+        stdout_tail: failure_output_tail(&failure.message, "stdout", FAILURE_TAIL_LINES)
+            .unwrap_or_default(),
+        stderr_tail: failure_output_tail(&failure.message, "stderr", FAILURE_TAIL_LINES)
+            .unwrap_or_else(|| tail_lines_text(&failure.message, FAILURE_TAIL_LINES)),
+        trial_dir: failure.trial_dir.to_path_buf(),
+        elapsed: Duration::ZERO,
         error: Some(failure.message),
     })
 }
@@ -1272,6 +1660,8 @@ Options:
       --jobs-dir <path>   Directory where job results are written
       --backend <name>    Execution backend: docker or unsafe-local
       --env <name>        Alias for --backend
+      --verbose           Stream raw command stdout/stderr
+      --quiet             Print only the final summary
   -i, --include-task-name <glob>
                           Include only matching task names
   -x, --exclude-task-name <glob>
@@ -1331,6 +1721,7 @@ struct RunOptions {
     attempts: usize,
     backend: SandboxBackend,
     jobs_dir: Option<String>,
+    log_mode: LogMode,
     selection: TaskSelection,
 }
 
@@ -1353,6 +1744,7 @@ impl Default for RunOptions {
             attempts: 1,
             backend: SandboxBackend::Docker,
             jobs_dir: None,
+            log_mode: LogMode::Concise,
             selection: TaskSelection::default(),
         }
     }
@@ -1444,6 +1836,14 @@ impl RunOptions {
                 "--jobs-dir" => {
                     options.jobs_dir = Some(required_value(args, index, flag)?);
                     index += 2;
+                }
+                "--verbose" => {
+                    options.log_mode = LogMode::Verbose;
+                    index += 1;
+                }
+                "--quiet" => {
+                    options.log_mode = LogMode::Quiet;
+                    index += 1;
                 }
                 "-i" | "--include-task-name" => {
                     options
@@ -1626,6 +2026,7 @@ mod tests {
         assert_eq!(options.agent.as_deref(), Some("codex"));
         assert_eq!(options.model.as_deref(), Some("openai/gpt-5"));
         assert_eq!(options.backend, SandboxBackend::Docker);
+        assert_eq!(options.log_mode, LogMode::Concise);
     }
 
     #[test]
@@ -1808,6 +2209,38 @@ mod tests {
         assert_eq!(
             options.verifier_env,
             [("EXPECTED".to_owned(), "ok".to_owned())]
+        );
+    }
+
+    #[test]
+    fn parses_log_mode_options() {
+        let verbose = RunOptions::parse(&strings(["-p", "tasks/example", "--verbose"]))
+            .expect("verbose options");
+        let quiet =
+            RunOptions::parse(&strings(["-p", "tasks/example", "--quiet"])).expect("quiet options");
+
+        assert_eq!(verbose.log_mode, LogMode::Verbose);
+        assert_eq!(quiet.log_mode, LogMode::Quiet);
+    }
+
+    #[test]
+    fn tail_lines_uses_last_non_empty_lines() {
+        let tail = tail_lines_text("one\n\n two \nthree\nfour\n", 2);
+
+        assert_eq!(tail, ["three", "four"]);
+    }
+
+    #[test]
+    fn failure_output_tail_reads_stream_sections() {
+        let message = "script failed\nstdout:\nfirst\nsecond\nstderr:\nboom\nlast\n";
+
+        assert_eq!(
+            failure_output_tail(message, "stdout", 8).expect("stdout"),
+            ["first", "second"]
+        );
+        assert_eq!(
+            failure_output_tail(message, "stderr", 1).expect("stderr"),
+            ["last"]
         );
     }
 
