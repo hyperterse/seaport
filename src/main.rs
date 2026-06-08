@@ -130,10 +130,10 @@ fn run_target(target: &RunTarget, options: &RunOptions, agent: AgentKind) -> Res
         .unwrap_or_else(|| PathBuf::from("jobs"));
     let job_dir = job_root.join(format!("seaport-{run_id}"));
     let plans = trial_plans(target, options);
-    let concurrency = options.concurrency.min(plans.len().max(1));
+    let concurrency = RunPhase::Execution.concurrency(options.concurrency, plans.len());
 
     print_target_ready(target, &job_dir, plans.len(), concurrency)?;
-    preflight_target(target, options, concurrency)?;
+    preflight_target(target, options)?;
 
     let outcomes = run_trial_plans(&plans, &job_dir, &run_id, options, agent, concurrency)?;
 
@@ -213,27 +213,24 @@ fn print_progress(message: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-fn preflight_target(
-    target: &RunTarget,
-    options: &RunOptions,
-    concurrency: usize,
-) -> Result<(), CliError> {
+fn preflight_target(target: &RunTarget, options: &RunOptions) -> Result<(), CliError> {
     if target.tasks.is_empty() || options.backend == SandboxBackend::UnsafeLocal {
         return Ok(());
     }
 
     ensure_sandbox_backend_available(options.backend)?;
 
-    let concurrency = phase_concurrency(concurrency, target.tasks.len(), 4);
+    let phase = RunPhase::Preflight;
+    let concurrency = phase.concurrency(options.concurrency, target.tasks.len());
 
     println!();
-    println!("Preflight");
-    println!("  phase: resolve/pull/build");
+    println!("{}", phase.title());
+    println!("  phase: {}", phase.label());
     println!("  tasks: {}", target.tasks.len());
     println!("  concurrency: {concurrency}");
     io::stdout().flush()?;
 
-    let work = Mutex::new((0..target.tasks.len()).collect::<VecDeque<_>>());
+    let work = Mutex::new(scheduled_task_indices(&target.tasks));
     let (sender, receiver) = mpsc::channel();
 
     thread::scope(|scope| {
@@ -279,8 +276,35 @@ fn preflight_target(
     Ok(())
 }
 
-fn phase_concurrency(requested: usize, item_count: usize, cap: usize) -> usize {
-    requested.max(1).min(item_count.max(1)).min(cap.max(1))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunPhase {
+    Preflight,
+    Execution,
+}
+
+impl RunPhase {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Preflight => "Preflight",
+            Self::Execution => "Execution",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Preflight => "resolve/pull/build",
+            Self::Execution => "solution/verifier",
+        }
+    }
+
+    fn concurrency(self, requested: usize, item_count: usize) -> usize {
+        let limit = requested.max(1).min(item_count.max(1));
+
+        match self {
+            Self::Preflight => limit.min(4),
+            Self::Execution => limit,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -350,12 +374,26 @@ fn run_trial_plans(
 }
 
 fn scheduled_trial_indices(plans: &[TrialPlan<'_>]) -> VecDeque<usize> {
-    let mut weighted = plans
+    let weighted = plans
         .iter()
         .enumerate()
-        .map(|(index, plan)| (index, trial_schedule_weight(plan.task)))
+        .map(|(index, plan)| (index, task_schedule_weight(plan.task)))
         .collect::<Vec<_>>();
 
+    weighted_indices(weighted)
+}
+
+fn scheduled_task_indices(tasks: &[TaskRef]) -> VecDeque<usize> {
+    let weighted = tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| (index, task_schedule_weight(task)))
+        .collect::<Vec<_>>();
+
+    weighted_indices(weighted)
+}
+
+fn weighted_indices(mut weighted: Vec<(usize, u32)>) -> VecDeque<usize> {
     weighted.sort_by(|(left_index, left_weight), (right_index, right_weight)| {
         right_weight
             .cmp(left_weight)
@@ -368,7 +406,7 @@ fn scheduled_trial_indices(plans: &[TrialPlan<'_>]) -> VecDeque<usize> {
         .collect::<VecDeque<_>>()
 }
 
-fn trial_schedule_weight(task: &TaskRef) -> u32 {
+fn task_schedule_weight(task: &TaskRef) -> u32 {
     let mut weight = 100;
 
     if file_contains_any(
@@ -1644,11 +1682,13 @@ mod tests {
     }
 
     #[test]
-    fn phase_concurrency_is_bounded_by_work_and_cap() {
-        assert_eq!(phase_concurrency(16, 10, 4), 4);
-        assert_eq!(phase_concurrency(2, 10, 4), 2);
-        assert_eq!(phase_concurrency(16, 2, 4), 2);
-        assert_eq!(phase_concurrency(0, 0, 0), 1);
+    fn run_phase_concurrency_bounds_preflight_but_honors_execution_requests() {
+        assert_eq!(RunPhase::Preflight.concurrency(16, 10), 4);
+        assert_eq!(RunPhase::Preflight.concurrency(2, 10), 2);
+        assert_eq!(RunPhase::Preflight.concurrency(16, 2), 2);
+        assert_eq!(RunPhase::Execution.concurrency(16, 10), 10);
+        assert_eq!(RunPhase::Execution.concurrency(32, 64), 32);
+        assert_eq!(RunPhase::Execution.concurrency(0, 0), 1);
     }
 
     #[test]
@@ -1715,6 +1755,13 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(scheduled, ["java", "rust", "asm", "fast"]);
+
+        let preflight = scheduled_task_indices(&tasks)
+            .into_iter()
+            .map(|index| tasks[index].name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(preflight, scheduled);
 
         let _ = fs::remove_dir_all(root);
     }
