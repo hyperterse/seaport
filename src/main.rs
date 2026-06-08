@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -236,7 +237,7 @@ fn run_trial_plans(
     agent: AgentKind,
     concurrency: usize,
 ) -> Result<Vec<TrialOutcome>, CliError> {
-    let work = Mutex::new((0..plans.len()).collect::<Vec<_>>());
+    let work = Mutex::new(scheduled_trial_indices(plans));
     let (sender, receiver) = mpsc::channel();
 
     thread::scope(|scope| {
@@ -247,7 +248,7 @@ fn run_trial_plans(
             scope.spawn(move || loop {
                 let index = {
                     let mut work = work.lock().expect("trial queue");
-                    work.pop()
+                    work.pop_front()
                 };
                 let Some(index) = index else {
                     break;
@@ -274,6 +275,90 @@ fn run_trial_plans(
         .into_iter()
         .map(|outcome| outcome.ok_or_else(|| CliError::task_failed("trial worker stopped early")))
         .collect()
+}
+
+fn scheduled_trial_indices(plans: &[TrialPlan<'_>]) -> VecDeque<usize> {
+    let mut weighted = plans
+        .iter()
+        .enumerate()
+        .map(|(index, plan)| (index, trial_schedule_weight(plan.task)))
+        .collect::<Vec<_>>();
+
+    weighted.sort_by(|(left_index, left_weight), (right_index, right_weight)| {
+        right_weight
+            .cmp(left_weight)
+            .then_with(|| left_index.cmp(right_index))
+    });
+
+    weighted
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect::<VecDeque<_>>()
+}
+
+fn trial_schedule_weight(task: &TaskRef) -> u32 {
+    let mut weight = 100;
+
+    if file_contains_any(
+        &task.path.join("environment").join("Dockerfile"),
+        &["zulu7-jdk", "openjdk-7-jdk", "openjdk-7-jre"],
+    ) {
+        weight += 1_000;
+    }
+
+    if file_contains_any(
+        &task.path.join("solution").join("solve.sh"),
+        &["cargo build --release", "mvn test", "gradle test", "javac"],
+    ) {
+        weight += 700;
+    }
+
+    if directory_contains_extension(&task.path.join("environment"), &["s", "asm"]) {
+        weight += 250;
+    }
+
+    weight
+}
+
+fn file_contains_any(path: &Path, needles: &[&str]) -> bool {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+    let contents = contents.to_ascii_lowercase();
+
+    needles.iter().any(|needle| contents.contains(needle))
+}
+
+fn directory_contains_extension(path: &Path, extensions: &[&str]) -> bool {
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+
+        if file_type.is_dir() && directory_contains_extension(&entry_path, extensions) {
+            return true;
+        }
+
+        if file_type.is_file()
+            && entry_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    extensions
+                        .iter()
+                        .any(|expected| extension.eq_ignore_ascii_case(expected))
+                })
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn run_trial(
@@ -1491,6 +1576,56 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_prioritizes_long_running_task_shapes() {
+        let root = temp_test_dir("schedule");
+        let fast = root.join("fast");
+        let asm = root.join("asm");
+        let rust = root.join("rust");
+        let java = root.join("java");
+
+        write_schedule_fixture(&fast, "", "");
+        write_schedule_fixture(&asm, "", "");
+        fs::write(
+            asm.join("environment").join("boot.s"),
+            ".intel_syntax noprefix\n",
+        )
+        .expect("asm");
+        write_schedule_fixture(&rust, "", "cargo build --release\n");
+        write_schedule_fixture(&java, "RUN apt-get install -y zulu7-jdk\n", "");
+
+        let tasks = [
+            TaskRef {
+                name: "fast".to_owned(),
+                path: fast,
+            },
+            TaskRef {
+                name: "asm".to_owned(),
+                path: asm,
+            },
+            TaskRef {
+                name: "rust".to_owned(),
+                path: rust,
+            },
+            TaskRef {
+                name: "java".to_owned(),
+                path: java,
+            },
+        ];
+        let plans = tasks
+            .iter()
+            .map(|task| TrialPlan { task, attempt: 1 })
+            .collect::<Vec<_>>();
+        let scheduled = scheduled_trial_indices(&plans)
+            .into_iter()
+            .map(|index| plans[index].task.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(scheduled, ["java", "rust", "asm", "fast"]);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn parses_agent_command_option() {
         let args = strings([
             "-p",
@@ -2016,6 +2151,17 @@ mod tests {
     fn temp_test_dir(name: &str) -> PathBuf {
         let id = timestamp_id().expect("timestamp");
         env::temp_dir().join(format!("seaport-{name}-{id}"))
+    }
+
+    fn write_schedule_fixture(root: &Path, dockerfile_body: &str, solution_body: &str) {
+        fs::create_dir_all(root.join("environment")).expect("environment dir");
+        fs::create_dir_all(root.join("solution")).expect("solution dir");
+        fs::write(
+            root.join("environment").join("Dockerfile"),
+            format!("FROM ubuntu:24.04\n{dockerfile_body}"),
+        )
+        .expect("dockerfile");
+        fs::write(root.join("solution").join("solve.sh"), solution_body).expect("solution");
     }
 
     fn write_oracle_task(root: &Path, name: &str) {
