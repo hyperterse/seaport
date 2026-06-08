@@ -1239,13 +1239,20 @@ impl Default for RunOptions {
             agent_env: Vec::new(),
             verifier_env: Vec::new(),
             model: None,
-            concurrency: 4,
+            concurrency: default_concurrency(),
             attempts: 1,
             backend: SandboxBackend::Docker,
             jobs_dir: None,
             selection: TaskSelection::default(),
         }
     }
+}
+
+fn default_concurrency() -> usize {
+    thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(4)
+        .clamp(1, 8)
 }
 
 impl RunOptions {
@@ -1555,6 +1562,13 @@ mod tests {
         assert_eq!(options.selection.include_task_names, ["bench/*"]);
         assert_eq!(options.selection.exclude_task_names, ["bench/skip-*"]);
         assert_eq!(options.selection.task_limit, Some(5));
+    }
+
+    #[test]
+    fn default_concurrency_is_positive_and_bounded() {
+        let concurrency = default_concurrency();
+
+        assert!((1..=8).contains(&concurrency));
     }
 
     #[test]
