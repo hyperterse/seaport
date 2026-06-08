@@ -1295,6 +1295,10 @@ fn hash_cache_bytes(hash: &mut u64, bytes: &[u8]) {
 }
 
 fn docker_image_exists(reference: &str) -> bool {
+    if let Some(exists) = docker_api_image_exists(reference) {
+        return exists;
+    }
+
     Command::new("docker")
         .args(["image", "inspect", reference])
         .stdout(Stdio::null())
@@ -1624,6 +1628,10 @@ fn docker_pull_command(image: &str, platform: Option<&str>) -> Command {
 }
 
 fn ensure_docker_available() -> Result<(), CliError> {
+    if docker_api_ping() {
+        return Ok(());
+    }
+
     let output = Command::new("docker")
         .arg("version")
         .arg("--format")
@@ -1905,6 +1913,10 @@ fn script_phase(script: &str) -> &'static str {
 }
 
 fn cleanup_docker_container(container_name: &str) {
+    if docker_api_remove_container(container_name) {
+        return;
+    }
+
     match Command::new("docker")
         .args(["container", "rm", "-f", container_name])
         .output()
@@ -1926,6 +1938,10 @@ fn cleanup_docker_container(container_name: &str) {
 }
 
 fn cleanup_docker_image(image: &str) {
+    if docker_api_remove_image(image) {
+        return;
+    }
+
     match Command::new("docker")
         .args(["image", "rm", "-f", image])
         .output()
@@ -1942,6 +1958,123 @@ fn cleanup_docker_image(image: &str) {
             eprintln!("seaport: warning: could not remove docker image {image}: {error}");
         }
     }
+}
+
+fn docker_api_ping() -> bool {
+    matches!(
+        docker_api_request("GET", "/_ping"),
+        Some(Ok(response)) if response.status == 200
+    )
+}
+
+fn docker_api_image_exists(reference: &str) -> Option<bool> {
+    let response = docker_api_request("GET", &docker_api_image_json_path(reference))?.ok()?;
+
+    match response.status {
+        200 => Some(true),
+        404 => Some(false),
+        _ => None,
+    }
+}
+
+fn docker_api_remove_container(container_name: &str) -> bool {
+    docker_api_delete_success(&format!("/containers/{container_name}?force=true&v=false"))
+}
+
+fn docker_api_remove_image(image: &str) -> bool {
+    docker_api_delete_success(&format!("/images/{image}?force=true"))
+}
+
+fn docker_api_delete_success(path: &str) -> bool {
+    matches!(
+        docker_api_request("DELETE", path),
+        Some(Ok(response)) if response.status == 204 || response.status == 404
+    )
+}
+
+fn docker_api_image_json_path(reference: &str) -> String {
+    format!("/images/{reference}/json")
+}
+
+struct DockerApiResponse {
+    status: u16,
+    body: Vec<u8>,
+}
+
+#[cfg(unix)]
+fn docker_api_request(method: &str, path: &str) -> Option<io::Result<DockerApiResponse>> {
+    use std::os::unix::net::UnixStream;
+
+    let socket = docker_socket_path()?;
+    let mut stream = UnixStream::connect(socket).ok()?;
+    let request = format!("{method} {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n");
+
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+
+    if let Err(error) = stream.write_all(request.as_bytes()) {
+        return Some(Err(error));
+    }
+
+    let mut response = Vec::new();
+
+    match stream.read_to_end(&mut response) {
+        Ok(_) => Some(parse_docker_api_response(&response)),
+        Err(error) => Some(Err(error)),
+    }
+}
+
+#[cfg(not(unix))]
+fn docker_api_request(_method: &str, _path: &str) -> Option<io::Result<DockerApiResponse>> {
+    None
+}
+
+#[cfg(unix)]
+fn docker_socket_path() -> Option<PathBuf> {
+    if let Some(path) = env::var_os("SEAPORT_DOCKER_SOCKET") {
+        return Some(PathBuf::from(path));
+    }
+
+    if let Ok(host) = env::var("DOCKER_HOST") {
+        if let Some(path) = host.strip_prefix("unix://") {
+            return Some(PathBuf::from(path));
+        }
+    }
+
+    let mut candidates = vec![PathBuf::from("/var/run/docker.sock")];
+
+    if let Some(home) = env::var_os("HOME") {
+        candidates.push(PathBuf::from(home).join(".docker/run/docker.sock"));
+    }
+
+    candidates
+        .iter()
+        .find(|candidate| candidate.exists())
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
+}
+
+fn parse_docker_api_response(response: &[u8]) -> io::Result<DockerApiResponse> {
+    let header_end = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP headers"))?;
+    let headers = String::from_utf8_lossy(&response[..header_end]);
+    let status_line = headers
+        .lines()
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP status"))?;
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing HTTP status code"))?
+        .parse::<u16>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+
+    Ok(DockerApiResponse {
+        status,
+        body: response[header_end + 4..].to_vec(),
+    })
 }
 
 fn run_scripts_locally(
@@ -2443,6 +2576,25 @@ FROM python:3.12-slim
         let args = command_args(command);
 
         assert_eq!(args, ["pull", "--platform", "linux/amd64", "ubuntu:24.04"]);
+    }
+
+    #[test]
+    fn docker_api_image_path_keeps_registry_reference() {
+        assert_eq!(
+            docker_api_image_json_path("ghcr.io/acme/image:latest"),
+            "/images/ghcr.io/acme/image:latest/json"
+        );
+    }
+
+    #[test]
+    fn parse_docker_api_response_reads_status_and_body() {
+        let response = parse_docker_api_response(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}",
+        )
+        .expect("response");
+
+        assert_eq!(response.status, 404);
+        assert_eq!(response.body, b"{}");
     }
 
     #[test]
