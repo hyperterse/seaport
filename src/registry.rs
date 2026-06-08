@@ -3,6 +3,8 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -14,6 +16,8 @@ const PACKAGE_REGISTRY_URL: &str = "https://ofhuhcpkvzjlejydnvyd.supabase.co";
 const PACKAGE_REGISTRY_KEY: &str = "sb_publishable_Z-vuQbpvpG-PStjbh4yE0Q_e-d3MTIH";
 const PACKAGE_TASK_PAGE_SIZE: usize = 1000;
 const PACKAGE_BUCKET: &str = "packages";
+const PACKAGE_ARCHIVE_DOWNLOAD_ATTEMPTS: usize = 8;
+const PACKAGE_ARCHIVE_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DATASET_VERSION_TAG_SELECT: &str =
     "dataset_version:dataset_version_id(*),package:package_id!inner(name,type,org:org_id!inner(name))";
 const DATASET_VERSION_SELECT: &str = "*,package:package_id!inner(name,type,org:org_id!inner(name))";
@@ -800,10 +804,74 @@ fn download_package_archive(remote_path: &str, archive_path: &Path) -> Result<()
         PACKAGE_BUCKET,
         remote_path
     );
-    let mut command = curl_base_command(&url);
-    add_package_headers(&mut command);
-    command.arg("-o").arg(archive_path);
-    run_command_status(&mut command, "download package archive")
+    let attempts = package_archive_download_attempts();
+
+    for attempt in 1..=attempts {
+        if archive_path.exists() {
+            fs::remove_file(archive_path)?;
+        }
+
+        progress(&format!(
+            "download attempt {attempt}/{attempts}: {remote_path}"
+        ))?;
+
+        let mut command = curl_base_command(&url);
+        add_package_headers(&mut command);
+        command.arg("-o").arg(archive_path);
+
+        match command.output() {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) if attempt < attempts && should_retry_download(&output) => {
+                progress(&format!(
+                    "download failed transiently; retrying in {}s",
+                    PACKAGE_ARCHIVE_RETRY_DELAY.as_secs()
+                ))?;
+                thread::sleep(PACKAGE_ARCHIVE_RETRY_DELAY);
+            }
+            Ok(output) => return Err(command_failed("download package archive", &output)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(CliError::usage(format!(
+                    "download package archive requires `{}` on PATH",
+                    command.get_program().to_string_lossy()
+                )));
+            }
+            Err(error) if attempt < attempts => {
+                progress(&format!(
+                    "download command failed: {error}; retrying in {}s",
+                    PACKAGE_ARCHIVE_RETRY_DELAY.as_secs()
+                ))?;
+                thread::sleep(PACKAGE_ARCHIVE_RETRY_DELAY);
+            }
+            Err(error) => return Err(CliError::io(error.to_string())),
+        }
+    }
+
+    Err(CliError::task_failed("download package archive failed"))
+}
+
+fn package_archive_download_attempts() -> usize {
+    env::var("SEAPORT_PACKAGE_DOWNLOAD_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|attempts| *attempts > 0)
+        .unwrap_or(PACKAGE_ARCHIVE_DOWNLOAD_ATTEMPTS)
+}
+
+fn should_retry_download(output: &std::process::Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    is_retryable_download_error(output.status.code(), &stderr)
+}
+
+fn is_retryable_download_error(exit_code: Option<i32>, stderr: &str) -> bool {
+    if stderr.contains(" 403") || stderr.contains(" 404") {
+        return false;
+    }
+
+    matches!(exit_code, Some(5 | 6 | 7 | 18 | 28 | 35 | 52 | 56))
+        || [" 500", " 502", " 503", " 504"]
+            .iter()
+            .any(|status| stderr.contains(status))
 }
 
 fn package_registry_url() -> String {
@@ -877,18 +945,22 @@ fn run_command_output(
 
     match output {
         Ok(output) if output.status.success() => Ok(output),
-        Ok(output) => Err(CliError::task_failed(format!(
-            "{action} failed (status: {})\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ))),
+        Ok(output) => Err(command_failed(action, &output)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Err(CliError::usage(format!(
             "{action} requires `{}` on PATH",
             command.get_program().to_string_lossy()
         ))),
         Err(error) => Err(CliError::io(error.to_string())),
     }
+}
+
+fn command_failed(action: &str, output: &std::process::Output) -> CliError {
+    CliError::task_failed(format!(
+        "{action} failed (status: {})\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
 }
 
 fn progress(message: &str) -> Result<(), CliError> {
@@ -985,6 +1057,22 @@ mod tests {
         let error = PackageReference::parse("terminal-bench-2").expect_err("error");
 
         assert_eq!(error.exit_code(), crate::EXIT_USAGE);
+    }
+
+    #[test]
+    fn package_download_retries_gateway_timeouts() {
+        assert!(is_retryable_download_error(
+            Some(56),
+            "curl: (56) The requested URL returned error: 504"
+        ));
+    }
+
+    #[test]
+    fn package_download_does_not_retry_missing_archives() {
+        assert!(!is_retryable_download_error(
+            Some(22),
+            "curl: (22) The requested URL returned error: 404"
+        ));
     }
 
     #[test]
