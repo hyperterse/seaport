@@ -269,13 +269,14 @@ fn run_scripts_in_docker(
         runtime.run_id,
         environment,
     )?;
+    let image_platform = image.platform.as_deref();
     let result = (|| {
         seed_docker_app_workspace(
             runtime.task_label,
             runtime.run_id,
             &image.reference,
             runtime.app_dir,
-            environment.platform.as_deref(),
+            image_platform,
         )?;
         prepare_task_file_workspace(runtime.task_path, runtime.app_dir)?;
         prepare_cobol_copybook_aliases(runtime.app_dir)?;
@@ -292,7 +293,7 @@ fn run_scripts_in_docker(
                     task_label: runtime.task_label,
                     script: "solution/solve.sh",
                     network: environment.agent_network,
-                    platform: environment.platform.as_deref(),
+                    platform: image_platform,
                     resources: &environment.resources,
                     env: &envs.agent,
                     timeout: environment.agent_timeout,
@@ -310,7 +311,7 @@ fn run_scripts_in_docker(
                     task_label: runtime.task_label,
                     agent,
                     network: environment.agent_network,
-                    platform: environment.platform.as_deref(),
+                    platform: image_platform,
                     resources: &environment.resources,
                     env: &envs.agent,
                     timeout: environment.agent_timeout,
@@ -326,7 +327,7 @@ fn run_scripts_in_docker(
             task_label: runtime.task_label,
             script: "tests/test.sh",
             network: environment.verifier_network,
-            platform: environment.platform.as_deref(),
+            platform: image_platform,
             resources: &environment.resources,
             env: &envs.verifier,
             timeout: environment.verifier_timeout,
@@ -345,6 +346,7 @@ fn run_scripts_in_docker(
 struct DockerImage {
     reference: String,
     remove_after_run: bool,
+    platform: Option<String>,
 }
 
 struct TaskEnvironment {
@@ -470,7 +472,6 @@ fn docker_platform(contents: &str) -> Option<String> {
     toml_section_value(contents, "environment", "docker_platform")
         .or_else(|| toml_section_value(contents, "environment", "platform"))
         .or_else(|| toml_top_level_value(contents, "docker_platform"))
-        .or_else(default_docker_platform)
 }
 
 fn docker_platform_value(platform: &str) -> Option<String> {
@@ -517,14 +518,6 @@ fn docker_resources(contents: &str) -> Result<DockerResources, CliError> {
     }
 
     Ok(resources)
-}
-
-fn default_docker_platform() -> Option<String> {
-    if cfg!(target_arch = "aarch64") {
-        Some(DEFAULT_COMPAT_DOCKER_PLATFORM.to_owned())
-    } else {
-        None
-    }
 }
 
 fn parse_network_mode(field: &str, value: &str) -> Result<DockerNetwork, CliError> {
@@ -781,6 +774,7 @@ fn prepare_docker_image(
         return Ok(DockerImage {
             reference: environment.image.clone(),
             remove_after_run: false,
+            platform: environment.platform.clone(),
         });
     }
 
@@ -788,8 +782,29 @@ fn prepare_docker_image(
     let environment_dir = dockerfile
         .parent()
         .ok_or_else(|| CliError::usage("environment/Dockerfile has no parent directory"))?;
-    let timed_output =
-        run_docker_build_with_retries(task_label, &tag, environment_dir, environment)?;
+    let mut build_platform = environment.platform.clone();
+    let mut timed_output = run_docker_build_with_retries(
+        task_label,
+        &tag,
+        environment_dir,
+        environment,
+        build_platform.as_deref(),
+    )?;
+
+    if should_retry_build_with_compat_platform(&timed_output, build_platform.as_deref()) {
+        build_platform = Some(DEFAULT_COMPAT_DOCKER_PLATFORM.to_owned());
+        println!(
+            "[{task_label} | build] native docker build is not available for this image; retrying with {DEFAULT_COMPAT_DOCKER_PLATFORM}"
+        );
+        timed_output = run_docker_build_with_retries(
+            task_label,
+            &tag,
+            environment_dir,
+            environment,
+            build_platform.as_deref(),
+        )?;
+    }
+
     let output = timed_output.output;
 
     if timed_output.timed_out {
@@ -814,6 +829,7 @@ fn prepare_docker_image(
     Ok(DockerImage {
         reference: tag,
         remove_after_run: true,
+        platform: build_platform,
     })
 }
 
@@ -822,12 +838,13 @@ fn run_docker_build_with_retries(
     tag: &str,
     environment_dir: &Path,
     environment: &TaskEnvironment,
+    platform: Option<&str>,
 ) -> Result<TimedOutput, CliError> {
     let mut attempt = 1;
 
     loop {
         let timed_output = run_command_with_timeout(
-            docker_build_command(tag, environment_dir, environment),
+            docker_build_command(tag, environment_dir, environment, platform),
             environment.build_timeout,
             Some(CommandLog::new(task_label, "build")),
         )?;
@@ -847,6 +864,40 @@ fn run_docker_build_with_retries(
         );
         thread::sleep(DOCKER_BUILD_RETRY_DELAY);
     }
+}
+
+fn should_retry_build_with_compat_platform(
+    timed_output: &TimedOutput,
+    platform: Option<&str>,
+) -> bool {
+    platform.is_none()
+        && compat_docker_platform_available()
+        && !timed_output.timed_out
+        && !timed_output.output.status.success()
+        && docker_build_needs_compat_platform(&timed_output.output)
+}
+
+fn compat_docker_platform_available() -> bool {
+    cfg!(target_arch = "aarch64")
+}
+
+fn docker_build_needs_compat_platform(output: &Output) -> bool {
+    let output = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .to_ascii_lowercase();
+
+    [
+        "no matching manifest for linux/arm64",
+        "no match for platform",
+        "does not support platform",
+        "package zulu7-jdk has no installation candidate",
+        "unable to locate package zulu7-jdk",
+    ]
+    .iter()
+    .any(|pattern| output.contains(pattern))
 }
 
 fn docker_build_transient_failure(output: &Output) -> bool {
@@ -876,6 +927,7 @@ fn docker_build_command(
     tag: &str,
     environment_dir: &Path,
     environment: &TaskEnvironment,
+    platform: Option<&str>,
 ) -> Command {
     let mut command = Command::new("docker");
     command.args([
@@ -886,7 +938,7 @@ fn docker_build_command(
         environment.build_network.as_docker_build_arg(),
     ]);
 
-    if let Some(platform) = environment.platform.as_deref() {
+    if let Some(platform) = platform {
         command.args(["--platform", platform]);
     }
 
@@ -1637,8 +1689,12 @@ mod tests {
             agent_timeout: Duration::from_secs(60),
             verifier_timeout: Duration::from_secs(60),
         };
-        let command =
-            docker_build_command("seaport-task-test", Path::new("/tmp/env"), &environment);
+        let command = docker_build_command(
+            "seaport-task-test",
+            Path::new("/tmp/env"),
+            &environment,
+            None,
+        );
         let args = command_args(command);
 
         assert!(args
@@ -1659,6 +1715,17 @@ mod tests {
             .expect("output");
 
         assert!(docker_build_transient_failure(&output));
+    }
+
+    #[test]
+    fn docker_build_needs_compat_platform_detects_arm_incompatible_toolchain() {
+        let output = Command::new("bash")
+            .arg("-lc")
+            .arg("printf 'E: Package zulu7-jdk has no installation candidate\\n' >&2; exit 1")
+            .output()
+            .expect("output");
+
+        assert!(docker_build_needs_compat_platform(&output));
     }
 
     #[test]
@@ -1821,7 +1888,7 @@ docker_image = "ubuntu:24.04" # explicit prebuilt image
     }
 
     #[test]
-    fn task_environment_defaults_to_compatible_platform_on_arm_hosts() {
+    fn task_environment_defaults_to_native_platform() {
         let task = temp_task_dir("default-docker-platform");
         fs::create_dir_all(&task).expect("task dir");
         fs::write(
@@ -1836,14 +1903,7 @@ build_timeout_sec = 7.5
         let environment = task_environment(&task).expect("environment");
 
         assert!(!environment.prebuilt_image);
-        if cfg!(target_arch = "aarch64") {
-            assert_eq!(
-                environment.platform.as_deref(),
-                Some(DEFAULT_COMPAT_DOCKER_PLATFORM)
-            );
-        } else {
-            assert_eq!(environment.platform, None);
-        }
+        assert_eq!(environment.platform, None);
 
         let _ = fs::remove_dir_all(task);
     }
