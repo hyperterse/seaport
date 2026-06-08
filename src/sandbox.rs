@@ -9,9 +9,10 @@ use std::time::{Duration, Instant};
 use crate::CliError;
 
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
-const CONTAINER_MEMORY: &str = "1g";
-const CONTAINER_CPUS: &str = "1.0";
+const DEFAULT_CONTAINER_MEMORY: &str = "1g";
+const DEFAULT_CONTAINER_CPUS: &str = "1.0";
 const CONTAINER_PIDS_LIMIT: &str = "256";
+const DEFAULT_TMPFS_SIZE: &str = "256m";
 const DEFAULT_COMPAT_DOCKER_PLATFORM: &str = "linux/amd64";
 const DOCKER_BUILD_TIMEOUT: Duration = Duration::from_secs(600);
 const DOCKER_WORKSPACE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -290,6 +291,7 @@ fn run_scripts_in_docker(
                     script: "solution/solve.sh",
                     network: environment.agent_network,
                     platform: environment.platform.as_deref(),
+                    resources: &environment.resources,
                     env: &envs.agent,
                     timeout: environment.agent_timeout,
                 })?,
@@ -307,6 +309,7 @@ fn run_scripts_in_docker(
                     agent,
                     network: environment.agent_network,
                     platform: environment.platform.as_deref(),
+                    resources: &environment.resources,
                     env: &envs.agent,
                     timeout: environment.agent_timeout,
                 })?,
@@ -322,6 +325,7 @@ fn run_scripts_in_docker(
             script: "tests/test.sh",
             network: environment.verifier_network,
             platform: environment.platform.as_deref(),
+            resources: &environment.resources,
             env: &envs.verifier,
             timeout: environment.verifier_timeout,
         })?;
@@ -345,12 +349,30 @@ struct TaskEnvironment {
     image: String,
     prebuilt_image: bool,
     platform: Option<String>,
+    resources: DockerResources,
     build_network: DockerNetwork,
     agent_network: DockerNetwork,
     verifier_network: DockerNetwork,
     build_timeout: Duration,
     agent_timeout: Duration,
     verifier_timeout: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DockerResources {
+    cpus: String,
+    memory: String,
+    tmpfs_size: String,
+}
+
+impl Default for DockerResources {
+    fn default() -> Self {
+        Self {
+            cpus: DEFAULT_CONTAINER_CPUS.to_owned(),
+            memory: DEFAULT_CONTAINER_MEMORY.to_owned(),
+            tmpfs_size: DEFAULT_TMPFS_SIZE.to_owned(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -384,6 +406,7 @@ fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
         .unwrap_or_else(|| DEFAULT_DOCKER_IMAGE.to_owned());
     let prebuilt_image = explicit_image.is_some();
     let platform = docker_platform(&task_toml);
+    let resources = docker_resources(&task_toml)?;
     let baseline_network = baseline_network(&task_toml)?;
     let build_timeout = toml_duration_value_with_default(
         &task_toml,
@@ -402,6 +425,7 @@ fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
         image,
         prebuilt_image,
         platform,
+        resources,
         build_network: baseline_network,
         agent_network,
         verifier_network,
@@ -455,6 +479,42 @@ fn docker_platform_value(platform: &str) -> Option<String> {
     } else {
         Some(platform.to_owned())
     }
+}
+
+fn docker_resources(contents: &str) -> Result<DockerResources, CliError> {
+    let mut resources = DockerResources::default();
+
+    if let Some(cpus) = toml_section_value(contents, "environment", "cpus") {
+        let parsed = cpus.parse::<f64>().map_err(|error| {
+            CliError::usage(format!("[environment].cpus must be a number: {error}"))
+        })?;
+
+        if parsed <= 0.0 {
+            return Err(CliError::usage(
+                "[environment].cpus must be greater than zero",
+            ));
+        }
+
+        resources.cpus = cpus;
+    }
+
+    if let Some(memory_mb) = toml_section_value(contents, "environment", "memory_mb") {
+        let parsed = memory_mb.parse::<u64>().map_err(|error| {
+            CliError::usage(format!(
+                "[environment].memory_mb must be a positive integer: {error}"
+            ))
+        })?;
+
+        if parsed == 0 {
+            return Err(CliError::usage(
+                "[environment].memory_mb must be greater than zero",
+            ));
+        }
+
+        resources.memory = format!("{parsed}m");
+    }
+
+    Ok(resources)
 }
 
 fn default_docker_platform() -> Option<String> {
@@ -813,6 +873,7 @@ struct DockerScriptRun<'a> {
     script: &'a str,
     network: DockerNetwork,
     platform: Option<&'a str>,
+    resources: &'a DockerResources,
     env: &'a [(String, String)],
     timeout: Duration,
 }
@@ -827,6 +888,7 @@ struct DockerShellRun<'a> {
     agent: &'a ExternalAgent,
     network: DockerNetwork,
     platform: Option<&'a str>,
+    resources: &'a DockerResources,
     env: &'a [(String, String)],
     timeout: Duration,
 }
@@ -847,6 +909,7 @@ fn run_script_in_docker(run: DockerScriptRun<'_>) -> Result<Output, CliError> {
         invocation: DockerInvocation::TaskScript(run.script),
         network: run.network,
         platform: run.platform,
+        resources: run.resources,
         extra_env: &extra_env,
     });
     let timed_output = run_command_with_timeout(
@@ -900,6 +963,7 @@ fn run_shell_in_docker(run: DockerShellRun<'_>) -> Result<Output, CliError> {
         invocation: DockerInvocation::ShellCommand(&run.agent.command),
         network: run.network,
         platform: run.platform,
+        resources: run.resources,
         extra_env: &extra_env,
     });
     let timed_output = run_command_with_timeout(
@@ -945,6 +1009,7 @@ struct DockerRunCommand<'a> {
     invocation: DockerInvocation<'a>,
     network: DockerNetwork,
     platform: Option<&'a str>,
+    resources: &'a DockerResources,
     extra_env: &'a [(&'a str, &'a str)],
 }
 
@@ -965,16 +1030,16 @@ fn docker_run_command(run: DockerRunCommand<'_>) -> Command {
             "--pids-limit",
             CONTAINER_PIDS_LIMIT,
             "--memory",
-            CONTAINER_MEMORY,
+            run.resources.memory.as_str(),
             "--memory-swap",
-            CONTAINER_MEMORY,
+            run.resources.memory.as_str(),
             "--cpus",
-            CONTAINER_CPUS,
+            run.resources.cpus.as_str(),
             "--read-only",
             "--workdir",
             "/app",
             "--tmpfs",
-            "/tmp:rw,nosuid,nodev,size=256m",
+            &format!("/tmp:rw,nosuid,nodev,size={}", run.resources.tmpfs_size),
             "--tmpfs",
             "/run:rw,nosuid,nodev,size=16m",
             "--env",
@@ -1462,6 +1527,7 @@ mod tests {
             invocation: DockerInvocation::TaskScript("tests/test.sh"),
             network: DockerNetwork::None,
             platform: Some("linux/amd64"),
+            resources: &DockerResources::default(),
             extra_env: &[],
         });
         let args = command_args(command);
@@ -1510,6 +1576,7 @@ mod tests {
             image: "ubuntu:24.04".to_owned(),
             prebuilt_image: false,
             platform: None,
+            resources: DockerResources::default(),
             build_network: DockerNetwork::Bridge,
             agent_network: DockerNetwork::Bridge,
             verifier_network: DockerNetwork::Bridge,
@@ -1634,6 +1701,8 @@ docker_image = "python:3.12"
 docker_platform = "linux/arm64"
 network_mode = "public"
 build_timeout_sec = 7.5
+cpus = 2
+memory_mb = 2048
 os = "linux"
 
 [agent]
@@ -1655,6 +1724,8 @@ network_mode = "public"
         assert_eq!(environment.build_network, DockerNetwork::Bridge);
         assert_eq!(environment.agent_network, DockerNetwork::None);
         assert_eq!(environment.verifier_network, DockerNetwork::Bridge);
+        assert_eq!(environment.resources.cpus, "2");
+        assert_eq!(environment.resources.memory, "2048m");
         assert_eq!(environment.build_timeout, Duration::from_secs_f64(7.5));
         assert_eq!(environment.agent_timeout, Duration::from_secs(3));
         assert_eq!(environment.verifier_timeout, Duration::from_secs(5));
