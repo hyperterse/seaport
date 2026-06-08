@@ -439,6 +439,13 @@ fn run_trial_plans(
     let (sender, receiver) = mpsc::channel();
     let mut outcomes = (0..plans.len()).map(|_| None).collect::<Vec<_>>();
     let mut completed = 0;
+    // Attribute to each finishing trial the wall-clock interval since the
+    // previous trial finished (the first since the phase began). With trials
+    // running concurrently these intervals tile the execution timeline, so the
+    // per-task durations sum to the execution wall-clock instead of each
+    // measuring from a shared start (which made every row look additive).
+    let phase_started = Instant::now();
+    let mut last_finished = phase_started;
 
     thread::scope(|scope| -> Result<(), CliError> {
         for _ in 0..concurrency {
@@ -466,7 +473,10 @@ fn run_trial_plans(
         drop(sender);
 
         for TrialEvent { index, result } in receiver {
-            let outcome = result?;
+            let mut outcome = result?;
+            let now = Instant::now();
+            outcome.elapsed = now.duration_since(last_finished);
+            last_finished = now;
 
             completed += 1;
             print_trial_finish(&outcome, options)?;
@@ -617,7 +627,6 @@ fn run_trial(
 
     let sandbox_agent = agent.sandbox_agent(options)?;
     let phase_envs = options.phase_envs();
-    let trial_started = Instant::now();
     let execution: Result<(ScriptOutputs, String), CliError> = (|| {
         let outputs = run_task_scripts(TaskScriptRequest {
             task_label: task_name,
@@ -634,43 +643,31 @@ fn run_trial(
         Ok((outputs, reward))
     })();
 
+    // `elapsed` is assigned by the caller as trials finish, so each trial's
+    // reported duration is its share of the execution timeline.
     let outcome = match execution {
-        Ok((outputs, reward)) => {
-            // Report the task's own execution span (agent + verifier), not the
-            // wall-clock since the trial was dequeued, so concurrent trials each
-            // show how long they actually ran rather than additive waiting time.
-            let elapsed = outputs.execution;
-            let mut outcome = record_completed_trial(TrialRecord {
-                task_name,
-                attempt,
-                agent,
-                options,
-                trial_dir: &trial_dir,
-                agent_dir: &agent_dir,
-                verifier_dir: &verifier_dir,
-                outputs,
-                reward,
-            })?;
-            outcome.elapsed = elapsed;
-            outcome
-        }
-        Err(error) if error.is_task_failure() => {
-            // No execution span is available when the trial fails before results
-            // are produced; fall back to the time spent inside this trial.
-            let mut outcome = record_failed_trial(TrialFailure {
-                task_name,
-                attempt,
-                agent,
-                options,
-                trial_dir: &trial_dir,
-                agent_dir: &agent_dir,
-                verifier_dir: &verifier_dir,
-                logs_dir: &logs_dir,
-                message: error.to_string(),
-            })?;
-            outcome.elapsed = trial_started.elapsed();
-            outcome
-        }
+        Ok((outputs, reward)) => record_completed_trial(TrialRecord {
+            task_name,
+            attempt,
+            agent,
+            options,
+            trial_dir: &trial_dir,
+            agent_dir: &agent_dir,
+            verifier_dir: &verifier_dir,
+            outputs,
+            reward,
+        })?,
+        Err(error) if error.is_task_failure() => record_failed_trial(TrialFailure {
+            task_name,
+            attempt,
+            agent,
+            options,
+            trial_dir: &trial_dir,
+            agent_dir: &agent_dir,
+            verifier_dir: &verifier_dir,
+            logs_dir: &logs_dir,
+            message: error.to_string(),
+        })?,
         Err(error) => return Err(error),
     };
 
@@ -2461,25 +2458,29 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_trial_durations_are_recorded_per_task() {
+    fn concurrent_trial_durations_sum_to_wall_clock() {
         let root = temp_test_dir("trial-durations");
-        let fast = root.join("fast");
-        let slow = root.join("slow");
         let jobs = root.join("jobs");
 
-        write_sleeping_oracle_task(&fast, "acme/fast", "0.05");
-        write_sleeping_oracle_task(&slow, "acme/slow", "0.30");
+        // Three trials that each sleep the same amount, all run concurrently, so
+        // the execution wall-clock is ~one sleep, not the sum of the three.
+        let sleep_secs = 0.30;
+        let task_dirs = ["acme/a", "acme/b", "acme/c"]
+            .iter()
+            .map(|name| {
+                let dir = root.join(name.replace('/', "-"));
+                write_sleeping_oracle_task(&dir, name, "0.30");
+                (name.to_string(), dir)
+            })
+            .collect::<Vec<_>>();
 
-        let tasks = [
-            TaskRef {
-                name: "acme/fast".to_owned(),
-                path: fast,
-            },
-            TaskRef {
-                name: "acme/slow".to_owned(),
-                path: slow,
-            },
-        ];
+        let tasks = task_dirs
+            .iter()
+            .map(|(name, dir)| TaskRef {
+                name: name.clone(),
+                path: dir.clone(),
+            })
+            .collect::<Vec<_>>();
         let plans = tasks
             .iter()
             .map(|task| TrialPlan { task, attempt: 1 })
@@ -2490,36 +2491,34 @@ mod tests {
             ..RunOptions::default()
         };
 
+        let wall_started = Instant::now();
         let outcomes = run_trial_plans(
             &plans,
             &jobs.join("run"),
             "duration-test",
             &options,
             AgentKind::Oracle,
-            2,
+            tasks.len(),
         )
         .expect("trial outcomes");
-        let fast_elapsed = outcomes
-            .iter()
-            .find(|outcome| outcome.task_name == "acme/fast")
-            .expect("fast outcome")
-            .elapsed;
-        let slow_elapsed = outcomes
-            .iter()
-            .find(|outcome| outcome.task_name == "acme/slow")
-            .expect("slow outcome")
-            .elapsed;
+        let wall_clock = wall_started.elapsed();
 
+        let total: Duration = outcomes.iter().map(|outcome| outcome.elapsed).sum();
+        let sleep = Duration::from_secs_f64(sleep_secs);
+
+        // The per-task durations tile the timeline, so they sum to the execution
+        // wall-clock rather than to three independent sleeps.
         assert!(
-            slow_elapsed > fast_elapsed + Duration::from_millis(100),
-            "fast={fast_elapsed:?} slow={slow_elapsed:?}"
+            total <= wall_clock + Duration::from_millis(50),
+            "per-task durations should sum to wall-clock: total={total:?} wall={wall_clock:?}"
         );
-
-        // The fast trial must report its own short execution span, never the
-        // wall-clock spent waiting alongside the slow trial.
         assert!(
-            fast_elapsed >= Duration::from_millis(40) && fast_elapsed < Duration::from_millis(250),
-            "fast trial duration should reflect its own work, got {fast_elapsed:?}"
+            total < sleep * 2,
+            "per-task durations must not be additive: total={total:?} sleep={sleep:?}"
+        );
+        assert!(
+            total >= sleep,
+            "per-task durations should cover the run: total={total:?} sleep={sleep:?}"
         );
 
         let _ = fs::remove_dir_all(root);

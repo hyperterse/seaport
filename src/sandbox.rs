@@ -44,10 +44,6 @@ fn log_mode() -> LogMode {
 pub(crate) struct ScriptOutputs {
     pub(crate) agent: AgentStep,
     pub(crate) verifier: Output,
-    /// Active execution span: from when the agent script starts running to when
-    /// the verifier produces results. Excludes image build, workspace seeding,
-    /// and any time spent waiting on other concurrent trials.
-    pub(crate) execution: Duration,
 }
 
 pub(crate) struct TaskScriptRequest<'a> {
@@ -333,7 +329,6 @@ fn run_scripts_in_docker(
         prepare_task_file_workspace(runtime.task_path, runtime.app_dir)?;
         prepare_cobol_copybook_aliases(runtime.app_dir)?;
 
-        let execution_started = Instant::now();
         let agent = match agent_kind {
             SandboxAgent::Oracle => AgentStep::from_output(
                 "solution/solve.sh",
@@ -385,13 +380,8 @@ fn run_scripts_in_docker(
             env: &envs.verifier,
             timeout: environment.verifier_timeout,
         })?;
-        let execution = execution_started.elapsed();
 
-        Ok(ScriptOutputs {
-            agent,
-            verifier,
-            execution,
-        })
+        Ok(ScriptOutputs { agent, verifier })
     })();
 
     if image.remove_after_run {
@@ -2234,7 +2224,6 @@ fn run_scripts_locally(
     environment: &TaskEnvironment,
 ) -> Result<ScriptOutputs, CliError> {
     let verifier = runtime.task_path.join("tests").join("test.sh");
-    let execution_started = Instant::now();
     let agent = match agent_kind {
         SandboxAgent::Oracle => AgentStep::from_output(
             "solution/solve.sh",
@@ -2273,13 +2262,8 @@ fn run_scripts_locally(
         env: &envs.verifier,
         timeout: environment.verifier_timeout,
     })?;
-    let execution = execution_started.elapsed();
 
-    Ok(ScriptOutputs {
-        agent,
-        verifier,
-        execution,
-    })
+    Ok(ScriptOutputs { agent, verifier })
 }
 
 fn run_shell_locally(
