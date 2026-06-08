@@ -36,6 +36,7 @@ const EXIT_TASK_FAILED: i32 = 4;
 const PROGRESS_BAR_WIDTH: usize = 30;
 const TASK_LABEL_WIDTH: usize = 56;
 const FAILURE_TAIL_LINES: usize = 8;
+const VERSION_TEXT: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("SEAPORT_VERSION"));
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -48,6 +49,10 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
     match args.first().map(String::as_str) {
         None | Some("-h") | Some("--help") => {
             print_help();
+            Ok(())
+        }
+        Some("-v") | Some("-V") | Some("--version") => {
+            print_version();
             Ok(())
         }
         Some("run") => run_eval(&args[1..]),
@@ -159,11 +164,9 @@ fn run_target(
 
     print_target_ready(target, &job_dir, plans.len(), concurrency, options, agent)?;
     print_resolution_progress(options, resolution_progress)?;
-    let preflight_elapsed = preflight_target(target, options)?;
+    preflight_target(target, options)?;
 
-    let execution_started = Instant::now();
     let outcomes = run_trial_plans(&plans, &job_dir, &run_id, options, agent, concurrency)?;
-    let execution_elapsed = execution_started.elapsed();
 
     fs::write(
         job_dir.join("config.json"),
@@ -180,8 +183,6 @@ fn run_target(
         total_count: outcomes.len(),
         reward: aggregate_reward(&outcomes),
         job_dir: &job_dir,
-        preflight_elapsed,
-        execution_elapsed,
         total_elapsed: run_started.elapsed(),
         options,
     })?;
@@ -304,11 +305,9 @@ fn print_resolution_progress(
     Ok(())
 }
 
-fn preflight_target(target: &RunTarget, options: &RunOptions) -> Result<Duration, CliError> {
-    let started = Instant::now();
-
+fn preflight_target(target: &RunTarget, options: &RunOptions) -> Result<(), CliError> {
     if target.tasks.is_empty() || options.backend == SandboxBackend::UnsafeLocal {
-        return Ok(started.elapsed());
+        return Ok(());
     }
 
     ensure_sandbox_backend_available(options.backend)?;
@@ -317,7 +316,7 @@ fn preflight_target(target: &RunTarget, options: &RunOptions) -> Result<Duration
     let concurrency = phase.concurrency(options.concurrency, target.tasks.len());
 
     print_phase_header(phase, target.tasks.len(), concurrency, options)?;
-    print_phase_progress(phase, 0, target.tasks.len(), started.elapsed(), options)?;
+    print_phase_progress(phase, 0, target.tasks.len(), options)?;
 
     let work = Mutex::new(scheduled_task_indices(&target.tasks));
     let (sender, receiver) = mpsc::channel();
@@ -363,16 +362,10 @@ fn preflight_target(target: &RunTarget, options: &RunOptions) -> Result<Duration
             Err(error) => return Err(error),
         }
 
-        print_phase_progress(
-            phase,
-            completed,
-            target.tasks.len(),
-            started.elapsed(),
-            options,
-        )?;
+        print_phase_progress(phase, completed, target.tasks.len(), options)?;
     }
 
-    Ok(started.elapsed())
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -412,6 +405,11 @@ struct TrialPlan<'a> {
     attempt: usize,
 }
 
+struct TrialEvent {
+    index: usize,
+    result: Result<TrialOutcome, CliError>,
+}
+
 fn trial_plans<'a>(target: &'a RunTarget, options: &RunOptions) -> Vec<TrialPlan<'a>> {
     let mut plans = Vec::with_capacity(target.tasks.len() * options.attempts);
 
@@ -433,15 +431,16 @@ fn run_trial_plans(
     concurrency: usize,
 ) -> Result<Vec<TrialOutcome>, CliError> {
     let phase = RunPhase::Execution;
-    let started = Instant::now();
 
     print_phase_header(phase, plans.len(), concurrency, options)?;
-    print_phase_progress(phase, 0, plans.len(), started.elapsed(), options)?;
+    print_phase_progress(phase, 0, plans.len(), options)?;
 
     let work = Mutex::new(scheduled_trial_indices(plans));
     let (sender, receiver) = mpsc::channel();
+    let mut outcomes = (0..plans.len()).map(|_| None).collect::<Vec<_>>();
+    let mut completed = 0;
 
-    thread::scope(|scope| {
+    thread::scope(|scope| -> Result<(), CliError> {
         for _ in 0..concurrency {
             let sender = sender.clone();
             let work = &work;
@@ -455,29 +454,29 @@ fn run_trial_plans(
                     break;
                 };
                 let plan = plans[index];
+
                 let result = run_trial(plan.task, plan.attempt, job_dir, run_id, options, agent);
 
-                if sender.send((index, result)).is_err() {
+                if sender.send(TrialEvent { index, result }).is_err() {
                     break;
                 }
             });
         }
-    });
 
-    drop(sender);
+        drop(sender);
 
-    let mut outcomes = (0..plans.len()).map(|_| None).collect::<Vec<_>>();
-    let mut completed = 0;
+        for TrialEvent { index, result } in receiver {
+            let outcome = result?;
 
-    for (index, result) in receiver {
-        let outcome = result?;
+            completed += 1;
+            print_trial_finish(&outcome, options)?;
+            print_phase_progress(phase, completed, plans.len(), options)?;
 
-        completed += 1;
-        print_trial_finish(&outcome, options)?;
-        print_phase_progress(phase, completed, plans.len(), started.elapsed(), options)?;
+            outcomes[index] = Some(outcome);
+        }
 
-        outcomes[index] = Some(outcome);
-    }
+        Ok(())
+    })?;
 
     outcomes
         .into_iter()
@@ -592,7 +591,6 @@ fn run_trial(
     agent: AgentKind,
 ) -> Result<TrialOutcome, CliError> {
     let task_name = &task.name;
-    let started = Instant::now();
     let trial_name = trial_dir_name(task_name, attempt, options.attempts);
     let trial_run_id = format!("{run_id}-{trial_name}");
     let trial_dir = job_dir.join(&trial_name);
@@ -619,6 +617,7 @@ fn run_trial(
 
     let sandbox_agent = agent.sandbox_agent(options)?;
     let phase_envs = options.phase_envs();
+    let trial_started = Instant::now();
     let execution: Result<(ScriptOutputs, String), CliError> = (|| {
         let outputs = run_task_scripts(TaskScriptRequest {
             task_label: task_name,
@@ -635,33 +634,45 @@ fn run_trial(
         Ok((outputs, reward))
     })();
 
-    let mut outcome = match execution {
-        Ok((outputs, reward)) => record_completed_trial(TrialRecord {
-            task_name,
-            attempt,
-            agent,
-            options,
-            trial_dir: &trial_dir,
-            agent_dir: &agent_dir,
-            verifier_dir: &verifier_dir,
-            outputs,
-            reward,
-        })?,
-        Err(error) if error.is_task_failure() => record_failed_trial(TrialFailure {
-            task_name,
-            attempt,
-            agent,
-            options,
-            trial_dir: &trial_dir,
-            agent_dir: &agent_dir,
-            verifier_dir: &verifier_dir,
-            logs_dir: &logs_dir,
-            message: error.to_string(),
-        })?,
+    let outcome = match execution {
+        Ok((outputs, reward)) => {
+            // Report the task's own execution span (agent + verifier), not the
+            // wall-clock since the trial was dequeued, so concurrent trials each
+            // show how long they actually ran rather than additive waiting time.
+            let elapsed = outputs.execution;
+            let mut outcome = record_completed_trial(TrialRecord {
+                task_name,
+                attempt,
+                agent,
+                options,
+                trial_dir: &trial_dir,
+                agent_dir: &agent_dir,
+                verifier_dir: &verifier_dir,
+                outputs,
+                reward,
+            })?;
+            outcome.elapsed = elapsed;
+            outcome
+        }
+        Err(error) if error.is_task_failure() => {
+            // No execution span is available when the trial fails before results
+            // are produced; fall back to the time spent inside this trial.
+            let mut outcome = record_failed_trial(TrialFailure {
+                task_name,
+                attempt,
+                agent,
+                options,
+                trial_dir: &trial_dir,
+                agent_dir: &agent_dir,
+                verifier_dir: &verifier_dir,
+                logs_dir: &logs_dir,
+                message: error.to_string(),
+            })?;
+            outcome.elapsed = trial_started.elapsed();
+            outcome
+        }
         Err(error) => return Err(error),
     };
-
-    outcome.elapsed = started.elapsed();
 
     if let Err(error) = fs::remove_dir_all(&workspace) {
         eprintln!(
@@ -788,7 +799,6 @@ fn print_phase_progress(
     phase: RunPhase,
     completed: usize,
     total: usize,
-    elapsed: Duration,
     options: &RunOptions,
 ) -> Result<(), CliError> {
     if options.log_mode == LogMode::Quiet {
@@ -801,12 +811,10 @@ fn print_phase_progress(
     };
 
     let line = format!(
-        "{:<13} {}  {:>3}/{:<3} {}",
+        "{:<13} {}  {:>7}",
         phase.title(),
         progress_bar(completed, total, PROGRESS_BAR_WIDTH, color),
-        completed,
-        total,
-        dim(&format_duration(elapsed))
+        format!("{completed}/{total}")
     );
 
     if live_progress_enabled(options) {
@@ -891,8 +899,6 @@ struct RunSummary<'a> {
     total_count: usize,
     reward: String,
     job_dir: &'a Path,
-    preflight_elapsed: Duration,
-    execution_elapsed: Duration,
     total_elapsed: Duration,
     options: &'a RunOptions,
 }
@@ -900,7 +906,7 @@ struct RunSummary<'a> {
 fn print_run_summary(summary: RunSummary<'_>) -> Result<(), CliError> {
     if summary.options.log_mode == LogMode::Quiet {
         println!(
-            "{} {}/{} reward {} elapsed {}",
+            "{} {}/{} reward {} total {}",
             if summary.passed { "passed" } else { "failed" },
             summary.passed_count,
             summary.total_count,
@@ -924,19 +930,13 @@ fn print_run_summary(summary: RunSummary<'_>) -> Result<(), CliError> {
     println!();
     println!("{}", bold("Summary"));
     println!(
-        "  {} {} {}/{}       reward {}       elapsed {}",
+        "  {} {} {}/{}       reward {}       total time {}",
         status,
         label,
         summary.passed_count,
         summary.total_count,
         green(&summary.reward),
         bold(&format_duration(summary.total_elapsed))
-    );
-    println!(
-        "  {} preflight {}       execution {}",
-        dim("phases:"),
-        dim(&format_duration(summary.preflight_elapsed)),
-        dim(&format_duration(summary.execution_elapsed))
     );
     println!("  {} {}", dim("job_dir:"), summary.job_dir.display());
     io::stdout().flush()?;
@@ -1709,8 +1709,16 @@ Commands:
   init --task <name>  Create a task skeleton
   view [jobs-dir]     View job results
 
+Options:
+  -h, --help          Show this help
+  -v, --version       Show the version
+
 Run `seaport <command> --help` for command-specific help."
     );
+}
+
+fn print_version() {
+    println!("{VERSION_TEXT}");
 }
 
 fn print_run_help() {
@@ -2453,6 +2461,71 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_trial_durations_are_recorded_per_task() {
+        let root = temp_test_dir("trial-durations");
+        let fast = root.join("fast");
+        let slow = root.join("slow");
+        let jobs = root.join("jobs");
+
+        write_sleeping_oracle_task(&fast, "acme/fast", "0.05");
+        write_sleeping_oracle_task(&slow, "acme/slow", "0.30");
+
+        let tasks = [
+            TaskRef {
+                name: "acme/fast".to_owned(),
+                path: fast,
+            },
+            TaskRef {
+                name: "acme/slow".to_owned(),
+                path: slow,
+            },
+        ];
+        let plans = tasks
+            .iter()
+            .map(|task| TrialPlan { task, attempt: 1 })
+            .collect::<Vec<_>>();
+        let options = RunOptions {
+            backend: SandboxBackend::UnsafeLocal,
+            log_mode: LogMode::Quiet,
+            ..RunOptions::default()
+        };
+
+        let outcomes = run_trial_plans(
+            &plans,
+            &jobs.join("run"),
+            "duration-test",
+            &options,
+            AgentKind::Oracle,
+            2,
+        )
+        .expect("trial outcomes");
+        let fast_elapsed = outcomes
+            .iter()
+            .find(|outcome| outcome.task_name == "acme/fast")
+            .expect("fast outcome")
+            .elapsed;
+        let slow_elapsed = outcomes
+            .iter()
+            .find(|outcome| outcome.task_name == "acme/slow")
+            .expect("slow outcome")
+            .elapsed;
+
+        assert!(
+            slow_elapsed > fast_elapsed + Duration::from_millis(100),
+            "fast={fast_elapsed:?} slow={slow_elapsed:?}"
+        );
+
+        // The fast trial must report its own short execution span, never the
+        // wall-clock spent waiting alongside the slow trial.
+        assert!(
+            fast_elapsed >= Duration::from_millis(40) && fast_elapsed < Duration::from_millis(250),
+            "fast trial duration should reflect its own work, got {fast_elapsed:?}"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn oracle_run_does_not_require_model() {
         let args = strings(["run", "-p", "missing", "-a", "oracle"]);
 
@@ -2848,6 +2921,20 @@ mod tests {
 
         make_executable(&solve).expect("solve executable");
         make_executable(&test).expect("test executable");
+    }
+
+    fn write_sleeping_oracle_task(root: &Path, name: &str, seconds: &str) {
+        write_oracle_task(root, name);
+
+        let solve = root.join("solution").join("solve.sh");
+        fs::write(
+            &solve,
+            format!(
+                "#!/bin/bash\nset -euo pipefail\nsleep {seconds}\nprintf 'ok\\n' > \"$APP_DIR/output.txt\"\n"
+            ),
+        )
+        .expect("sleeping solve");
+        make_executable(&solve).expect("solve executable");
     }
 
     fn write_failing_oracle_task(root: &Path, name: &str) {
