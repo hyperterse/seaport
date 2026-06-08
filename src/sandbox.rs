@@ -2047,7 +2047,6 @@ fn docker_api_image_json_path(reference: &str) -> String {
 
 struct DockerApiResponse {
     status: u16,
-    body: Vec<u8>,
 }
 
 #[cfg(unix)]
@@ -2120,10 +2119,7 @@ fn parse_docker_api_response(response: &[u8]) -> io::Result<DockerApiResponse> {
         .parse::<u16>()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
-    Ok(DockerApiResponse {
-        status,
-        body: response[header_end + 4..].to_vec(),
-    })
+    Ok(DockerApiResponse { status })
 }
 
 fn run_scripts_locally(
@@ -2639,10 +2635,9 @@ FROM python:3.12-slim
     fn parse_docker_api_response_reads_status_and_body() {
         let response =
             parse_docker_api_response(b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\n\r\n{}")
-                .expect("response");
+        .expect("response");
 
         assert_eq!(response.status, 404);
-        assert_eq!(response.body, b"{}");
     }
 
     #[test]
