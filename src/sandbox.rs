@@ -19,8 +19,10 @@ const DOCKER_BUILD_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DOCKER_PULL_ATTEMPTS: usize = 3;
 const DOCKER_PULL_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DOCKER_BUILD_TIMEOUT: Duration = Duration::from_secs(600);
+const DOCKER_BUILDER_TIMEOUT: Duration = Duration::from_secs(60);
 const DOCKER_WORKSPACE_TIMEOUT: Duration = Duration::from_secs(120);
 const DOCKER_IMAGE_CACHE_NAMESPACE: &str = "seaport-env-cache-v1";
+const DEFAULT_BUILDKIT_BUILDER: &str = "seaport-builder";
 const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV_PRIME: u64 = 0x100000001b3;
 
@@ -1401,6 +1403,8 @@ fn run_docker_build_with_retries(
     environment: &TaskEnvironment,
     platform: Option<&str>,
 ) -> Result<TimedOutput, CliError> {
+    ensure_seaport_buildkit_builder(task_label)?;
+
     let mut attempt = 1;
 
     loop {
@@ -1524,9 +1528,13 @@ fn docker_build_command(
 ) -> Command {
     let mut command = Command::new("docker");
     command.args([
+        "buildx",
         "build",
+        "--builder",
+        &buildkit_builder_name(),
         "--progress=plain",
         "--pull=false",
+        "--load",
         "--network",
         environment.build_network.as_docker_build_arg(),
     ]);
@@ -1537,6 +1545,70 @@ fn docker_build_command(
 
     command.args(["-t", tag]).arg(environment_dir);
     command
+}
+
+fn ensure_seaport_buildkit_builder(task_label: &str) -> Result<(), CliError> {
+    let builder = buildkit_builder_name();
+
+    if docker_buildx_builder_exists(&builder) {
+        return Ok(());
+    }
+
+    println!("[{task_label} | builder] creating BuildKit builder: {builder}");
+    let timed_output = run_command_with_timeout(
+        docker_buildx_create_command(&builder),
+        DOCKER_BUILDER_TIMEOUT,
+        Some(CommandLog::new(task_label, "builder")),
+    )?;
+
+    if timed_output.timed_out {
+        return Err(CliError::task_failed(format!(
+            "docker buildx builder creation timed out after {:.3}s for {builder}",
+            DOCKER_BUILDER_TIMEOUT.as_secs_f64()
+        )));
+    }
+
+    if timed_output.output.status.success() || docker_buildx_builder_exists(&builder) {
+        return Ok(());
+    }
+
+    Err(CliError::task_failed(format!(
+        "docker buildx builder creation failed for {builder} (status: {})\nstdout:\n{}\nstderr:\n{}",
+        timed_output.output.status,
+        String::from_utf8_lossy(&timed_output.output.stdout),
+        String::from_utf8_lossy(&timed_output.output.stderr)
+    )))
+}
+
+fn docker_buildx_builder_exists(builder: &str) -> bool {
+    Command::new("docker")
+        .args(["buildx", "inspect", builder])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn docker_buildx_create_command(builder: &str) -> Command {
+    let mut command = Command::new("docker");
+    command.args([
+        "buildx",
+        "create",
+        "--name",
+        builder,
+        "--driver",
+        "docker-container",
+        "--driver-opt",
+        "network=host",
+    ]);
+    command
+}
+
+fn buildkit_builder_name() -> String {
+    env::var("SEAPORT_BUILDKIT_BUILDER")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_BUILDKIT_BUILDER.to_owned())
 }
 
 fn docker_pull_command(image: &str, platform: Option<&str>) -> Command {
@@ -2305,13 +2377,39 @@ mod tests {
         );
         let args = command_args(command);
 
+        assert_eq!(args.first().map(String::as_str), Some("buildx"));
+        assert_eq!(args.get(1).map(String::as_str), Some("build"));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--builder", "seaport-builder"]));
         assert!(args
             .windows(2)
             .any(|window| window == ["--progress=plain", "--pull=false"]));
+        assert!(args.iter().any(|arg| arg == "--load"));
         assert!(args
             .windows(2)
             .any(|window| window == ["--network", "default"]));
         assert!(!args.iter().any(|arg| arg == "-q"));
+    }
+
+    #[test]
+    fn docker_buildx_create_command_configures_persistent_builder() {
+        let command = docker_buildx_create_command("seaport-builder");
+        let args = command_args(command);
+
+        assert_eq!(
+            args,
+            [
+                "buildx",
+                "create",
+                "--name",
+                "seaport-builder",
+                "--driver",
+                "docker-container",
+                "--driver-opt",
+                "network=host"
+            ]
+        );
     }
 
     #[test]
