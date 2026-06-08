@@ -1153,7 +1153,10 @@ fn docker_run_command(run: DockerRunCommand<'_>) -> Command {
             "--workdir",
             "/app",
             "--tmpfs",
-            &format!("/tmp:rw,nosuid,nodev,size={}", run.resources.tmpfs_size),
+            &format!(
+                "/tmp:rw,exec,nosuid,nodev,size={}",
+                run.resources.tmpfs_size
+            ),
             "--tmpfs",
             "/run:rw,nosuid,nodev,size=16m",
             "--env",
@@ -1670,7 +1673,7 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "--user"));
         assert!(args
             .windows(2)
-            .any(|window| window == ["--tmpfs", "/tmp:rw,nosuid,nodev,size=256m"]));
+            .any(|window| window == ["--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=256m"]));
         assert!(args.windows(2).any(|window| window
             == [
                 "--env",
