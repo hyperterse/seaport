@@ -15,7 +15,9 @@ mod registry;
 mod sandbox;
 mod target;
 
-use logging::LogMode;
+use logging::{
+    begin_progress_buffer, push_progress_line, take_progress_buffer, LogMode, ProgressLine,
+};
 use registry::{
     resolve_git_task_source, resolve_local_registry_dataset, resolve_local_registry_task,
     resolve_remote_registry_dataset, resolve_remote_registry_task,
@@ -83,9 +85,18 @@ fn run_eval(args: &[String]) -> Result<(), CliError> {
         ));
     }
 
+    begin_progress_buffer();
     print_run_start(&options, agent)?;
-    let target = resolve_run_target(&options)?;
-    run_target(&target, &options, agent)
+    let target = match resolve_run_target(&options) {
+        Ok(target) => target,
+        Err(error) => {
+            print_resolution_progress(&options, take_progress_buffer())?;
+            return Err(error);
+        }
+    };
+    let resolution_progress = take_progress_buffer();
+
+    run_target(&target, &options, agent, resolution_progress)
 }
 
 fn resolve_run_target(options: &RunOptions) -> Result<RunTarget, CliError> {
@@ -129,7 +140,12 @@ fn resolve_run_target(options: &RunOptions) -> Result<RunTarget, CliError> {
     RunTarget::from_registry_dataset(resolved, &options.selection)
 }
 
-fn run_target(target: &RunTarget, options: &RunOptions, agent: AgentKind) -> Result<(), CliError> {
+fn run_target(
+    target: &RunTarget,
+    options: &RunOptions,
+    agent: AgentKind,
+    resolution_progress: Vec<ProgressLine>,
+) -> Result<(), CliError> {
     let run_started = Instant::now();
     let run_id = timestamp_id()?;
     let job_root = options
@@ -142,6 +158,7 @@ fn run_target(target: &RunTarget, options: &RunOptions, agent: AgentKind) -> Res
     let concurrency = RunPhase::Execution.concurrency(options.concurrency, plans.len());
 
     print_target_ready(target, &job_dir, plans.len(), concurrency, options, agent)?;
+    print_resolution_progress(options, resolution_progress)?;
     let preflight_elapsed = preflight_target(target, options)?;
 
     let execution_started = Instant::now();
@@ -185,16 +202,26 @@ fn print_run_start(options: &RunOptions, agent: AgentKind) -> Result<(), CliErro
         return Ok(());
     }
 
-    println!(
-        "{} {} · {} · {}",
-        bold("Seaport"),
-        run_source_label(options),
-        agent.as_str(options),
-        options.backend.as_str()
-    );
+    let label = run_start_label(options, agent);
+
+    if push_progress_line(ProgressLine::Banner(label.clone())) {
+        return Ok(());
+    }
+
+    println!("{}", bold(&label));
     io::stdout().flush()?;
 
     Ok(())
+}
+
+fn run_start_label(options: &RunOptions, agent: AgentKind) -> String {
+    format!(
+        "{} {} · {} · {}",
+        "Seaport",
+        run_source_label(options),
+        agent.as_str(options),
+        options.backend.as_str()
+    )
 }
 
 fn run_source_label(options: &RunOptions) -> String {
@@ -244,7 +271,34 @@ fn print_progress(options: &RunOptions, message: &str) -> Result<(), CliError> {
         return Ok(());
     }
 
+    if push_progress_line(ProgressLine::Step(message.to_owned())) {
+        return Ok(());
+    }
+
     println!("  {} {message}", blue("->"));
+    io::stdout().flush()?;
+
+    Ok(())
+}
+
+fn print_resolution_progress(
+    options: &RunOptions,
+    lines: Vec<ProgressLine>,
+) -> Result<(), CliError> {
+    if options.log_mode == LogMode::Quiet || lines.is_empty() {
+        return Ok(());
+    }
+
+    println!();
+    println!("{}", bold("Progress"));
+
+    for line in lines {
+        match line {
+            ProgressLine::Banner(message) => println!("  {}", bold(&message)),
+            ProgressLine::Step(message) => println!("  {} {message}", blue("->")),
+        }
+    }
+
     io::stdout().flush()?;
 
     Ok(())

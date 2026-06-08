@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::logging::LogMode;
+use crate::logging::{push_progress_line, LogMode, ProgressLine};
 use crate::CliError;
 
 const DEFAULT_JSON_REGISTRY_URL: &str =
@@ -976,6 +976,10 @@ fn command_failed(action: &str, output: &std::process::Output) -> CliError {
 
 fn progress(message: &str) -> Result<(), CliError> {
     if !log_mode().prints_events() {
+        return Ok(());
+    }
+
+    if push_progress_line(ProgressLine::Step(message.to_owned())) {
         return Ok(());
     }
 
