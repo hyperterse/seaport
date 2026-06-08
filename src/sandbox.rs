@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 use crate::CliError;
 
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
-const CONTAINER_USER: &str = "1000:1000";
 const CONTAINER_MEMORY: &str = "1g";
 const CONTAINER_CPUS: &str = "1.0";
 const CONTAINER_PIDS_LIMIT: &str = "256";
@@ -189,6 +188,70 @@ fn prepare_container_writable_tree(_path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
+fn prepare_cobol_copybook_aliases(app_dir: &Path) -> Result<(), CliError> {
+    let mut copybooks = Vec::new();
+    collect_copybooks(app_dir, &mut copybooks)?;
+
+    for copybook in copybooks {
+        create_copybook_aliases(&copybook)?;
+    }
+
+    Ok(())
+}
+
+fn collect_copybooks(path: &Path, copybooks: &mut Vec<PathBuf>) -> Result<(), CliError> {
+    if !path.is_dir() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let file_type = entry.file_type()?;
+
+        if file_type.is_dir() {
+            collect_copybooks(&entry_path, copybooks)?;
+        } else if file_type.is_file()
+            && entry_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("cpy"))
+        {
+            copybooks.push(entry_path);
+        }
+    }
+
+    Ok(())
+}
+
+fn create_copybook_aliases(copybook: &Path) -> Result<(), CliError> {
+    let parent = copybook
+        .parent()
+        .ok_or_else(|| CliError::usage("copybook path has no parent directory"))?;
+    let stem = copybook
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| CliError::usage("copybook path has no valid UTF-8 file stem"))?;
+    let stems = [
+        stem.to_owned(),
+        stem.to_ascii_uppercase(),
+        stem.to_ascii_lowercase(),
+    ];
+    let extensions = ["", ".cpy", ".CPY", ".cob", ".COB"];
+
+    for stem in stems {
+        for extension in extensions {
+            let alias = parent.join(format!("{stem}{extension}"));
+
+            if alias != copybook && !alias.exists() {
+                fs::copy(copybook, alias)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn run_scripts_in_docker(
     runtime: TaskRuntime<'_>,
     agent_kind: &SandboxAgent,
@@ -212,6 +275,7 @@ fn run_scripts_in_docker(
             environment.platform.as_deref(),
         )?;
         prepare_task_file_workspace(runtime.task_path, runtime.app_dir)?;
+        prepare_cobol_copybook_aliases(runtime.app_dir)?;
 
         let agent = match agent_kind {
             SandboxAgent::Oracle => AgentStep::from_output(
@@ -907,12 +971,10 @@ fn docker_run_command(run: DockerRunCommand<'_>) -> Command {
             "--cpus",
             CONTAINER_CPUS,
             "--read-only",
-            "--user",
-            CONTAINER_USER,
             "--workdir",
             "/app",
             "--tmpfs",
-            "/tmp:rw,noexec,nosuid,nodev,size=64m",
+            "/tmp:rw,nosuid,nodev,size=256m",
             "--tmpfs",
             "/run:rw,nosuid,nodev,size=16m",
             "--env",
@@ -923,6 +985,8 @@ fn docker_run_command(run: DockerRunCommand<'_>) -> Command {
             "SEAPORT_TASK_DIR=/seaport/task",
             "--env",
             "SEAPORT_INSTRUCTION_PATH=/seaport/task/instruction.md",
+            "--env",
+            "COBCPY=/app/copybooks:/app/COPYBOOKS:/app/src/copybooks:/app/src/COPYBOOKS",
         ])
         .args(
             run.extra_env
@@ -1423,9 +1487,15 @@ mod tests {
             .any(|window| window == ["--memory-swap", "1g"]));
         assert!(args.windows(2).any(|window| window == ["--cpus", "1.0"]));
         assert!(args.iter().any(|arg| arg == "--read-only"));
+        assert!(!args.iter().any(|arg| arg == "--user"));
         assert!(args
             .windows(2)
-            .any(|window| window == ["--user", "1000:1000"]));
+            .any(|window| window == ["--tmpfs", "/tmp:rw,nosuid,nodev,size=256m"]));
+        assert!(args.windows(2).any(|window| window
+            == [
+                "--env",
+                "COBCPY=/app/copybooks:/app/COPYBOOKS:/app/src/copybooks:/app/src/COPYBOOKS"
+            ]));
         assert!(args
             .iter()
             .any(|arg| arg == "type=bind,source=/tmp/task,target=/seaport/task,readonly"));
@@ -1508,6 +1578,31 @@ mod tests {
         assert!(!app.join("task_file/stale.txt").exists());
 
         let _ = fs::remove_dir_all(task);
+        let _ = fs::remove_dir_all(app);
+    }
+
+    #[test]
+    fn prepare_cobol_copybook_aliases_materializes_common_names() {
+        let app = temp_task_dir("copybook-aliases");
+        let copybook_dir = app.join("copybooks");
+        fs::create_dir_all(&copybook_dir).expect("copybook dir");
+        fs::write(copybook_dir.join("RECLAIM.cpy"), "01 RECLAIM-REC.\n").expect("copybook");
+
+        prepare_cobol_copybook_aliases(&app).expect("aliases");
+
+        assert_eq!(
+            fs::read_to_string(copybook_dir.join("RECLAIM")).expect("extensionless"),
+            "01 RECLAIM-REC.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(copybook_dir.join("RECLAIM.COB")).expect("cob alias"),
+            "01 RECLAIM-REC.\n"
+        );
+        assert_eq!(
+            fs::read_to_string(copybook_dir.join("reclaim.CPY")).expect("case alias"),
+            "01 RECLAIM-REC.\n"
+        );
+
         let _ = fs::remove_dir_all(app);
     }
 
