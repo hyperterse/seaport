@@ -54,6 +54,24 @@ Confirm the CLI works:
 seaport --help
 ```
 
+## Upgrade
+
+Update an installed CLI to the latest release:
+
+```sh
+seaport upgrade
+```
+
+Seaport also checks for new releases in the background and prints a one-line
+notice when an upgrade is available. The check is throttled to once per day and
+runs only on an interactive terminal. To opt out, set `SEAPORT_NO_UPDATE_CHECK`.
+
+```sh
+seaport upgrade --check          # report whether a newer version exists
+seaport upgrade --force          # reinstall the latest release
+seaport upgrade --version 0.1.0  # install a specific version
+```
+
 ## Quick Start
 
 Create a task skeleton:

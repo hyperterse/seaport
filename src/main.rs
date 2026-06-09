@@ -14,6 +14,7 @@ mod logging;
 mod registry;
 mod sandbox;
 mod target;
+mod upgrade;
 
 use logging::{
     begin_progress_buffer, push_progress_line, take_progress_buffer, LogMode, ProgressLine,
@@ -37,6 +38,7 @@ const PROGRESS_BAR_WIDTH: usize = 30;
 const TASK_LABEL_WIDTH: usize = 56;
 const FAILURE_TAIL_LINES: usize = 8;
 const VERSION_TEXT: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("SEAPORT_VERSION"));
+const CURRENT_VERSION: &str = env!("SEAPORT_VERSION");
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -46,7 +48,16 @@ fn main() {
 }
 
 fn run(args: Vec<String>) -> Result<(), CliError> {
-    match args.first().map(String::as_str) {
+    let command = args.first().map(String::as_str);
+
+    // `__update-check` is the hidden background refresh spawned by the notice
+    // itself, so it must never trigger another notice/respawn. `upgrade` skips
+    // the notice because it already reports version status.
+    if !matches!(command, Some("__update-check") | Some("upgrade")) {
+        upgrade::notify_if_outdated(CURRENT_VERSION);
+    }
+
+    match command {
         None | Some("-h") | Some("--help") => {
             print_help();
             Ok(())
@@ -59,6 +70,11 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
         Some("dataset") | Some("datasets") => dataset(&args[1..]),
         Some("init") => init(&args[1..]),
         Some("view") => view(&args[1..]),
+        Some("upgrade") => upgrade::run(&args[1..], CURRENT_VERSION),
+        Some("__update-check") => {
+            upgrade::refresh_cache();
+            Ok(())
+        }
         Some(command) => Err(CliError::usage(format!("unknown command `{command}`"))),
     }
 }
@@ -1705,6 +1721,7 @@ Commands:
   datasets list       Alias for `dataset list`
   init --task <name>  Create a task skeleton
   view [jobs-dir]     View job results
+  upgrade             Update Seaport to the latest release
 
 Options:
   -h, --help          Show this help

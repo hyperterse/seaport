@@ -112,8 +112,14 @@ binary_name_for_target() {
 latest_version() {
     local api_url
     local latest_tag
+    local repo
 
-    api_url="${BASE_URL%/releases}/releases/latest"
+    # Derive "owner/repo" from BASE_URL so we can query the GitHub API, which
+    # returns JSON containing "tag_name". The web /releases/latest page is HTML
+    # and has no such field.
+    repo="${BASE_URL#https://github.com/}"
+    repo="${repo%/releases}"
+    api_url="https://api.github.com/repos/${repo}/releases/latest"
 
     if command_exists curl; then
         latest_tag="$(curl -fsSL "$api_url" | grep '"tag_name":' | sed -E 's/.*"tag_name": "([^"]+)".*/\1/' | head -1)"
@@ -282,8 +288,14 @@ install_binary() {
     local install_path="$INSTALL_DIR/$binary_name"
 
     mkdir -p "$INSTALL_DIR"
-    cp "$binary_path" "$install_path"
-    chmod +x "$install_path"
+
+    # Stage into a temp file in the same directory, then atomically rename over
+    # the target. A direct overwrite would fail with "text file busy" on Linux
+    # when upgrading while the running binary still holds the destination path.
+    local staged="${install_path}.new.$$"
+    cp "$binary_path" "$staged"
+    chmod +x "$staged"
+    mv -f "$staged" "$install_path"
 
     success "Installed $binary_name to $install_path"
 
