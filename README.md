@@ -27,13 +27,13 @@ with Markdown instructions, shell scripts, and a small TOML config.
 Install the latest released CLI:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/hyperterse/seaport/main/install.sh | bash
+curl -fsSL https://seaport.run/install | bash
 ```
 
 Install a specific version:
 
 ```sh
-VERSION=0.1.0 curl -fsSL https://raw.githubusercontent.com/hyperterse/seaport/main/install.sh | bash
+VERSION=0.1.0 curl -fsSL https://seaport.run/install | bash
 ```
 
 Installer environment variables:
