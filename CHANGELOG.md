@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.0](https://github.com/hyperterse/seaport/compare/v0.2.0...v0.3.0) (2026-06-09)
+
+### Features
+
+* add upgrade command ([238a9ab](https://github.com/hyperterse/seaport/commit/238a9abd5ea76e36f3ec641dc1ed2be226ad1ef0))
+
 ## 0.2.0 (2026-06-09)
 
 ### Features
