@@ -95,7 +95,7 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             binary: seaport
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             binary: seaport
           - os: macos-latest
