@@ -83,19 +83,19 @@ seaport init --task acme/hello-world
 Run the generated task with its oracle solution:
 
 ```sh
-seaport run -p hello-world -a oracle
+seaport run -p hello-world
 ```
 
 Run the repository example:
 
 ```sh
-seaport run -p examples/tasks/basic-evaluation -a oracle
+seaport run -p examples/tasks/basic-evaluation
 ```
 
 Run without installing the CLI:
 
 ```sh
-cargo run -- run -p examples/tasks/basic-evaluation -a oracle
+cargo run -- run -p examples/tasks/basic-evaluation
 ```
 
 ## Task Format
@@ -171,13 +171,13 @@ During execution, Seaport provides:
 Run one local task:
 
 ```sh
-seaport run -p path/to/task -a oracle
+seaport run -p path/to/task
 ```
 
 Run every immediate task subdirectory in a local dataset:
 
 ```sh
-seaport run -p path/to/dataset -a oracle
+seaport run -p path/to/dataset
 ```
 
 Filter tasks by name:
@@ -192,13 +192,13 @@ seaport run -p path/to/dataset \
 Run two attempts per task with two workers:
 
 ```sh
-seaport run -p path/to/dataset -a oracle -k 2 -n 2
+seaport run -p path/to/dataset -k 2 -n 2
 ```
 
 Write results somewhere other than `jobs/`:
 
 ```sh
-seaport run -p path/to/task -a oracle --jobs-dir /tmp/seaport-jobs
+seaport run -p path/to/task --jobs-dir /tmp/seaport-jobs
 ```
 
 ## Agents
@@ -250,13 +250,13 @@ seaport run -p path/to/task -a claude-code -m sonnet --ae ANTHROPIC_API_KEY="$AN
 Run a dataset from a local registry JSON file:
 
 ```sh
-seaport run -d acme/suite@head --registry-path registry.json -a oracle
+seaport run -d acme/suite@head --registry-path registry.json
 ```
 
 Run one registered task:
 
 ```sh
-seaport run -t acme/task --registry-path registry.json -a oracle
+seaport run -t acme/task --registry-path registry.json
 ```
 
 Registry task paths are resolved relative to the registry file unless they are
@@ -292,8 +292,7 @@ Run a task directly from git without a registry file:
 seaport run \
   --task-git-url https://example.com/acme/tasks.git \
   --task-git-commit 0123456789abcdef \
-  -p tasks/git-task \
-  -a oracle
+  -p tasks/git-task
 ```
 
 Set `SEAPORT_REGISTRY_CACHE` to control where git-backed task checkouts are
@@ -304,7 +303,7 @@ stored. By default Seaport uses the system temporary directory.
 The Docker backend is the default:
 
 ```sh
-seaport run -p path/to/task -a oracle --backend docker
+seaport run -p path/to/task --backend docker
 ```
 
 Docker execution uses:
@@ -326,7 +325,7 @@ overrides can be set in `[agent]` or `[verifier]`.
 For trusted local development only:
 
 ```sh
-seaport run -p path/to/task -a oracle --backend unsafe-local
+seaport run -p path/to/task --backend unsafe-local
 ```
 
 `unsafe-local` runs task scripts as host subprocesses. It is convenient for
