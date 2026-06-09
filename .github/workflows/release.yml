@@ -67,7 +67,7 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
-          git config user.name "${{ steps.app-token.outputs.app-slug }}[bot]"
+          git config user.name "${{ steps.app-token.outputs.app-slug }}"
           git config user.email "${{ steps.app-user.outputs.user-id }}+${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com"
           gh auth setup-git
 
