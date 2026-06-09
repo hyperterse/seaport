@@ -11,13 +11,13 @@ description: Install Seaport and run your first evaluation.
 Install the latest release:
 
 ```sh
-curl -fsSL https://seaport.run/install.sh | bash
+curl -fsSL https://seaport.run/install | bash
 ```
 
 Pin a specific version:
 
 ```sh
-VERSION=0.1.0 curl -fsSL https://seaport.run/install.sh | bash
+VERSION=0.1.0 curl -fsSL https://seaport.run/install | bash
 ```
 
 The installer accepts a few environment variables:
