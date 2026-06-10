@@ -7,14 +7,16 @@ use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
-use crate::logging::LogMode;
+use crate::logging::{self, LogMode};
 use crate::CliError;
 
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
-const DEFAULT_CONTAINER_MEMORY: &str = "1g";
+const DEFAULT_CONTAINER_MEMORY_MB: u64 = 1024;
 const DEFAULT_CONTAINER_CPUS: &str = "1.0";
+const BOOSTED_CONTAINER_CPUS_MAX: usize = 8;
+const BOOSTED_CONTAINER_MEMORY_MB: u64 = 4096;
 const CONTAINER_PIDS_LIMIT: &str = "256";
 const DEFAULT_TMPFS_SIZE: &str = "256m";
 const DEFAULT_COMPAT_DOCKER_PLATFORM: &str = "linux/amd64";
@@ -55,6 +57,7 @@ pub(crate) struct TaskScriptRequest<'a> {
     pub(crate) agent: &'a SandboxAgent,
     pub(crate) envs: &'a PhaseEnvs,
     pub(crate) backend: SandboxBackend,
+    pub(crate) strict_resources: bool,
 }
 
 pub(crate) struct AgentStep {
@@ -115,7 +118,13 @@ pub(crate) fn run_task_scripts(run: TaskScriptRequest<'_>) -> Result<ScriptOutpu
     };
 
     match run.backend {
-        SandboxBackend::Docker => run_scripts_in_docker(runtime, run.agent, run.envs, &environment),
+        SandboxBackend::Docker => run_scripts_in_docker(
+            runtime,
+            run.agent,
+            run.envs,
+            &environment,
+            run.strict_resources,
+        ),
         SandboxBackend::UnsafeLocal => {
             prepare_task_file_workspace(run.task_path, run.app_dir)?;
             run_scripts_locally(runtime, run.agent, run.envs, &environment)
@@ -126,20 +135,6 @@ pub(crate) fn run_task_scripts(run: TaskScriptRequest<'_>) -> Result<ScriptOutpu
 pub(crate) fn ensure_sandbox_backend_available(backend: SandboxBackend) -> Result<(), CliError> {
     match backend {
         SandboxBackend::Docker => ensure_docker_available(),
-        SandboxBackend::UnsafeLocal => Ok(()),
-    }
-}
-
-pub(crate) fn preflight_task_environment(
-    task_label: &str,
-    task_path: &Path,
-    backend: SandboxBackend,
-) -> Result<(), CliError> {
-    match backend {
-        SandboxBackend::Docker => {
-            let environment = task_environment(task_path)?;
-            preflight_docker_task_environment(task_label, task_path, &environment)
-        }
         SandboxBackend::UnsafeLocal => Ok(()),
     }
 }
@@ -234,100 +229,50 @@ fn prepare_container_writable_tree(_path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
-fn prepare_cobol_copybook_aliases(app_dir: &Path) -> Result<(), CliError> {
-    let mut copybooks = Vec::new();
-    collect_copybooks(app_dir, &mut copybooks)?;
-
-    for copybook in copybooks {
-        create_copybook_aliases(&copybook)?;
-
-        if copybook.parent().is_some_and(|parent| parent != app_dir) {
-            create_copybook_aliases_in_dir(&copybook, app_dir)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn collect_copybooks(path: &Path, copybooks: &mut Vec<PathBuf>) -> Result<(), CliError> {
-    if !path.is_dir() {
-        return Ok(());
-    }
-
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let entry_path = entry.path();
-        let file_type = entry.file_type()?;
-
-        if file_type.is_dir() {
-            collect_copybooks(&entry_path, copybooks)?;
-        } else if file_type.is_file()
-            && entry_path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("cpy"))
-        {
-            copybooks.push(entry_path);
-        }
-    }
-
-    Ok(())
-}
-
-fn create_copybook_aliases(copybook: &Path) -> Result<(), CliError> {
-    let parent = copybook
-        .parent()
-        .ok_or_else(|| CliError::usage("copybook path has no parent directory"))?;
-
-    create_copybook_aliases_in_dir(copybook, parent)
-}
-
-fn create_copybook_aliases_in_dir(copybook: &Path, target_dir: &Path) -> Result<(), CliError> {
-    let stem = copybook
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .ok_or_else(|| CliError::usage("copybook path has no valid UTF-8 file stem"))?;
-    let stems = [
-        stem.to_owned(),
-        stem.to_ascii_uppercase(),
-        stem.to_ascii_lowercase(),
-    ];
-    let extensions = ["", ".cpy", ".CPY", ".cob", ".COB"];
-
-    for stem in stems {
-        for extension in extensions {
-            let alias = target_dir.join(format!("{stem}{extension}"));
-
-            if alias != copybook && !alias.exists() {
-                fs::copy(copybook, alias)?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
 fn run_scripts_in_docker(
     runtime: TaskRuntime<'_>,
     agent_kind: &SandboxAgent,
     envs: &PhaseEnvs,
     environment: &TaskEnvironment,
+    strict_resources: bool,
 ) -> Result<ScriptOutputs, CliError> {
     ensure_docker_available()?;
+    let resources = if strict_resources {
+        environment.resources.clone()
+    } else {
+        environment.resources.boosted()
+    };
 
+    let prepare_started = Instant::now();
     let image = prepare_docker_image(runtime.task_label, runtime.task_path, environment)?;
+    logging::log_timing(
+        runtime.task_label,
+        "image",
+        &format!("prepare_docker_image -> {}", image.reference),
+        prepare_started.elapsed(),
+    );
     let image_platform = image.platform.as_deref();
+    // /app lives in a per-trial docker volume instead of a host bind mount:
+    // build/test I/O stays inside the VM filesystem, which is dramatically
+    // faster than macOS file sharing, and the volume carries solution state
+    // into the verifier container.
+    let app_volume = docker_volume_name(runtime.run_id);
     let result = (|| {
-        seed_docker_app_workspace(
+        let seed_started = Instant::now();
+        seed_docker_volume_workspace(
             runtime.task_label,
             runtime.run_id,
             &image.reference,
-            runtime.app_dir,
+            runtime.task_path,
+            &app_volume,
             image_platform,
-            image.cache_key.as_deref(),
         )?;
-        prepare_task_file_workspace(runtime.task_path, runtime.app_dir)?;
-        prepare_cobol_copybook_aliases(runtime.app_dir)?;
+        logging::log_timing(
+            runtime.task_label,
+            "seed",
+            "seed app volume (task files + copybook aliases)",
+            seed_started.elapsed(),
+        );
 
         let agent = match agent_kind {
             SandboxAgent::Oracle => AgentStep::from_output(
@@ -336,13 +281,13 @@ fn run_scripts_in_docker(
                     image: &image.reference,
                     run_id: runtime.run_id,
                     task_path: runtime.task_path,
-                    app_dir: runtime.app_dir,
+                    app_volume: &app_volume,
                     logs_dir: runtime.logs_dir,
                     task_label: runtime.task_label,
                     script: "solution/solve.sh",
                     network: environment.agent_network,
                     platform: image_platform,
-                    resources: &environment.resources,
+                    resources: &resources,
                     env: &envs.agent,
                     timeout: environment.agent_timeout,
                 })?,
@@ -354,13 +299,13 @@ fn run_scripts_in_docker(
                     image: &image.reference,
                     run_id: runtime.run_id,
                     task_path: runtime.task_path,
-                    app_dir: runtime.app_dir,
+                    app_volume: &app_volume,
                     logs_dir: runtime.logs_dir,
                     task_label: runtime.task_label,
                     agent,
                     network: environment.agent_network,
                     platform: image_platform,
-                    resources: &environment.resources,
+                    resources: &resources,
                     env: &envs.agent,
                     timeout: environment.agent_timeout,
                 })?,
@@ -370,19 +315,21 @@ fn run_scripts_in_docker(
             image: &image.reference,
             run_id: runtime.run_id,
             task_path: runtime.task_path,
-            app_dir: runtime.app_dir,
+            app_volume: &app_volume,
             logs_dir: runtime.logs_dir,
             task_label: runtime.task_label,
             script: "tests/test.sh",
             network: environment.verifier_network,
             platform: image_platform,
-            resources: &environment.resources,
+            resources: &resources,
             env: &envs.verifier,
             timeout: environment.verifier_timeout,
         })?;
 
         Ok(ScriptOutputs { agent, verifier })
     })();
+
+    cleanup_docker_volume(&app_volume);
 
     if image.remove_after_run {
         cleanup_docker_image(&image.reference);
@@ -395,7 +342,6 @@ struct DockerImage {
     reference: String,
     remove_after_run: bool,
     platform: Option<String>,
-    cache_key: Option<String>,
 }
 
 struct TaskEnvironment {
@@ -419,19 +365,47 @@ struct CompatPlatformInference {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct DockerResources {
-    cpus: String,
-    memory: String,
+    cpus: Option<String>,
+    memory_mb: Option<u64>,
     tmpfs_size: String,
 }
 
 impl Default for DockerResources {
     fn default() -> Self {
         Self {
-            cpus: DEFAULT_CONTAINER_CPUS.to_owned(),
-            memory: DEFAULT_CONTAINER_MEMORY.to_owned(),
+            cpus: Some(DEFAULT_CONTAINER_CPUS.to_owned()),
+            memory_mb: Some(DEFAULT_CONTAINER_MEMORY_MB),
             tmpfs_size: DEFAULT_TMPFS_SIZE.to_owned(),
         }
     }
+}
+
+impl DockerResources {
+    /// Relaxes the task's cpu/memory caps. Task authors size `cpus` and
+    /// `memory_mb` for native execution; on this runner (often emulating
+    /// amd64) honoring them strictly starves the workload, so boosted caps are
+    /// the default and `--strict-resources` restores the task's own limits.
+    /// The caps stay bounded so concurrent trials cannot starve each other or
+    /// pressure the docker VM's memory.
+    fn boosted(&self) -> Self {
+        let boosted_memory_mb = self
+            .memory_mb
+            .map(|memory_mb| (memory_mb.saturating_mul(2)).max(BOOSTED_CONTAINER_MEMORY_MB));
+
+        Self {
+            cpus: Some(boosted_cpu_limit()),
+            memory_mb: boosted_memory_mb,
+            tmpfs_size: self.tmpfs_size.clone(),
+        }
+    }
+}
+
+fn boosted_cpu_limit() -> String {
+    let host_cpus = thread::available_parallelism()
+        .map(|cpus| cpus.get())
+        .unwrap_or(4);
+
+    host_cpus.min(BOOSTED_CONTAINER_CPUS_MAX).to_string()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -553,7 +527,7 @@ fn docker_resources(contents: &str) -> Result<DockerResources, CliError> {
             ));
         }
 
-        resources.cpus = cpus;
+        resources.cpus = Some(cpus);
     }
 
     if let Some(memory_mb) = toml_section_value(contents, "environment", "memory_mb") {
@@ -569,7 +543,7 @@ fn docker_resources(contents: &str) -> Result<DockerResources, CliError> {
             ));
         }
 
-        resources.memory = format!("{parsed}m");
+        resources.memory_mb = Some(parsed);
     }
 
     Ok(resources)
@@ -716,398 +690,132 @@ fn strip_inline_comment(value: &str) -> &str {
     value
 }
 
-fn seed_docker_app_workspace(
+fn docker_volume_name(run_id: &str) -> String {
+    format!("seaport-app-{run_id}")
+}
+
+/// Populates the per-trial /app volume. Mounting the volume at /app lets
+/// dockerd copy the image's /app content into it on first use, so the seed
+/// container only layers task files on top, materializes COBOL copybook
+/// aliases, and makes the tree world-writable.
+fn seed_docker_volume_workspace(
     task_label: &str,
     run_id: &str,
     image: &str,
-    app_dir: &Path,
+    task_path: &Path,
+    app_volume: &str,
     platform: Option<&str>,
-    cache_key: Option<&str>,
 ) -> Result<(), CliError> {
-    if let Some(cache_key) = cache_key {
-        if try_seed_app_workspace_from_cache(task_label, cache_key, app_dir)? {
-            return Ok(());
-        }
-    }
-
-    let container_name = docker_container_name(run_id, "workspace");
-    let create_output = run_command_with_timeout(
-        docker_create_workspace_command(&container_name, image, platform),
+    let container_name = docker_container_name(run_id, "seed");
+    let timed_output = run_command_with_timeout(
+        docker_seed_command(&container_name, image, task_path, app_volume, platform),
         DOCKER_WORKSPACE_TIMEOUT,
         Some(CommandLog::new(task_label, "workspace")),
     )?;
 
-    if create_output.timed_out {
+    if timed_output.timed_out {
         cleanup_docker_container(&container_name);
         return Err(CliError::task_failed(format!(
-            "docker workspace container creation timed out after {:.3}s",
+            "docker workspace seeding timed out after {:.3}s",
             DOCKER_WORKSPACE_TIMEOUT.as_secs_f64()
         )));
     }
 
-    if !create_output.output.status.success() {
-        cleanup_docker_container(&container_name);
+    if !timed_output.output.status.success() {
         return Err(CliError::task_failed(format!(
-            "docker workspace container creation failed (status: {})\nstdout:\n{}\nstderr:\n{}",
-            create_output.output.status,
-            String::from_utf8_lossy(&create_output.output.stdout),
-            String::from_utf8_lossy(&create_output.output.stderr)
+            "docker workspace seeding failed (status: {})\nstdout:\n{}\nstderr:\n{}",
+            timed_output.output.status,
+            String::from_utf8_lossy(&timed_output.output.stdout),
+            String::from_utf8_lossy(&timed_output.output.stderr)
         )));
-    }
-
-    let copy_output = run_command_with_timeout(
-        docker_copy_workspace_command(&container_name, app_dir),
-        DOCKER_WORKSPACE_TIMEOUT,
-        Some(CommandLog::new(task_label, "workspace")),
-    )?;
-    cleanup_docker_container(&container_name);
-
-    if copy_output.timed_out {
-        return Err(CliError::task_failed(format!(
-            "docker workspace copy timed out after {:.3}s",
-            DOCKER_WORKSPACE_TIMEOUT.as_secs_f64()
-        )));
-    }
-
-    if !copy_output.output.status.success() {
-        if docker_copy_missing_app(&copy_output.output) {
-            if let Some(cache_key) = cache_key {
-                best_effort_store_app_workspace_cache(task_label, cache_key, app_dir);
-            }
-
-            return Ok(());
-        }
-
-        return Err(CliError::task_failed(format!(
-            "docker workspace copy failed (status: {})\nstdout:\n{}\nstderr:\n{}",
-            copy_output.output.status,
-            String::from_utf8_lossy(&copy_output.output.stdout),
-            String::from_utf8_lossy(&copy_output.output.stderr)
-        )));
-    }
-
-    prepare_container_writable_tree(app_dir)?;
-
-    if let Some(cache_key) = cache_key {
-        best_effort_store_app_workspace_cache(task_label, cache_key, app_dir);
     }
 
     Ok(())
 }
 
-fn try_seed_app_workspace_from_cache(
-    task_label: &str,
-    cache_key: &str,
-    app_dir: &Path,
-) -> Result<bool, CliError> {
-    let cache_dir = app_workspace_cache_dir(cache_key);
+const SEED_WORKSPACE_SCRIPT: &str = r#"set -e
+if [ -d /seaport/task/environment/task_file ]; then
+  rm -rf /app/task_file
+  mkdir -p /app/task_file
+  cp -a /seaport/task/environment/task_file/. /app/task_file/
+fi
+find /app -type f -iname '*.cpy' > /tmp/seaport-copybooks 2>/dev/null || true
+while IFS= read -r copybook; do
+  dir=$(dirname "$copybook")
+  base=$(basename "$copybook")
+  stem="${base%.*}"
+  upper=$(printf '%s' "$stem" | tr '[:lower:]' '[:upper:]')
+  lower=$(printf '%s' "$stem" | tr '[:upper:]' '[:lower:]')
+  for s in "$stem" "$upper" "$lower"; do
+    for ext in '' .cpy .CPY .cob .COB; do
+      for target_dir in "$dir" /app; do
+        alias_path="$target_dir/$s$ext"
+        if [ "$alias_path" != "$copybook" ] && [ ! -e "$alias_path" ]; then
+          cp "$copybook" "$alias_path"
+        fi
+      done
+    done
+  done
+done < /tmp/seaport-copybooks
+chmod -R a+rwX /app
+"#;
 
-    if !cache_dir.is_dir() {
-        return Ok(false);
-    }
-
-    match copy_app_workspace_from_cache_dir(&cache_dir, app_dir) {
-        Ok(()) => {
-            print_backend_event(task_label, "workspace", "cache hit");
-            Ok(true)
-        }
-        Err(error) => {
-            eprintln!(
-                "seaport: warning: could not read workspace cache {}: {error}",
-                cache_dir.display()
-            );
-            reset_directory(app_dir)?;
-            Ok(false)
-        }
-    }
-}
-
-fn copy_app_workspace_from_cache_dir(cache_dir: &Path, app_dir: &Path) -> Result<(), CliError> {
-    copy_app_workspace_snapshot(cache_dir, app_dir)?;
-    prepare_container_writable_tree(app_dir)
-}
-
-fn best_effort_store_app_workspace_cache(task_label: &str, cache_key: &str, app_dir: &Path) {
-    let cache_dir = app_workspace_cache_dir(cache_key);
-
-    if cache_dir.is_dir() {
-        return;
-    }
-
-    match store_app_workspace_cache_dir(&cache_dir, app_dir) {
-        Ok(()) => print_backend_event(task_label, "workspace", "cached seeded /app"),
-        Err(error) => eprintln!(
-            "seaport: warning: could not write workspace cache {}: {error}",
-            cache_dir.display()
-        ),
-    }
-}
-
-fn store_app_workspace_cache_dir(cache_dir: &Path, app_dir: &Path) -> Result<(), CliError> {
-    if cache_dir.is_dir() {
-        return Ok(());
-    }
-
-    let parent = cache_dir
-        .parent()
-        .ok_or_else(|| CliError::io("workspace cache path has no parent directory"))?;
-    fs::create_dir_all(parent)?;
-
-    let staging = unique_cache_staging_dir(parent, "workspace")?;
-    copy_app_workspace_snapshot(app_dir, &staging)?;
-
-    match fs::rename(&staging, cache_dir) {
-        Ok(()) => Ok(()),
-        Err(error) if cache_dir.is_dir() => {
-            let _ = fs::remove_dir_all(&staging);
-            eprintln!(
-                "seaport: warning: another worker populated workspace cache {} first: {error}",
-                cache_dir.display()
-            );
-            Ok(())
-        }
-        Err(error) => {
-            let _ = fs::remove_dir_all(&staging);
-            Err(CliError::from(error))
-        }
-    }
-}
-
-fn reset_directory(path: &Path) -> Result<(), CliError> {
-    if path.exists() {
-        fs::remove_dir_all(path)?;
-    }
-
-    fs::create_dir_all(path)?;
-    prepare_container_writable_dir(path)
-}
-
-fn app_workspace_cache_dir(cache_key: &str) -> PathBuf {
-    env::var_os("SEAPORT_WORKSPACE_CACHE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| seaport_cache_root().join("workspaces"))
-        .join(cache_key)
-}
-
-fn seaport_cache_root() -> PathBuf {
-    env::var_os("SEAPORT_CACHE_DIR")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/seaport")))
-        .unwrap_or_else(|| env::temp_dir().join("seaport-cache"))
-}
-
-fn unique_cache_staging_dir(parent: &Path, prefix: &str) -> Result<PathBuf, CliError> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| CliError::io(format!("system clock before Unix epoch: {error}")))?
-        .as_nanos();
-
-    Ok(parent.join(format!("{prefix}-{}-{nanos}.tmp", std::process::id())))
-}
-
-fn copy_app_workspace_snapshot(source: &Path, target: &Path) -> Result<(), CliError> {
-    if try_clone_app_workspace_snapshot(source, target)? {
-        return Ok(());
-    }
-
-    copy_dir_all(source, target)
-}
-
-fn try_clone_app_workspace_snapshot(source: &Path, target: &Path) -> Result<bool, CliError> {
-    let Some(mut command) = workspace_snapshot_clone_command(source, target) else {
-        return Ok(false);
-    };
-
-    fs::create_dir_all(target)?;
-
-    match command.output() {
-        Ok(output) if output.status.success() => Ok(true),
-        Ok(_) => Ok(false),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(CliError::from(error)),
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn workspace_snapshot_clone_command(source: &Path, target: &Path) -> Option<Command> {
-    let mut command = Command::new("cp");
-    command.arg("-cR").arg(source.join(".")).arg(target);
-    Some(command)
-}
-
-#[cfg(target_os = "linux")]
-fn workspace_snapshot_clone_command(source: &Path, target: &Path) -> Option<Command> {
-    let mut command = Command::new("cp");
-    command
-        .args(["-a", "--reflink=auto"])
-        .arg(source.join("."))
-        .arg(target);
-    Some(command)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn workspace_snapshot_clone_command(_source: &Path, _target: &Path) -> Option<Command> {
-    None
-}
-
-fn docker_create_workspace_command(
+fn docker_seed_command(
     container_name: &str,
     image: &str,
+    task_path: &Path,
+    app_volume: &str,
     platform: Option<&str>,
 ) -> Command {
     let mut command = Command::new("docker");
-    command.args(["create", "--name", container_name]);
+    command.args([
+        "run",
+        "--rm",
+        "--name",
+        container_name,
+        "--network",
+        "none",
+        "--user",
+        "0:0",
+    ]);
 
     if let Some(platform) = platform {
         command.args(["--platform", platform]);
     }
 
-    command.arg(image);
+    command
+        .arg("--mount")
+        .arg(format!("type=volume,source={app_volume},target=/app"))
+        .arg("--mount")
+        .arg(format!(
+            "type=bind,source={},target=/seaport/task,readonly",
+            task_path.display()
+        ))
+        .args([image, "bash", "-c", SEED_WORKSPACE_SCRIPT]);
     command
 }
 
-fn docker_copy_workspace_command(container_name: &str, app_dir: &Path) -> Command {
-    let mut command = Command::new("docker");
-    command
-        .arg("cp")
-        .arg(format!("{container_name}:/app/."))
-        .arg(app_dir);
-    command
-}
-
-fn docker_copy_missing_app(output: &Output) -> bool {
-    let output = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-    .to_ascii_lowercase();
-
-    output.contains("/app")
-        && (output.contains("could not find")
-            || output.contains("no such file")
-            || output.contains("not found"))
-}
-
-fn preflight_docker_task_environment(
-    task_label: &str,
-    task_path: &Path,
-    environment: &TaskEnvironment,
-) -> Result<(), CliError> {
-    let dockerfile = task_path.join("environment").join("Dockerfile");
-    let inferred_platform = if environment.platform.is_none() {
-        infer_compat_platform(task_path)?
-    } else {
-        None
-    };
-    let platform = environment.platform.as_deref().or_else(|| {
-        inferred_platform
-            .as_ref()
-            .map(|inference| inference.platform)
-    });
-
-    if environment.prebuilt_image || !dockerfile.is_file() {
-        ensure_docker_image_available(
-            task_label,
-            &environment.image,
-            platform,
-            environment.build_timeout,
-        )?;
-        return Ok(());
+fn cleanup_docker_volume(app_volume: &str) {
+    if docker_api_remove_volume(app_volume) {
+        return;
     }
 
-    pull_dockerfile_base_images(task_label, &dockerfile, platform, environment.build_timeout)?;
-    let image = prepare_docker_image(task_label, task_path, environment)?;
-
-    print_backend_event(
-        task_label,
-        "preflight",
-        &format!("environment ready: {}", image.reference),
-    );
-
-    Ok(())
-}
-
-fn pull_dockerfile_base_images(
-    task_label: &str,
-    dockerfile: &Path,
-    platform: Option<&str>,
-    timeout: Duration,
-) -> Result<(), CliError> {
-    for image in dockerfile_base_images(dockerfile)? {
-        ensure_docker_image_available(task_label, &image, platform, timeout)?;
-    }
-
-    Ok(())
-}
-
-fn dockerfile_base_images(dockerfile: &Path) -> Result<Vec<String>, CliError> {
-    let contents = fs::read_to_string(dockerfile)?;
-    let mut images = Vec::new();
-    let mut stage_aliases = Vec::new();
-
-    for line in contents.lines() {
-        let line = strip_dockerfile_comment(line).trim();
-
-        if line.is_empty() {
-            continue;
+    match Command::new("docker")
+        .args(["volume", "rm", "-f", app_volume])
+        .output()
+    {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            eprintln!(
+                "seaport: warning: could not remove docker volume {app_volume} (status: {})\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
-
-        let mut words = line.split_whitespace().collect::<Vec<_>>();
-        let Some(first) = words.first() else {
-            continue;
-        };
-
-        if !first.eq_ignore_ascii_case("FROM") {
-            continue;
-        }
-
-        words.remove(0);
-
-        while words.first().is_some_and(|word| word.starts_with("--")) {
-            words.remove(0);
-        }
-
-        let Some(image) = words.first().copied() else {
-            continue;
-        };
-
-        if !image.eq_ignore_ascii_case("scratch")
-            && !image.contains('$')
-            && !stage_aliases.iter().any(|alias: &String| alias == image)
-            && !images.iter().any(|existing| existing == image)
-        {
-            images.push(image.to_owned());
-        }
-
-        if words
-            .get(1)
-            .is_some_and(|keyword| keyword.eq_ignore_ascii_case("AS"))
-        {
-            if let Some(alias) = words.get(2) {
-                stage_aliases.push((*alias).to_owned());
-            }
+        Err(error) => {
+            eprintln!("seaport: warning: could not remove docker volume {app_volume}: {error}");
         }
     }
-
-    Ok(images)
-}
-
-fn strip_dockerfile_comment(line: &str) -> &str {
-    let mut escaped = false;
-
-    for (index, character) in line.char_indices() {
-        if character == '#' && !escaped {
-            return &line[..index];
-        }
-
-        escaped = character == '\\' && !escaped;
-        if character != '\\' {
-            escaped = false;
-        }
-    }
-
-    line
 }
 
 fn ensure_docker_image_available(
@@ -1212,11 +920,17 @@ fn prepare_docker_image(
     });
 
     if environment.prebuilt_image || !dockerfile.is_file() {
+        ensure_docker_image_available(
+            task_label,
+            &environment.image,
+            platform.as_deref(),
+            environment.build_timeout,
+        )?;
+
         return Ok(DockerImage {
             reference: environment.image.clone(),
             remove_after_run: false,
             platform,
-            cache_key: None,
         });
     }
 
@@ -1234,6 +948,7 @@ fn prepare_docker_image(
     let mut build_platform = platform;
     let mut cached_image =
         cached_docker_image(environment_dir, environment, build_platform.as_deref())?;
+    let _build_guard = DockerImagePull::start(&format!("build:{}", cached_image.reference));
 
     if docker_image_exists(&cached_image.reference) {
         print_backend_event(
@@ -1246,7 +961,6 @@ fn prepare_docker_image(
             reference: cached_image.reference,
             remove_after_run: false,
             platform: build_platform,
-            cache_key: Some(cached_image.cache_key),
         });
     }
 
@@ -1281,7 +995,6 @@ fn prepare_docker_image(
                 reference: cached_image.reference,
                 remove_after_run: false,
                 platform: build_platform,
-                cache_key: Some(cached_image.cache_key),
             });
         } else {
             timed_output = run_docker_build_with_retries(
@@ -1319,13 +1032,11 @@ fn prepare_docker_image(
         reference: cached_image.reference,
         remove_after_run: false,
         platform: build_platform,
-        cache_key: Some(cached_image.cache_key),
     })
 }
 
 struct CachedDockerImage {
     reference: String,
-    cache_key: String,
 }
 
 fn cached_docker_image(
@@ -1337,7 +1048,6 @@ fn cached_docker_image(
 
     Ok(CachedDockerImage {
         reference: format!("seaport-env-cache:{cache_key}"),
-        cache_key,
     })
 }
 
@@ -1801,7 +1511,7 @@ struct DockerScriptRun<'a> {
     image: &'a str,
     run_id: &'a str,
     task_path: &'a Path,
-    app_dir: &'a Path,
+    app_volume: &'a str,
     logs_dir: &'a Path,
     task_label: &'a str,
     script: &'a str,
@@ -1816,7 +1526,7 @@ struct DockerShellRun<'a> {
     image: &'a str,
     run_id: &'a str,
     task_path: &'a Path,
-    app_dir: &'a Path,
+    app_volume: &'a str,
     logs_dir: &'a Path,
     task_label: &'a str,
     agent: &'a ExternalAgent,
@@ -1838,7 +1548,7 @@ fn run_script_in_docker(run: DockerScriptRun<'_>) -> Result<Output, CliError> {
         image: run.image,
         container_name: &container_name,
         task_path: run.task_path,
-        app_dir: run.app_dir,
+        app_volume: run.app_volume,
         logs_root,
         invocation: DockerInvocation::TaskScript(run.script),
         network: run.network,
@@ -1892,7 +1602,7 @@ fn run_shell_in_docker(run: DockerShellRun<'_>) -> Result<Output, CliError> {
         image: run.image,
         container_name: &container_name,
         task_path: run.task_path,
-        app_dir: run.app_dir,
+        app_volume: run.app_volume,
         logs_root,
         invocation: DockerInvocation::ShellCommand(&run.agent.command),
         network: run.network,
@@ -1938,7 +1648,7 @@ struct DockerRunCommand<'a> {
     image: &'a str,
     container_name: &'a str,
     task_path: &'a Path,
-    app_dir: &'a Path,
+    app_volume: &'a str,
     logs_root: &'a Path,
     invocation: DockerInvocation<'a>,
     network: DockerNetwork,
@@ -1963,12 +1673,6 @@ fn docker_run_command(run: DockerRunCommand<'_>) -> Command {
             "no-new-privileges",
             "--pids-limit",
             CONTAINER_PIDS_LIMIT,
-            "--memory",
-            run.resources.memory.as_str(),
-            "--memory-swap",
-            run.resources.memory.as_str(),
-            "--cpus",
-            run.resources.cpus.as_str(),
             "--read-only",
             "--workdir",
             "/app",
@@ -1996,16 +1700,22 @@ fn docker_run_command(run: DockerRunCommand<'_>) -> Command {
                 .flat_map(|(name, value)| ["--env".to_owned(), format!("{name}={value}")]),
         );
 
+    if let Some(memory_mb) = run.resources.memory_mb {
+        let memory = format!("{memory_mb}m");
+        command.args(["--memory", &memory, "--memory-swap", &memory]);
+    }
+
+    if let Some(cpus) = run.resources.cpus.as_deref() {
+        command.args(["--cpus", cpus]);
+    }
+
     if let Some(platform) = run.platform {
         command.args(["--platform", platform]);
     }
 
     command
         .arg("--mount")
-        .arg(format!(
-            "type=bind,source={},target=/app",
-            run.app_dir.display()
-        ))
+        .arg(format!("type=volume,source={},target=/app", run.app_volume))
         .arg("--mount")
         .arg(format!(
             "type=bind,source={},target=/logs",
@@ -2127,6 +1837,10 @@ fn docker_api_remove_container(container_name: &str) -> bool {
 
 fn docker_api_remove_image(image: &str) -> bool {
     docker_api_delete_success(&format!("/images/{image}?force=true"))
+}
+
+fn docker_api_remove_volume(volume: &str) -> bool {
+    docker_api_delete_success(&format!("/volumes/{volume}?force=true"))
 }
 
 fn docker_api_delete_success(path: &str) -> bool {
@@ -2429,6 +2143,13 @@ fn run_command_with_timeout(
         print_phase_start(log, timeout);
     }
 
+    let command_line = if logging::timings_enabled() {
+        Some(format_command_line(&command))
+    } else {
+        None
+    };
+    let command_started = Instant::now();
+
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2464,6 +2185,25 @@ fn run_command_with_timeout(
     let stdout = join_stream_reader(stdout_reader)?;
     let stderr = join_stream_reader(stderr_reader)?;
 
+    if let Some(command_line) = command_line {
+        let (task, phase) = log
+            .as_ref()
+            .map(|log| (log.task.as_str(), log.phase.as_str()))
+            .unwrap_or(("-", "command"));
+        logging::log_timing(
+            task,
+            phase,
+            &format!(
+                "status={}{} cmd: {command_line}",
+                status
+                    .code()
+                    .map_or_else(|| "?".to_owned(), |code| code.to_string()),
+                if timed_out { " timed-out" } else { "" }
+            ),
+            command_started.elapsed(),
+        );
+    }
+
     Ok(TimedOutput {
         output: Output {
             status,
@@ -2472,6 +2212,23 @@ fn run_command_with_timeout(
         },
         timed_out,
     })
+}
+
+fn format_command_line(command: &Command) -> String {
+    let mut line = command.get_program().to_string_lossy().into_owned();
+
+    for arg in command.get_args() {
+        line.push(' ');
+        line.push_str(&arg.to_string_lossy());
+
+        if line.len() > 160 {
+            line.truncate(157);
+            line.push_str("...");
+            break;
+        }
+    }
+
+    line
 }
 
 fn read_stream<R: Read>(stream: R, log: Option<StreamLog>) -> io::Result<Vec<u8>> {
@@ -2635,7 +2392,7 @@ mod tests {
             image: "seaport-task-test",
             container_name: "seaport-test-container",
             task_path: Path::new("/tmp/task"),
-            app_dir: Path::new("/tmp/app"),
+            app_volume: "seaport-app-test",
             logs_root: Path::new("/tmp/logs"),
             invocation: DockerInvocation::TaskScript("tests/test.sh"),
             network: DockerNetwork::None,
@@ -2660,10 +2417,12 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|window| window == ["--pids-limit", "256"]));
-        assert!(args.windows(2).any(|window| window == ["--memory", "1g"]));
         assert!(args
             .windows(2)
-            .any(|window| window == ["--memory-swap", "1g"]));
+            .any(|window| window == ["--memory", "1024m"]));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--memory-swap", "1024m"]));
         assert!(args.windows(2).any(|window| window == ["--cpus", "1.0"]));
         assert!(args.iter().any(|arg| arg == "--read-only"));
         assert!(!args.iter().any(|arg| arg == "--user"));
@@ -2738,31 +2497,6 @@ mod tests {
                 "network=host"
             ]
         );
-    }
-
-    #[test]
-    fn dockerfile_base_images_skip_stage_aliases_and_dynamic_images() {
-        let task = temp_task_dir("dockerfile-base-images");
-        let dockerfile = task.join("Dockerfile");
-        fs::create_dir_all(&task).expect("task dir");
-        fs::write(
-            &dockerfile,
-            "\
-FROM --platform=$TARGETPLATFORM ubuntu:24.04 AS base
-FROM base AS build
-FROM ${RUNTIME_IMAGE}
-FROM scratch AS empty
-FROM python:3.12-slim
-",
-        )
-        .expect("dockerfile");
-
-        let images = dockerfile_base_images(&dockerfile).expect("images");
-
-        assert_eq!(images, ["ubuntu:24.04", "python:3.12-slim"]);
-
-        let _ = fs::remove_file(dockerfile);
-        let _ = fs::remove_dir_all(task);
     }
 
     #[test]
@@ -2939,86 +2673,6 @@ FROM python:3.12-slim
     }
 
     #[test]
-    fn docker_workspace_commands_copy_image_app_tree() {
-        let create = docker_create_workspace_command(
-            "seaport-workspace-test",
-            "seaport-task-test",
-            Some("linux/amd64"),
-        );
-        let copy = docker_copy_workspace_command("seaport-workspace-test", Path::new("/tmp/app"));
-
-        let create_args = command_args(create);
-        let copy_args = command_args(copy);
-
-        assert!(create_args
-            .windows(2)
-            .any(|window| window == ["--platform", "linux/amd64"]));
-        assert_eq!(
-            create_args.last().map(String::as_str),
-            Some("seaport-task-test")
-        );
-        assert_eq!(
-            copy_args,
-            ["cp", "seaport-workspace-test:/app/.", "/tmp/app"]
-        );
-    }
-
-    #[test]
-    fn app_workspace_cache_round_trips_seeded_files() {
-        let cache_root = temp_task_dir("workspace-cache-root");
-        let source = temp_task_dir("workspace-cache-source");
-        let target = temp_task_dir("workspace-cache-target");
-        let cache_dir = cache_root.join("cache-key");
-
-        fs::create_dir_all(source.join("src")).expect("source dir");
-        fs::write(
-            source.join("src").join("main.c"),
-            "int main(void) { return 0; }\n",
-        )
-        .expect("source file");
-
-        store_app_workspace_cache_dir(&cache_dir, &source).expect("store cache");
-        copy_app_workspace_from_cache_dir(&cache_dir, &target).expect("copy cache");
-
-        assert_eq!(
-            fs::read_to_string(target.join("src").join("main.c")).expect("cached file"),
-            "int main(void) { return 0; }\n"
-        );
-
-        let _ = fs::remove_dir_all(cache_root);
-        let _ = fs::remove_dir_all(source);
-        let _ = fs::remove_dir_all(target);
-    }
-
-    #[test]
-    fn workspace_snapshot_clone_command_uses_platform_copy_on_write() {
-        let command =
-            workspace_snapshot_clone_command(Path::new("/tmp/source"), Path::new("/tmp/target"));
-
-        #[cfg(target_os = "macos")]
-        {
-            let args = command_args(command.expect("macos clone command"));
-
-            assert_eq!(args, ["-cR", "/tmp/source/.", "/tmp/target"]);
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            let args = command_args(command.expect("linux clone command"));
-
-            assert_eq!(
-                args,
-                ["-a", "--reflink=auto", "/tmp/source/.", "/tmp/target"]
-            );
-        }
-
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            assert!(command.is_none());
-        }
-    }
-
-    #[test]
     fn prepare_task_file_workspace_copies_packaged_task_files() {
         let task = temp_task_dir("task-file-source");
         let app = temp_task_dir("task-file-app");
@@ -3041,35 +2695,6 @@ FROM python:3.12-slim
         assert!(!app.join("task_file/stale.txt").exists());
 
         let _ = fs::remove_dir_all(task);
-        let _ = fs::remove_dir_all(app);
-    }
-
-    #[test]
-    fn prepare_cobol_copybook_aliases_materializes_common_names() {
-        let app = temp_task_dir("copybook-aliases");
-        let copybook_dir = app.join("copybooks");
-        fs::create_dir_all(&copybook_dir).expect("copybook dir");
-        fs::write(copybook_dir.join("RECLAIM.cpy"), "01 RECLAIM-REC.\n").expect("copybook");
-
-        prepare_cobol_copybook_aliases(&app).expect("aliases");
-
-        assert_eq!(
-            fs::read_to_string(copybook_dir.join("RECLAIM")).expect("extensionless"),
-            "01 RECLAIM-REC.\n"
-        );
-        assert_eq!(
-            fs::read_to_string(copybook_dir.join("RECLAIM.COB")).expect("cob alias"),
-            "01 RECLAIM-REC.\n"
-        );
-        assert_eq!(
-            fs::read_to_string(app.join("RECLAIM.COB")).expect("workspace root cob alias"),
-            "01 RECLAIM-REC.\n"
-        );
-        assert_eq!(
-            fs::read_to_string(copybook_dir.join("reclaim.CPY")).expect("case alias"),
-            "01 RECLAIM-REC.\n"
-        );
-
         let _ = fs::remove_dir_all(app);
     }
 
@@ -3124,8 +2749,8 @@ network_mode = "public"
         assert_eq!(environment.build_network, DockerNetwork::Bridge);
         assert_eq!(environment.agent_network, DockerNetwork::None);
         assert_eq!(environment.verifier_network, DockerNetwork::Bridge);
-        assert_eq!(environment.resources.cpus, "2");
-        assert_eq!(environment.resources.memory, "2048m");
+        assert_eq!(environment.resources.cpus.as_deref(), Some("2"));
+        assert_eq!(environment.resources.memory_mb, Some(2048));
         assert_eq!(environment.build_timeout, Duration::from_secs_f64(7.5));
         assert_eq!(environment.agent_timeout, Duration::from_secs(3));
         assert_eq!(environment.verifier_timeout, Duration::from_secs(5));

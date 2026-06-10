@@ -1,4 +1,31 @@
 use std::cell::RefCell;
+use std::env;
+use std::sync::OnceLock;
+use std::time::Duration;
+
+/// Wall-clock phase timing for performance debugging, enabled with
+/// `SEAPORT_TIMINGS=1`. Lines go to stderr so they interleave with, but do not
+/// corrupt, normal progress output.
+pub(crate) fn timings_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+
+    *ENABLED.get_or_init(|| {
+        env::var_os("SEAPORT_TIMINGS").is_some_and(|value| !value.is_empty() && value != "0")
+    })
+}
+
+pub(crate) fn log_timing(task: &str, phase: &str, detail: &str, elapsed: Duration) {
+    if !timings_enabled() {
+        return;
+    }
+
+    eprintln!(
+        "seaport-timing: {:>9.3}s  {:<12} {:<44} {detail}",
+        elapsed.as_secs_f64(),
+        phase,
+        task
+    );
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]

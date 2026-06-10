@@ -25,9 +25,9 @@ use registry::{
     set_log_mode as set_registry_log_mode,
 };
 use sandbox::{
-    ensure_sandbox_backend_available, preflight_task_environment, prepare_container_writable_dir,
-    run_task_scripts, set_log_mode as set_sandbox_log_mode, AgentStep, ExternalAgent, PhaseEnvs,
-    SandboxAgent, SandboxBackend, ScriptOutputs, TaskScriptRequest,
+    ensure_sandbox_backend_available, prepare_container_writable_dir, run_task_scripts,
+    set_log_mode as set_sandbox_log_mode, AgentStep, ExternalAgent, PhaseEnvs, SandboxAgent,
+    SandboxBackend, ScriptOutputs, TaskScriptRequest,
 };
 use target::{RunTarget, TaskRef, TaskSelection};
 
@@ -54,7 +54,14 @@ fn run(args: Vec<String>) -> Result<(), CliError> {
     // itself, so it must never trigger another notice/respawn. `upgrade` skips
     // the notice because it already reports version status.
     if !matches!(command, Some("__update-check") | Some("upgrade")) {
+        let update_check_started = Instant::now();
         upgrade::notify_if_outdated(CURRENT_VERSION);
+        logging::log_timing(
+            "run",
+            "startup",
+            "update notice check",
+            update_check_started.elapsed(),
+        );
     }
 
     match command {
@@ -108,6 +115,7 @@ fn run_eval(args: &[String]) -> Result<(), CliError> {
 
     begin_progress_buffer();
     print_run_start(&options, agent)?;
+    let resolve_started = Instant::now();
     let target = match resolve_run_target(&options) {
         Ok(target) => target,
         Err(error) => {
@@ -115,6 +123,12 @@ fn run_eval(args: &[String]) -> Result<(), CliError> {
             return Err(error);
         }
     };
+    logging::log_timing(
+        "run",
+        "resolve",
+        "target resolution (registry + task downloads)",
+        resolve_started.elapsed(),
+    );
     let resolution_progress = take_progress_buffer();
 
     run_target(&target, &options, agent, resolution_progress)
@@ -180,9 +194,19 @@ fn run_target(
 
     print_target_ready(target, &job_dir, plans.len(), concurrency, options, agent)?;
     print_resolution_progress(options, resolution_progress)?;
-    preflight_target(target, options)?;
 
+    if !target.tasks.is_empty() {
+        ensure_sandbox_backend_available(options.backend)?;
+    }
+
+    let execution_started = Instant::now();
     let outcomes = run_trial_plans(&plans, &job_dir, &run_id, options, agent, concurrency)?;
+    logging::log_timing(
+        "run",
+        "execution",
+        "all trials (solution + verifier)",
+        execution_started.elapsed(),
+    );
 
     fs::write(
         job_dir.join("config.json"),
@@ -321,97 +345,23 @@ fn print_resolution_progress(
     Ok(())
 }
 
-fn preflight_target(target: &RunTarget, options: &RunOptions) -> Result<(), CliError> {
-    if target.tasks.is_empty() || options.backend == SandboxBackend::UnsafeLocal {
-        return Ok(());
-    }
-
-    ensure_sandbox_backend_available(options.backend)?;
-
-    let phase = RunPhase::Preflight;
-    let concurrency = phase.concurrency(options.concurrency, target.tasks.len());
-
-    print_phase_header(phase, target.tasks.len(), concurrency, options)?;
-    print_phase_progress(phase, 0, target.tasks.len(), options)?;
-
-    let work = Mutex::new(scheduled_task_indices(&target.tasks));
-    let (sender, receiver) = mpsc::channel();
-
-    thread::scope(|scope| {
-        for _ in 0..concurrency {
-            let sender = sender.clone();
-            let work = &work;
-
-            scope.spawn(move || loop {
-                let index = {
-                    let mut work = work.lock().expect("preflight queue");
-                    work.pop_front()
-                };
-                let Some(index) = index else {
-                    break;
-                };
-                let task = &target.tasks[index];
-                let result = preflight_task_environment(&task.name, &task.path, options.backend);
-
-                if sender.send((index, result)).is_err() {
-                    break;
-                }
-            });
-        }
-    });
-
-    drop(sender);
-
-    let mut completed = 0;
-
-    for (index, result) in receiver {
-        completed += 1;
-
-        match result {
-            Ok(()) => {}
-            Err(error) if error.is_task_failure() => {
-                eprintln!(
-                    "seaport: warning: preflight failed for {}; task will retry during execution: {error}",
-                    target.tasks[index].name
-                );
-            }
-            Err(error) => return Err(error),
-        }
-
-        print_phase_progress(phase, completed, target.tasks.len(), options)?;
-    }
-
-    Ok(())
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RunPhase {
-    Preflight,
     Execution,
 }
 
 impl RunPhase {
     fn title(self) -> &'static str {
-        match self {
-            Self::Preflight => "Preflight",
-            Self::Execution => "Execution",
-        }
+        "Execution"
     }
 
     fn label(self) -> &'static str {
-        match self {
-            Self::Preflight => "resolve/pull/build",
-            Self::Execution => "solution/verifier",
-        }
+        "build/solution/verifier"
     }
 
     fn concurrency(self, requested: usize, item_count: usize) -> usize {
-        let limit = requested.max(1).min(item_count.max(1));
-
-        match self {
-            Self::Preflight => limit.min(4),
-            Self::Execution => limit,
-        }
+        let _ = self;
+        requested.max(1).min(item_count.max(1))
     }
 }
 
@@ -520,16 +470,6 @@ fn scheduled_trial_indices(plans: &[TrialPlan<'_>]) -> VecDeque<usize> {
     weighted_indices(weighted)
 }
 
-fn scheduled_task_indices(tasks: &[TaskRef]) -> VecDeque<usize> {
-    let weighted = tasks
-        .iter()
-        .enumerate()
-        .map(|(index, task)| (index, task_schedule_weight(task)))
-        .collect::<Vec<_>>();
-
-    weighted_indices(weighted)
-}
-
 fn weighted_indices(mut weighted: Vec<(usize, u32)>) -> VecDeque<usize> {
     weighted.sort_by(|(left_index, left_weight), (right_index, right_weight)| {
         right_weight
@@ -616,6 +556,7 @@ fn run_trial(
     options: &RunOptions,
     agent: AgentKind,
 ) -> Result<TrialOutcome, CliError> {
+    let trial_started = Instant::now();
     let task_name = &task.name;
     let trial_name = trial_dir_name(task_name, attempt, options.attempts);
     let trial_run_id = format!("{run_id}-{trial_name}");
@@ -653,6 +594,7 @@ fn run_trial(
             agent: &sandbox_agent,
             envs: &phase_envs,
             backend: options.backend,
+            strict_resources: options.strict_resources,
         })?;
         let reward = read_reward(&logs_dir)?;
 
@@ -687,12 +629,25 @@ fn run_trial(
         Err(error) => return Err(error),
     };
 
+    let cleanup_started = Instant::now();
     if let Err(error) = fs::remove_dir_all(&workspace) {
         eprintln!(
             "seaport: warning: could not remove workspace {}: {error}",
             workspace.display()
         );
     }
+    logging::log_timing(
+        task_name,
+        "cleanup",
+        "workspace removal",
+        cleanup_started.elapsed(),
+    );
+    logging::log_timing(
+        task_name,
+        "trial",
+        "total trial wall clock",
+        trial_started.elapsed(),
+    );
 
     Ok(outcome)
 }
@@ -819,7 +774,6 @@ fn print_phase_progress(
     }
 
     let color = match phase {
-        RunPhase::Preflight => "34",
         RunPhase::Execution => "32",
     };
 
@@ -1767,6 +1721,8 @@ Options:
   -n <count>              Concurrency
   -k, --n-attempts <count>
                           Number of attempts per task
+      --strict-resources  Enforce task cpu/memory limits on sandbox containers
+                          (default: containers may use all idle host resources)
       --jobs-dir <path>   Directory where job results are written
       --backend <name>    Execution backend: docker or unsafe-local
       --env <name>        Alias for --backend
@@ -1830,6 +1786,7 @@ struct RunOptions {
     concurrency: usize,
     attempts: usize,
     backend: SandboxBackend,
+    strict_resources: bool,
     jobs_dir: Option<String>,
     log_mode: LogMode,
     selection: TaskSelection,
@@ -1852,6 +1809,7 @@ impl Default for RunOptions {
             model: None,
             concurrency: default_concurrency(),
             attempts: 1,
+            strict_resources: false,
             backend: SandboxBackend::Docker,
             jobs_dir: None,
             log_mode: LogMode::Concise,
@@ -1942,6 +1900,10 @@ impl RunOptions {
                     let value = required_value(args, index, flag)?;
                     options.backend = SandboxBackend::parse(&value)?;
                     index += 2;
+                }
+                "--strict-resources" => {
+                    options.strict_resources = true;
+                    index += 1;
                 }
                 "--jobs-dir" => {
                     options.jobs_dir = Some(required_value(args, index, flag)?);
@@ -2193,10 +2155,7 @@ mod tests {
     }
 
     #[test]
-    fn run_phase_concurrency_bounds_preflight_but_honors_execution_requests() {
-        assert_eq!(RunPhase::Preflight.concurrency(16, 10), 4);
-        assert_eq!(RunPhase::Preflight.concurrency(2, 10), 2);
-        assert_eq!(RunPhase::Preflight.concurrency(16, 2), 2);
+    fn run_phase_concurrency_honors_execution_requests() {
         assert_eq!(RunPhase::Execution.concurrency(16, 10), 10);
         assert_eq!(RunPhase::Execution.concurrency(32, 64), 32);
         assert_eq!(RunPhase::Execution.concurrency(0, 0), 1);
@@ -2266,13 +2225,6 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(scheduled, ["java", "rust", "asm", "fast"]);
-
-        let preflight = scheduled_task_indices(&tasks)
-            .into_iter()
-            .map(|index| tasks[index].name.as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(preflight, scheduled);
 
         let _ = fs::remove_dir_all(root);
     }

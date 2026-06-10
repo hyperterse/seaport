@@ -319,23 +319,52 @@ fn resolve_package_dataset(dataset: &str) -> Result<ResolvedRegistryDataset, Cli
     }
 
     progress(&format!("preparing {} packaged tasks", task_versions.len()))?;
-    let mut task_paths = Vec::with_capacity(task_versions.len());
-
-    for (index, task) in task_versions.iter().enumerate() {
-        verbose_progress(&format!(
-            "preparing package task {}/{}: {}/{}",
-            index + 1,
-            task_versions.len(),
-            task.package.org.name,
-            task.package.name
-        ))?;
-        task_paths.push(download_package_task(task)?);
-    }
+    let task_paths = download_package_tasks(&task_versions)?;
 
     Ok(ResolvedRegistryDataset {
         name: reference.display_name(),
         task_paths,
     })
+}
+
+/// Downloads dataset tasks with bounded parallelism; archives are independent
+/// and network-bound, so serial fetches dominate cold-cache resolution time.
+fn download_package_tasks(task_versions: &[PackageTaskVersion]) -> Result<Vec<PathBuf>, CliError> {
+    use std::sync::Mutex;
+
+    let worker_count = task_versions.len().clamp(1, 6);
+    let next_index = Mutex::new(0usize);
+    let results: Vec<Mutex<Option<Result<PathBuf, CliError>>>> =
+        task_versions.iter().map(|_| Mutex::new(None)).collect();
+
+    thread::scope(|scope| {
+        for _ in 0..worker_count {
+            scope.spawn(|| loop {
+                let index = {
+                    let mut next = next_index.lock().expect("download queue");
+                    let index = *next;
+                    *next += 1;
+                    index
+                };
+
+                let Some(task) = task_versions.get(index) else {
+                    break;
+                };
+
+                let result = download_package_task(task);
+                *results[index].lock().expect("download result") = Some(result);
+            });
+        }
+    });
+
+    results
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .expect("download result")
+                .unwrap_or_else(|| Err(CliError::task_failed("package download did not finish")))
+        })
+        .collect()
 }
 
 fn resolve_package_task(task_name: &str) -> Result<ResolvedRegistryDataset, CliError> {

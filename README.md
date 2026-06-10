@@ -315,7 +315,10 @@ Docker execution uses:
 - `no-new-privileges`
 - read-only container root filesystem
 - non-root numeric user
-- CPU, memory, swap, PID, and wall-clock limits
+- CPU, memory, swap, PID, and wall-clock limits (task limits are boosted to
+  use idle host resources by default; pass `--strict-resources` to enforce
+  the task's own `cpus`/`memory_mb` exactly)
+- per-trial `/app` docker volume seeded from the environment image
 - phase-specific network mode from `task.toml`
 
 Use `network_mode = "no-network"` for isolated tasks and `network_mode =
