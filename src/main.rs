@@ -25,9 +25,10 @@ use registry::{
     set_log_mode as set_registry_log_mode,
 };
 use sandbox::{
-    ensure_sandbox_backend_available, prepare_container_writable_dir, run_task_scripts,
-    set_log_mode as set_sandbox_log_mode, AgentStep, ExternalAgent, PhaseEnvs, SandboxAgent,
-    SandboxBackend, ScriptOutputs, TaskScriptRequest,
+    cleanup_orphaned_trial_containers, ensure_sandbox_backend_available,
+    prepare_container_writable_dir, run_task_scripts, set_log_mode as set_sandbox_log_mode,
+    AgentStep, ExternalAgent, PhaseEnvs, SandboxAgent, SandboxBackend, ScriptOutputs,
+    TaskScriptRequest,
 };
 use target::{RunTarget, TaskRef, TaskSelection};
 
@@ -197,6 +198,10 @@ fn run_target(
 
     if !target.tasks.is_empty() {
         ensure_sandbox_backend_available(options.backend)?;
+
+        if options.backend == SandboxBackend::Docker {
+            cleanup_orphaned_trial_containers();
+        }
     }
 
     let execution_started = Instant::now();

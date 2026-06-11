@@ -19,6 +19,8 @@ const DEFAULT_CONTAINER_MEMORY_MB: u64 = 1024;
 const DEFAULT_CONTAINER_CPUS: &str = "1.0";
 const BOOSTED_CONTAINER_CPUS_MAX: usize = 8;
 const CONTAINER_PIDS_LIMIT: &str = "4096";
+const TRIAL_CONTAINER_LABEL: &str = "io.seaport.trial=1";
+const TRIAL_PARENT_PID_LABEL_KEY: &str = "io.seaport.parent-pid";
 const DEFAULT_COMPAT_DOCKER_PLATFORM: &str = "linux/amd64";
 const DOCKER_BUILD_ATTEMPTS: usize = 3;
 const DOCKER_BUILD_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -136,6 +138,59 @@ pub(crate) fn run_task_scripts(run: TaskScriptRequest<'_>) -> Result<ScriptOutpu
             run_scripts_locally(runtime, run.agent, run.envs, &environment)
         }
     }
+}
+
+/// Removes trial containers whose owning seaport process is gone. Trial
+/// containers idle until removed, so a killed run (Ctrl-C, crash) would
+/// otherwise leak them running forever.
+pub(crate) fn cleanup_orphaned_trial_containers() {
+    let Ok(output) = Command::new("docker")
+        .args([
+            "ps",
+            "--all",
+            "--filter",
+            &format!("label={TRIAL_CONTAINER_LABEL}"),
+            "--format",
+            &format!("{{{{.Names}}}}\t{{{{.Label \"{TRIAL_PARENT_PID_LABEL_KEY}\"}}}}"),
+        ])
+        .output()
+    else {
+        return;
+    };
+
+    if !output.status.success() {
+        return;
+    }
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some((name, parent_pid)) = line.split_once('\t') else {
+            continue;
+        };
+
+        if name.is_empty() || parent_pid.trim().is_empty() {
+            continue;
+        }
+
+        if process_is_alive(parent_pid.trim()) {
+            continue;
+        }
+
+        eprintln!("seaport: removing orphaned trial container {name}");
+        cleanup_docker_container(name);
+    }
+}
+
+fn process_is_alive(pid: &str) -> bool {
+    if pid.parse::<u32>().is_err() {
+        return true;
+    }
+
+    Command::new("ps")
+        .args(["-p", pid])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 pub(crate) fn ensure_sandbox_backend_available(backend: SandboxBackend) -> Result<(), CliError> {
@@ -797,6 +852,8 @@ fn docker_start_command(start: &StartTrialContainer<'_>) -> Command {
         start.network.as_docker_run_arg(),
         "--pids-limit",
         CONTAINER_PIDS_LIMIT,
+        "--label",
+        TRIAL_CONTAINER_LABEL,
         "--env",
         "APP_DIR=/app",
         "--env",
@@ -807,6 +864,11 @@ fn docker_start_command(start: &StartTrialContainer<'_>) -> Command {
         "SEAPORT_INSTRUCTION_PATH=/seaport/task/instruction.md",
         "--env",
         "COBCPY=/app/copybooks:/app/COPYBOOKS:/app/src/copybooks:/app/src/COPYBOOKS",
+    ]);
+
+    command.args([
+        "--label",
+        &format!("{TRIAL_PARENT_PID_LABEL_KEY}={}", std::process::id()),
     ]);
 
     if let Some(memory_mb) = start.resources.memory_mb {
@@ -1727,6 +1789,9 @@ fn cleanup_docker_container(container_name: &str) {
         .output()
     {
         Ok(output) if output.status.success() => {}
+        // A concurrent removal (e.g. the API call above already accepted it) or
+        // an already-gone container is the desired end state, not a failure.
+        Ok(output) if docker_removal_already_underway(&output) => {}
         Ok(output) => {
             eprintln!(
                 "seaport: warning: could not remove docker container {container_name} (status: {})\nstderr:\n{}",
@@ -1740,6 +1805,13 @@ fn cleanup_docker_container(container_name: &str) {
             );
         }
     }
+}
+
+fn docker_removal_already_underway(output: &Output) -> bool {
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    stderr.contains("already in progress")
+        || stderr.contains("no such container")
+        || stderr.contains("is already in progress")
 }
 
 fn cleanup_docker_image(image: &str) {

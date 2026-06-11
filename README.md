@@ -308,18 +308,17 @@ seaport run -p path/to/task --backend docker
 
 Docker execution uses:
 
-- separate containers for agent and verifier phases
-- read-only task mount at `/seaport/task`
-- writable `/app`, `/logs`, `/tmp`, and `/run`
-- dropped Linux capabilities
-- `no-new-privileges`
-- read-only container root filesystem
-- non-root numeric user
+- one container per trial; the agent and verifier run in it via `docker exec`,
+  so runtime state the solution creates (installed packages, tool caches)
+  is still present for the verifier
+- a writable container filesystem with default Linux capabilities, so tasks
+  can install packages at runtime
+- read-only task mounts at `/seaport/task` and `/tests`
 - CPU, memory, swap, PID, and wall-clock limits (task limits are boosted to
   use idle host resources by default; pass `--strict-resources` to enforce
   the task's own `cpus`/`memory_mb` exactly)
-- per-trial `/app` docker volume seeded from the environment image
-- phase-specific network mode from `task.toml`
+- phase-specific network mode from `task.toml`, switched between phases when
+  they differ
 
 Use `network_mode = "no-network"` for isolated tasks and `network_mode =
 "public"` when the task explicitly needs network access. Phase-specific
