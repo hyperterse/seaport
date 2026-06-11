@@ -444,8 +444,15 @@ fn run_scripts_in_docker(
         prep_container_workspace(&container, runtime.task_label)?;
 
         if multi_step {
-            return run_steps_in_container(&container, &runtime, environment, agent_kind, envs)
-                .map(|(steps, reward)| TrialScripts::MultiStep { steps, reward });
+            return run_steps_in_container(
+                &container,
+                &runtime,
+                environment,
+                agent_kind,
+                envs,
+                logs_root,
+            )
+            .map(|(steps, reward)| TrialScripts::MultiStep { steps, reward });
         }
 
         let agent = match agent_kind {
@@ -515,6 +522,10 @@ fn run_scripts_in_docker(
                 verifier_env_cfg,
                 logs_root,
                 &verifier_env,
+                &environment.artifacts,
+                "tests/test.sh",
+                environment.verifier_timeout,
+                environment.verifier_user.as_deref(),
             )?,
             // Shared verifier mode (default): exec the verifier in the agent
             // container, where state outside /app is still present.
@@ -566,12 +577,37 @@ fn run_steps_in_container(
     environment: &TaskEnvironment,
     agent_kind: &SandboxAgent,
     envs: &PhaseEnvs,
+    logs_root: &Path,
 ) -> Result<(Vec<StepOutcome>, crate::Rewards), CliError> {
     populate_writable_tests(container)?;
 
     let mut outcomes: Vec<StepOutcome> = Vec::with_capacity(environment.steps.len());
 
     for step in &environment.steps {
+        // Per-step setup: if the step ships a workdir/setup.sh, seed it into
+        // /app and run it before the agent. A non-zero setup exit aborts the
+        // remaining steps (matching harbor's "setup failure aborts").
+        if step_has_setup(runtime, step) {
+            let setup = run_step_setup(container, runtime, step)?;
+            if !setup.status.success() {
+                print_backend_notice(
+                    runtime.task_label,
+                    "steps",
+                    &format!(
+                        "step `{}` setup.sh failed (status: {}); aborting remaining steps",
+                        step.name, setup.status
+                    ),
+                );
+                outcomes.push(StepOutcome {
+                    name: step.name.clone(),
+                    agent: AgentStep::nop(),
+                    verifier: setup,
+                    rewards: crate::Rewards::default(),
+                });
+                break;
+            }
+        }
+
         let agent = run_step_agent(container, runtime, step, agent_kind, envs)?;
 
         collect_artifacts(
@@ -581,44 +617,74 @@ fn run_steps_in_container(
             runtime.task_label,
         );
 
-        // The verifier may run on a different network than the agent; switch to
-        // it for the verifier, then back so the next step's agent runs on the
-        // agent network again.
-        let switch_network = environment.verifier_network != environment.agent_network;
-        if switch_network {
-            switch_container_network(
-                container,
-                environment.agent_network,
-                environment.verifier_network,
-            )?;
-        }
-
-        // Reset the reward files so we read this step's reward, not a prior
-        // step's. Best-effort: a fresh `/logs/verifier` may have neither file.
-        reset_reward_files(container);
-
+        let verifier_script = format!("steps/{}/tests/test.sh", step.name);
         let verifier_env = env_refs(&envs.verifier);
-        let verifier = exec_in_container(ContainerExec {
-            container,
-            task_label: runtime.task_label,
-            phase: "verifier",
-            label: "steps/tests/test.sh",
-            invocation: ContainerInvocation::TaskScript(&format!(
-                "steps/{}/tests/test.sh",
-                step.name
-            )),
-            env: &verifier_env,
-            timeout: step.verifier_timeout,
-            user: step.verifier_user.as_deref(),
-        })?;
 
-        if switch_network {
-            switch_container_network(
-                container,
-                environment.verifier_network,
-                environment.agent_network,
-            )?;
-        }
+        let verifier = match &environment.verifier_environment {
+            // Per-step separate verifier (harbor parity): run this step's
+            // verifier in a fresh container seeded only with the step's curated
+            // artifacts. The step's verifier timeout/user apply.
+            Some(verifier_env_cfg) => {
+                // Reset the reward files in the shared agent container as well,
+                // so a step that writes no reward in the verifier does not read
+                // a stale reward. The verifier writes its reward to the shared
+                // /logs mount, which the fresh container also mounts.
+                reset_reward_files(container);
+
+                run_verifier_in_separate_container(
+                    runtime,
+                    container,
+                    environment,
+                    verifier_env_cfg,
+                    logs_root,
+                    &verifier_env,
+                    &step.artifacts,
+                    &verifier_script,
+                    step.verifier_timeout,
+                    step.verifier_user.as_deref(),
+                )?
+            }
+            // Shared verifier (default): exec in the agent container.
+            None => {
+                // The verifier may run on a different network than the agent;
+                // switch to it for the verifier, then back so the next step's
+                // agent runs on the agent network again.
+                let switch_network = environment.verifier_network != environment.agent_network;
+                if switch_network {
+                    switch_container_network(
+                        container,
+                        environment.agent_network,
+                        environment.verifier_network,
+                    )?;
+                }
+
+                // Reset the reward files so we read this step's reward, not a
+                // prior step's. Best-effort: a fresh `/logs/verifier` may have
+                // neither file.
+                reset_reward_files(container);
+
+                let verifier = exec_in_container(ContainerExec {
+                    container,
+                    task_label: runtime.task_label,
+                    phase: "verifier",
+                    label: "steps/tests/test.sh",
+                    invocation: ContainerInvocation::TaskScript(&verifier_script),
+                    env: &verifier_env,
+                    timeout: step.verifier_timeout,
+                    user: step.verifier_user.as_deref(),
+                })?;
+
+                if switch_network {
+                    switch_container_network(
+                        container,
+                        environment.verifier_network,
+                        environment.agent_network,
+                    )?;
+                }
+
+                verifier
+            }
+        };
 
         // A step that wrote no reward contributes an empty reward (which the
         // aggregation treats as "no valid reward" for the mean strategy).
@@ -645,6 +711,44 @@ fn run_steps_in_container(
     let reward = aggregate_step_rewards(environment.reward_strategy, &outcomes);
 
     Ok((outcomes, reward))
+}
+
+/// Whether the step ships a host-side `steps/<name>/workdir/setup.sh`.
+fn step_has_setup(runtime: &TaskRuntime<'_>, step: &StepConfig) -> bool {
+    runtime
+        .task_path
+        .join("steps")
+        .join(&step.name)
+        .join("workdir")
+        .join("setup.sh")
+        .is_file()
+}
+
+/// Seeds `steps/<name>/workdir/` into `/app` and runs `/app/setup.sh` in the
+/// shared agent container, as the step's agent user, honoring the step's agent
+/// timeout. Faithful-but-simple version of harbor's `_run_step_setup`.
+fn run_step_setup(
+    container: &str,
+    runtime: &TaskRuntime<'_>,
+    step: &StepConfig,
+) -> Result<Output, CliError> {
+    let workdir = format!("/seaport/task/steps/{}/workdir", step.name);
+    let script = format!(
+        "if [ -d {workdir} ]; then cp -a {workdir}/. /app/; fi && \
+         if [ -f /app/setup.sh ]; then bash /app/setup.sh; fi",
+        workdir = workdir
+    );
+
+    exec_in_container(ContainerExec {
+        container,
+        task_label: runtime.task_label,
+        phase: "setup",
+        label: &format!("steps/{}/workdir/setup.sh", step.name),
+        invocation: ContainerInvocation::ShellCommand(&script),
+        env: &[],
+        timeout: step.agent_timeout,
+        user: step.agent_user.as_deref(),
+    })
 }
 
 fn run_step_agent(
@@ -810,18 +914,23 @@ fn aggregate_rewards(strategy: RewardStrategy, rewards: &[crate::Rewards]) -> cr
 
 /// Runs the verifier in a dedicated container (harbor's "separate" mode).
 ///
-/// The agent's `/app` workspace is copied out of the agent container and
-/// seeded into a fresh verifier container started from the verifier image, on
+/// The verifier runs in a fresh container started from the verifier image, on
 /// the verifier network, with the same /tests, /solution, /seaport/task and
-/// /logs mounts. `tests/test.sh` then runs there, isolated from the agent's
-/// installed packages, $HOME, and any filesystem changes outside /app.
+/// /logs mounts. It is isolated from the agent's installed packages, $HOME, and
+/// any filesystem changes the agent made — which is the whole point of separate
+/// mode.
 ///
-/// Fidelity gap vs harbor: harbor uploads only the task-declared *artifacts*
-/// into the clean verifier environment. Seaport has no artifact-declaration
-/// mechanism, so it seeds the verifier with the agent's entire `/app`
-/// workspace. The verifier is still isolated from the agent's installed
-/// packages, $HOME, and non-/app filesystem side-effects — which is the main
-/// point of separate mode — but it is not restricted to a curated artifact set.
+/// To give the verifier the agent's work product, this mirrors harbor's
+/// `upload_artifacts`: the declared `artifacts` (plus the conventional
+/// `/logs/artifacts`) are first collected OUT of the agent container into a host
+/// temp dir, then uploaded back INTO the fresh verifier at each artifact's
+/// SOURCE path. Nothing else crosses over.
+///
+/// Harbor's contract (and now ours): a separate-verifier task MUST declare the
+/// work product it expects the verifier to see (e.g. `artifacts = [{ source =
+/// "/app", destination = "app" }]`). With no declared artifacts the verifier
+/// gets only `/logs/artifacts` — `/app` is NOT seeded.
+#[allow(clippy::too_many_arguments)]
 fn run_verifier_in_separate_container(
     runtime: &TaskRuntime<'_>,
     agent_container: &str,
@@ -829,6 +938,10 @@ fn run_verifier_in_separate_container(
     verifier_env_cfg: &VerifierEnvironment,
     logs_root: &Path,
     verifier_env: &[(&str, &str)],
+    artifacts: &[ArtifactSpec],
+    verifier_script: &str,
+    verifier_timeout: Duration,
+    verifier_user: Option<&str>,
 ) -> Result<Output, CliError> {
     // Build a synthetic TaskEnvironment so the verifier image reuses the exact
     // same prepare/pull/build path as the agent image.
@@ -851,11 +964,17 @@ fn run_verifier_in_separate_container(
         prepare_started.elapsed(),
     );
 
-    // Capture the agent's /app into a unique host temp dir, then seed it into
-    // the fresh verifier container. Cleaned up unconditionally below.
-    let workspace = AgentWorkspaceCopy::capture(agent_container, runtime)?;
+    // Collect the declared artifacts (and the conventional /logs/artifacts) out
+    // of the agent container into a unique host temp dir, then upload them into
+    // the fresh verifier. Cleaned up unconditionally on drop.
+    let curated = CuratedArtifacts::collect(agent_container, runtime, artifacts);
 
     let verifier_container = docker_container_name(runtime.run_id, "verifier");
+    // Multi-step tasks keep their verifiers under `steps/<name>/tests/` and have
+    // no top-level `tests/` dir to bind; single-step tasks do. Bind it when it
+    // exists, otherwise populate a writable `/tests` from the task mount (as the
+    // shared multi-step path does).
+    let bind_tests = runtime.task_path.join("tests").is_dir();
     let start_started = Instant::now();
     let result = (|| {
         start_trial_container(
@@ -867,7 +986,7 @@ fn run_verifier_in_separate_container(
                 network: environment.verifier_network,
                 platform: image.platform.as_deref(),
                 resources: &verifier_env_cfg.resources,
-                bind_tests: true,
+                bind_tests,
             },
             runtime.task_label,
         )?;
@@ -878,21 +997,25 @@ fn run_verifier_in_separate_container(
             start_started.elapsed(),
         );
 
-        // Seed /app with the captured workspace, then re-run the prep chmod so
-        // the tree is world-writable for whatever user the verifier image picks
-        // (matching the agent container's prep).
-        workspace.seed_into(&verifier_container)?;
+        if !bind_tests {
+            populate_writable_tests(&verifier_container)?;
+        }
+
+        // Upload the curated artifacts to their source paths in the verifier,
+        // then re-run the prep chmod so any seeded tree is world-writable for
+        // whatever user the verifier image picks (matching the agent prep).
+        curated.upload_into(&verifier_container, artifacts)?;
         prep_container_workspace(&verifier_container, runtime.task_label)?;
 
         exec_in_container(ContainerExec {
             container: &verifier_container,
             task_label: runtime.task_label,
             phase: "verifier",
-            label: "tests/test.sh",
-            invocation: ContainerInvocation::TaskScript("tests/test.sh"),
+            label: verifier_script,
+            invocation: ContainerInvocation::TaskScript(verifier_script),
             env: verifier_env,
-            timeout: environment.verifier_timeout,
-            user: environment.verifier_user.as_deref(),
+            timeout: verifier_timeout,
+            user: verifier_user,
         })
     })();
 
@@ -903,83 +1026,173 @@ fn run_verifier_in_separate_container(
     if image.remove_after_run {
         cleanup_docker_image(&image.reference);
     }
-    drop(workspace);
+    drop(curated);
 
     result
 }
 
-/// A host temp directory holding a copy of the agent container's `/app`,
-/// removed on drop. Used to transfer the agent's work product into a fresh
-/// verifier container in separate mode.
-struct AgentWorkspaceCopy {
+/// A host temp directory holding the curated artifacts collected out of the
+/// agent container, removed on drop. Used to transfer only the declared work
+/// product (plus the conventional `/logs/artifacts`) into a fresh verifier
+/// container in separate mode, mirroring harbor's download/upload artifact flow.
+struct CuratedArtifacts {
     dir: PathBuf,
 }
 
-impl AgentWorkspaceCopy {
-    fn capture(agent_container: &str, runtime: &TaskRuntime<'_>) -> Result<Self, CliError> {
-        let dir = env::temp_dir().join(format!("seaport-verifier-app-{}", runtime.run_id));
+impl CuratedArtifacts {
+    /// Collects the declared artifacts (and the conventional `/logs/artifacts`)
+    /// out of the agent container into a unique host temp dir. Declared specs
+    /// land under `<dir>/declared/...` (per `artifact_destination`) and the
+    /// conventional dir's contents under `<dir>/convention`, so each can be
+    /// uploaded back to its own source path independently. Collection is
+    /// best-effort, matching `collect_artifacts`.
+    fn collect(
+        agent_container: &str,
+        runtime: &TaskRuntime<'_>,
+        artifacts: &[ArtifactSpec],
+    ) -> Self {
+        let dir = env::temp_dir().join(format!("seaport-verifier-artifacts-{}", runtime.run_id));
         // Start from a clean directory in case a prior run left one behind.
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir)?;
 
-        // `docker cp <container>:/app/.` copies the *contents* of /app into the
-        // destination directory (the trailing `/.`), so we can later copy them
-        // back into the verifier's /app the same way.
-        let output = Command::new("docker")
-            .arg("cp")
-            .arg(format!("{agent_container}:/app/."))
-            .arg(&dir)
-            .output()?;
-
-        if !output.status.success() {
-            let _ = fs::remove_dir_all(&dir);
-            return Err(CliError::task_failed(format!(
-                "docker cp of agent /app failed (status: {})\nstderr:\n{}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            )));
+        let declared = dir.join("declared");
+        for spec in artifacts {
+            let dest = artifact_destination(&declared, spec);
+            let _ = collect_one_artifact(agent_container, spec, &dest);
         }
 
-        Ok(Self { dir })
+        // The conventional `/logs/artifacts`: collect its contents (best-effort)
+        // only when it actually holds something.
+        if container_dir_has_contents(agent_container, CONTAINER_ARTIFACTS_DIR) {
+            let convention = dir.join("convention");
+            if fs::create_dir_all(&convention).is_ok() {
+                let _ = run_artifact_command(artifact_copy_command(
+                    agent_container,
+                    &format!("{CONTAINER_ARTIFACTS_DIR}/."),
+                    &convention,
+                ));
+            }
+        }
+
+        Self { dir }
     }
 
-    /// Copies the captured workspace into the target container's `/app`.
-    fn seed_into(&self, container: &str) -> Result<(), CliError> {
-        // Ensure /app exists in the fresh container before copying into it.
-        let mkdir = Command::new("docker")
-            .args(["exec", "--user", "0:0", container, "mkdir", "-p", "/app"])
-            .output()?;
-        if !mkdir.status.success() {
-            return Err(CliError::task_failed(format!(
-                "could not create /app in verifier container {container} (status: {})\nstderr:\n{}",
-                mkdir.status,
-                String::from_utf8_lossy(&mkdir.stderr)
-            )));
+    /// Uploads each collected artifact back into the target container at its
+    /// SOURCE path, mirroring harbor's `upload_artifacts`. The conventional
+    /// `/logs/artifacts` contents are uploaded to `/logs/artifacts` in the
+    /// target. A spec whose host copy is missing (its collection failed or
+    /// produced nothing) is skipped.
+    fn upload_into(&self, container: &str, artifacts: &[ArtifactSpec]) -> Result<(), CliError> {
+        let declared = self.dir.join("declared");
+        for spec in artifacts {
+            let host_path = artifact_destination(&declared, spec);
+            if !host_path.exists() {
+                continue;
+            }
+            upload_artifact(container, &host_path, &spec.source)?;
         }
 
-        let source = self.dir.join(".");
-        let output = Command::new("docker")
-            .arg("cp")
-            .arg(&source)
-            .arg(format!("{container}:/app"))
-            .output()?;
-
-        if !output.status.success() {
-            return Err(CliError::task_failed(format!(
-                "docker cp of agent workspace into verifier {container} failed (status: {})\nstderr:\n{}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            )));
+        let convention = self.dir.join("convention");
+        if dir_has_contents(&convention) {
+            upload_artifact(container, &convention, CONTAINER_ARTIFACTS_DIR)?;
         }
 
         Ok(())
     }
 }
 
-impl Drop for AgentWorkspaceCopy {
+impl Drop for CuratedArtifacts {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
     }
+}
+
+/// Uploads a host file or directory into `container` at `target`, creating the
+/// target's parent directories first. For a directory, its *contents* are copied
+/// into `target` (so the verifier sees `<target>/<entry>` for each entry),
+/// matching harbor's `upload_dir`.
+fn upload_artifact(container: &str, host_path: &Path, target: &str) -> Result<(), CliError> {
+    let is_dir = host_path.is_dir();
+
+    // Ensure the target (for a dir) or its parent (for a file) exists, as root,
+    // before copying into it.
+    let mkdir_target = if is_dir {
+        target.to_owned()
+    } else {
+        parent_dir(target)
+    };
+    let mkdir = Command::new("docker")
+        .args([
+            "exec",
+            "--user",
+            "0:0",
+            container,
+            "mkdir",
+            "-p",
+            &mkdir_target,
+        ])
+        .output()?;
+    if !mkdir.status.success() {
+        return Err(CliError::task_failed(format!(
+            "could not create {mkdir_target} in verifier container {container} (status: {})\nstderr:\n{}",
+            mkdir.status,
+            String::from_utf8_lossy(&mkdir.stderr)
+        )));
+    }
+
+    // For a directory, copy its contents (trailing `/.`) into the target so the
+    // tree merges onto the target path rather than nesting under it. For a file,
+    // copy it directly to the target path.
+    let (source_arg, dest_arg) = artifact_upload_args(host_path, container, target, is_dir);
+
+    let output = Command::new("docker")
+        .arg("cp")
+        .arg(&source_arg)
+        .arg(&dest_arg)
+        .output()?;
+
+    if !output.status.success() {
+        return Err(CliError::task_failed(format!(
+            "docker cp of artifact into verifier {container} failed (status: {})\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(())
+}
+
+/// The `docker cp` source and destination for uploading a curated artifact back
+/// into a verifier container at `target`. A directory uploads its contents
+/// (trailing `/.`); a file uploads as-is. Pure helper for unit testing the
+/// argument shape.
+fn artifact_upload_args(
+    host_path: &Path,
+    container: &str,
+    target: &str,
+    is_dir: bool,
+) -> (PathBuf, String) {
+    let source = if is_dir {
+        host_path.join(".")
+    } else {
+        host_path.to_path_buf()
+    };
+    (source, format!("{container}:{target}"))
+}
+
+/// The parent directory of an absolute container path, as a string (defaults to
+/// `/` when there is no parent).
+fn parent_dir(path: &str) -> String {
+    match path.trim_end_matches('/').rsplit_once('/') {
+        Some(("", _)) | None => "/".to_owned(),
+        Some((parent, _)) => parent.to_owned(),
+    }
+}
+
+fn dir_has_contents(dir: &Path) -> bool {
+    fs::read_dir(dir)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
 }
 
 struct DockerImage {
@@ -4401,6 +4614,45 @@ artifacts = [
         assert_eq!(args.first().map(String::as_str), Some("cp"));
         assert!(args.iter().any(|arg| arg == "seaport-trial-x:/app/out.txt"));
         assert!(args.iter().any(|arg| arg == "/tmp/a/out.txt"));
+    }
+
+    #[test]
+    fn artifact_upload_args_uploads_dir_contents_and_file_verbatim() {
+        // A directory artifact `{source="/app", destination="app"}` lives at
+        // `<host>/app` and uploads its *contents* back to the verifier at /app.
+        let host = Path::new("/tmp/seaport-artifacts");
+        let app_host = artifact_destination(
+            host,
+            &ArtifactSpec {
+                source: "/app".to_owned(),
+                destination: Some("app".to_owned()),
+                exclude: Vec::new(),
+            },
+        );
+        assert_eq!(app_host, host.join("app"));
+
+        let (source, dest) = artifact_upload_args(&app_host, "seaport-verifier-x", "/app", true);
+        assert_eq!(source, host.join("app").join("."));
+        assert_eq!(dest, "seaport-verifier-x:/app");
+
+        // A file artifact uploads verbatim to its target path.
+        let (file_source, file_dest) = artifact_upload_args(
+            &host.join("out.txt"),
+            "seaport-verifier-x",
+            "/app/out.txt",
+            false,
+        );
+        assert_eq!(file_source, host.join("out.txt"));
+        assert_eq!(file_dest, "seaport-verifier-x:/app/out.txt");
+    }
+
+    #[test]
+    fn parent_dir_returns_container_parent() {
+        assert_eq!(parent_dir("/app/out.txt"), "/app");
+        assert_eq!(parent_dir("/app/nested/dir"), "/app/nested");
+        assert_eq!(parent_dir("/app"), "/");
+        assert_eq!(parent_dir("/app/"), "/");
+        assert_eq!(parent_dir("out.txt"), "/");
     }
 
     #[test]
