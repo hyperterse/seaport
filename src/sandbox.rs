@@ -1732,16 +1732,13 @@ fn exec_in_container(exec: ContainerExec<'_>) -> Result<Output, CliError> {
         )));
     }
 
-    if !output.status.success() {
-        return Err(CliError::task_failed(format!(
-            "sandboxed docker command failed: {} (status: {})\nstdout:\n{}\nstderr:\n{}",
-            exec.label,
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-
+    // A non-zero exit from the agent or verifier script is not, by itself, a
+    // trial failure: the verifier's reward.txt is the source of truth, and the
+    // script's exit code is recorded for inspection. This matches harbor, where
+    // the agent phase is best-effort and the verifier always runs and decides
+    // the reward. The status (and captured output) travel back in the returned
+    // Output. Only hard failures — timeouts above, or a verifier that never
+    // writes a reward — fail the trial.
     Ok(output)
 }
 
@@ -2090,16 +2087,9 @@ fn run_script_locally(run: LocalScriptRun<'_>) -> Result<Output, CliError> {
         )));
     }
 
-    if !output.status.success() {
-        return Err(CliError::task_failed(format!(
-            "script failed: {} (status: {})\nstdout:\n{}\nstderr:\n{}",
-            run.script.display(),
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-
+    // As with the docker backend, a non-zero script exit is informational, not
+    // a trial failure: the verifier's reward.txt decides the outcome. The exit
+    // status is preserved in the returned Output.
     Ok(output)
 }
 

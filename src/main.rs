@@ -2715,9 +2715,13 @@ mod tests {
         assert!(result.contains("\"tasks_passed\": 1"));
         assert!(result.contains("\"tasks_failed\": 1"));
         assert!(result.contains("\"task\":\"acme/bad\""));
-        assert!(result.contains("\"error\":\"script failed:"));
+        // The solution script exits non-zero, but that no longer fails the
+        // trial on its own (matching harbor): the verifier runs and its
+        // reward.txt of 0 is what marks the task failed.
+        assert!(result.contains("\"error\":\"verifier returned reward 0\""));
+        assert!(!result.contains("script failed:"));
         assert!(failed_result.contains("\"passed\": false"));
-        assert!(failed_result.contains("\"error\": \"script failed:"));
+        assert!(failed_result.contains("\"error\": \"verifier returned reward 0\""));
 
         let _ = fs::remove_dir_all(root);
     }
