@@ -59,6 +59,7 @@ pub(crate) struct TaskScriptRequest<'a> {
     pub(crate) run_id: &'a str,
     pub(crate) app_dir: &'a Path,
     pub(crate) logs_dir: &'a Path,
+    pub(crate) artifacts_dir: &'a Path,
     pub(crate) agent: &'a SandboxAgent,
     pub(crate) envs: &'a PhaseEnvs,
     pub(crate) backend: SandboxBackend,
@@ -174,6 +175,7 @@ pub(crate) fn run_task_scripts(run: TaskScriptRequest<'_>) -> Result<ScriptOutpu
         run_id: run.run_id,
         app_dir: run.app_dir,
         logs_dir: run.logs_dir,
+        artifacts_dir: run.artifacts_dir,
     };
 
     match run.backend {
@@ -259,6 +261,7 @@ struct TaskRuntime<'a> {
     run_id: &'a str,
     app_dir: &'a Path,
     logs_dir: &'a Path,
+    artifacts_dir: &'a Path,
 }
 
 #[cfg(unix)]
@@ -441,6 +444,16 @@ fn run_scripts_in_docker(
                 )
             }
         };
+
+        // Collect declared artifacts (plus the conventional /logs/artifacts
+        // dir) out of the container after the agent runs, matching harbor's
+        // single-step collection. Best-effort: never fails the trial.
+        collect_artifacts(
+            &container,
+            &environment.artifacts,
+            runtime.artifacts_dir,
+            runtime.task_label,
+        );
 
         let verifier_env = env_refs(&envs.verifier);
 
@@ -695,6 +708,11 @@ struct TaskEnvironment {
     /// image/platform/resources here describe that verifier container. `None`
     /// keeps the default shared-container behavior, byte-for-byte unchanged.
     verifier_environment: Option<VerifierEnvironment>,
+    /// Task-declared artifacts to collect out of the trial container after the
+    /// agent runs, from the top-level `artifacts` array. Mirrors harbor's
+    /// artifact collection; the conventional `/logs/artifacts` dir is always
+    /// collected in addition to these.
+    artifacts: Vec<ArtifactSpec>,
 }
 
 /// The container configuration for a separate (isolated) verifier, declared via
@@ -833,6 +851,8 @@ fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
 
     reject_unsupported_task_os(&doc)?;
 
+    let artifacts = parse_artifacts(&doc);
+
     let mut environment = TaskEnvironment {
         image,
         prebuilt_image,
@@ -847,6 +867,7 @@ fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
         agent_user,
         verifier_user,
         verifier_environment: None,
+        artifacts,
     };
     environment.verifier_environment = verifier_environment(&doc, &environment)?;
 
@@ -1085,6 +1106,274 @@ fn parse_network_mode(field: &str, value: &str) -> Result<DockerNetwork, CliErro
     }
 }
 
+/// A task-declared artifact to collect from the trial container: a `source`
+/// path inside the container, copied to `destination` (or the source's basename)
+/// under the host artifacts dir, optionally pruning `exclude` glob patterns from
+/// a directory. Mirrors harbor's `ArtifactConfig`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ArtifactSpec {
+    source: String,
+    destination: Option<String>,
+    exclude: Vec<String>,
+}
+
+/// In-container conventional artifacts directory, always collected (its contents
+/// land at the root of the host artifacts dir), matching harbor.
+const CONTAINER_ARTIFACTS_DIR: &str = "/logs/artifacts";
+
+/// Parses the top-level `artifacts` array: each entry is either a source-path
+/// string or a table `{ source, destination?, exclude? }`.
+fn parse_artifacts(doc: &toml::Value) -> Vec<ArtifactSpec> {
+    let Some(items) = doc.get("artifacts").and_then(toml::Value::as_array) else {
+        return Vec::new();
+    };
+
+    items.iter().filter_map(parse_artifact_spec).collect()
+}
+
+fn parse_artifact_spec(value: &toml::Value) -> Option<ArtifactSpec> {
+    match value {
+        toml::Value::String(source) => Some(ArtifactSpec {
+            source: source.clone(),
+            destination: None,
+            exclude: Vec::new(),
+        }),
+        toml::Value::Table(table) => {
+            let source = table.get("source")?.as_str()?.to_owned();
+            let destination = table
+                .get("destination")
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned);
+            let exclude = table
+                .get("exclude")
+                .and_then(toml::Value::as_array)
+                .map(|patterns| {
+                    patterns
+                        .iter()
+                        .filter_map(|pattern| pattern.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            Some(ArtifactSpec {
+                source,
+                destination,
+                exclude,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Host path an artifact is copied to under `artifacts_dir`.
+fn artifact_destination(artifacts_dir: &Path, spec: &ArtifactSpec) -> PathBuf {
+    match spec.destination.as_deref() {
+        Some(".") => artifacts_dir.to_path_buf(),
+        Some(destination) => artifacts_dir.join(destination),
+        None => {
+            let name = spec
+                .source
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("artifact");
+            artifacts_dir.join(name)
+        }
+    }
+}
+
+/// `docker cp <container>:<source> <dest>` for a file or directory without
+/// exclude patterns.
+fn artifact_copy_command(container: &str, source: &str, dest: &Path) -> Command {
+    let mut command = Command::new("docker");
+    command
+        .arg("cp")
+        .arg(format!("{container}:{source}"))
+        .arg(dest);
+    command
+}
+
+/// Collects declared artifacts and the conventional `/logs/artifacts` directory
+/// out of the container into `artifacts_dir`, writing a manifest. Best-effort:
+/// a missing or unreadable source is recorded, never fatal, so artifact
+/// collection cannot fail a trial (matching harbor).
+fn collect_artifacts(
+    container: &str,
+    specs: &[ArtifactSpec],
+    artifacts_dir: &Path,
+    task_label: &str,
+) {
+    let mut entries: Vec<String> = Vec::new();
+
+    for spec in specs {
+        let dest = artifact_destination(artifacts_dir, spec);
+        let status = collect_one_artifact(container, spec, &dest);
+        entries.push(artifact_manifest_entry(
+            &spec.source,
+            &dest,
+            artifacts_dir,
+            status,
+        ));
+    }
+
+    // The conventional artifacts dir is always collected (its contents to the
+    // artifacts root), but only when it actually holds something, so trials that
+    // produce no artifacts leave no empty directory behind.
+    if container_dir_has_contents(container, CONTAINER_ARTIFACTS_DIR) {
+        if let Err(error) = fs::create_dir_all(artifacts_dir) {
+            print_backend_notice(
+                task_label,
+                "artifacts",
+                &format!("could not create artifacts dir: {error}"),
+            );
+            return;
+        }
+
+        let status = match run_artifact_command(artifact_copy_command(
+            container,
+            &format!("{CONTAINER_ARTIFACTS_DIR}/."),
+            artifacts_dir,
+        )) {
+            Ok(()) => "ok",
+            Err(_) => "failed",
+        };
+        entries.push(artifact_manifest_entry(
+            CONTAINER_ARTIFACTS_DIR,
+            artifacts_dir,
+            artifacts_dir,
+            status,
+        ));
+    }
+
+    if entries.is_empty() {
+        return;
+    }
+
+    let manifest = format!(
+        "{{\n  \"artifacts\": [\n    {}\n  ]\n}}\n",
+        entries.join(",\n    ")
+    );
+    if let Err(error) = fs::write(artifacts_dir.join("manifest.json"), manifest) {
+        print_backend_notice(
+            task_label,
+            "artifacts",
+            &format!("could not write artifact manifest: {error}"),
+        );
+    }
+}
+
+fn collect_one_artifact(container: &str, spec: &ArtifactSpec, dest: &Path) -> &'static str {
+    if let Some(parent) = dest.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return "failed";
+        }
+    }
+
+    let result = if spec.exclude.is_empty() {
+        run_artifact_command(artifact_copy_command(container, &spec.source, dest))
+    } else {
+        copy_artifact_with_excludes(container, spec, dest)
+    };
+
+    match result {
+        Ok(()) => "ok",
+        Err(_) => "failed",
+    }
+}
+
+/// Copies a directory while pruning `exclude` glob patterns, by streaming a
+/// `tar` archive built inside the container (where the patterns are applied,
+/// exactly as harbor does) into a host `tar` that extracts it.
+fn copy_artifact_with_excludes(
+    container: &str,
+    spec: &ArtifactSpec,
+    dest: &Path,
+) -> Result<(), CliError> {
+    fs::create_dir_all(dest)?;
+
+    let mut producer = Command::new("docker");
+    producer.args(["exec", container, "tar", "-c", "-C", &spec.source]);
+    for pattern in &spec.exclude {
+        producer.arg(format!("--exclude={pattern}"));
+    }
+    producer.arg(".");
+    producer.stdout(Stdio::piped()).stderr(Stdio::null());
+
+    let mut producer = producer.spawn()?;
+    let archive = producer
+        .stdout
+        .take()
+        .ok_or_else(|| CliError::io("artifact tar stdout was not piped"))?;
+
+    let extract = Command::new("tar")
+        .arg("-x")
+        .arg("-C")
+        .arg(dest)
+        .stdin(archive)
+        .stderr(Stdio::null())
+        .status();
+
+    let producer_status = producer.wait();
+
+    match (extract, producer_status) {
+        (Ok(extract), Ok(producer)) if extract.success() && producer.success() => Ok(()),
+        _ => Err(CliError::task_failed(format!(
+            "could not collect artifact {} with excludes",
+            spec.source
+        ))),
+    }
+}
+
+fn run_artifact_command(mut command: Command) -> Result<(), CliError> {
+    let output = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+
+    if output.success() {
+        Ok(())
+    } else {
+        Err(CliError::task_failed("artifact command failed"))
+    }
+}
+
+fn container_dir_has_contents(container: &str, dir: &str) -> bool {
+    Command::new("docker")
+        .args([
+            "exec",
+            container,
+            "sh",
+            "-c",
+            &format!("test -d {dir} && [ -n \"$(ls -A {dir} 2>/dev/null)\" ]"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn artifact_manifest_entry(
+    source: &str,
+    dest: &Path,
+    artifacts_dir: &Path,
+    status: &str,
+) -> String {
+    let destination = dest
+        .strip_prefix(artifacts_dir)
+        .ok()
+        .map(|relative| relative.to_string_lossy().into_owned())
+        .filter(|relative| !relative.is_empty())
+        .unwrap_or_else(|| ".".to_owned());
+
+    format!(
+        "{{\"source\": \"{}\", \"destination\": \"{}\", \"status\": \"{}\"}}",
+        source.replace('\\', "\\\\").replace('"', "\\\""),
+        destination.replace('\\', "\\\\").replace('"', "\\\""),
+        status
+    )
+}
+
 fn reject_unsupported_task_os(doc: &toml::Value) -> Result<(), CliError> {
     let Some(os) = toml_doc::section_value(doc, "environment", "os") else {
         return Ok(());
@@ -1146,6 +1435,7 @@ fn toml_bool_value(doc: &toml::Value, section: &str, key: &str) -> Result<Option
 /// run as any user the image selects.
 const PREP_WORKSPACE_SCRIPT: &str = r#"set -e
 mkdir -p /app
+mkdir -p /logs/artifacts && chmod a+rwX /logs/artifacts
 if [ -d /seaport/task/environment/task_file ]; then
   rm -rf /app/task_file
   mkdir -p /app/task_file
@@ -2993,6 +3283,7 @@ mod tests {
             agent_user: None,
             verifier_user: None,
             verifier_environment: None,
+            artifacts: Vec::new(),
         };
         let command = docker_build_command(
             "seaport-task-test",
@@ -3090,6 +3381,7 @@ mod tests {
             agent_user: None,
             verifier_user: None,
             verifier_environment: None,
+            artifacts: Vec::new(),
         };
         let task = temp_task_dir("docker-cache-key");
         let environment_dir = task.join("environment");
@@ -3534,6 +3826,94 @@ docker_image = "verifier-image:latest"
         assert!(task_environment(&task).is_err());
 
         let _ = fs::remove_dir_all(task);
+    }
+
+    #[test]
+    fn parses_artifacts_in_string_and_table_forms() {
+        let doc = toml_doc::parse(
+            r#"
+artifacts = [
+  "/app/out.txt",
+  { source = "/app", destination = "app", exclude = [".git", "__pycache__"] },
+]
+"#,
+        )
+        .expect("toml");
+
+        let specs = parse_artifacts(&doc);
+
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].source, "/app/out.txt");
+        assert_eq!(specs[0].destination, None);
+        assert!(specs[0].exclude.is_empty());
+        assert_eq!(specs[1].source, "/app");
+        assert_eq!(specs[1].destination.as_deref(), Some("app"));
+        assert_eq!(specs[1].exclude, vec![".git", "__pycache__"]);
+    }
+
+    #[test]
+    fn no_artifacts_key_yields_empty_list() {
+        let doc = toml_doc::parse("[environment]\ncpus = 1\n").expect("toml");
+        assert!(parse_artifacts(&doc).is_empty());
+    }
+
+    #[test]
+    fn artifact_destination_resolves_destination_or_basename() {
+        let dir = Path::new("/tmp/artifacts");
+
+        let explicit = ArtifactSpec {
+            source: "/app".to_owned(),
+            destination: Some("app".to_owned()),
+            exclude: Vec::new(),
+        };
+        assert_eq!(artifact_destination(dir, &explicit), dir.join("app"));
+
+        let basename = ArtifactSpec {
+            source: "/app/results.json".to_owned(),
+            destination: None,
+            exclude: Vec::new(),
+        };
+        assert_eq!(
+            artifact_destination(dir, &basename),
+            dir.join("results.json")
+        );
+
+        let root = ArtifactSpec {
+            source: "/logs/artifacts".to_owned(),
+            destination: Some(".".to_owned()),
+            exclude: Vec::new(),
+        };
+        assert_eq!(artifact_destination(dir, &root), dir.to_path_buf());
+    }
+
+    #[test]
+    fn artifact_copy_command_targets_container_path() {
+        let command = artifact_copy_command(
+            "seaport-trial-x",
+            "/app/out.txt",
+            Path::new("/tmp/a/out.txt"),
+        );
+        let args = command_args(command);
+
+        assert_eq!(args.first().map(String::as_str), Some("cp"));
+        assert!(args.iter().any(|arg| arg == "seaport-trial-x:/app/out.txt"));
+        assert!(args.iter().any(|arg| arg == "/tmp/a/out.txt"));
+    }
+
+    #[test]
+    fn artifact_manifest_entry_is_relative_and_escaped() {
+        let dir = Path::new("/tmp/artifacts");
+        let entry = artifact_manifest_entry("/app", &dir.join("app"), dir, "ok");
+        assert_eq!(
+            entry,
+            "{\"source\": \"/app\", \"destination\": \"app\", \"status\": \"ok\"}"
+        );
+
+        let root = artifact_manifest_entry("/logs/artifacts", dir, dir, "ok");
+        assert_eq!(
+            root,
+            "{\"source\": \"/logs/artifacts\", \"destination\": \".\", \"status\": \"ok\"}"
+        );
     }
 
     #[test]

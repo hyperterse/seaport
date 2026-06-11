@@ -578,6 +578,8 @@ fn run_trial(
     let trial_dir = job_dir.join(&trial_name);
     let agent_dir = trial_dir.join("agent");
     let verifier_dir = trial_dir.join("verifier");
+    // Created lazily by the backend only when artifacts are actually collected.
+    let artifacts_dir = trial_dir.join("artifacts");
     let workspace = env::temp_dir().join(format!(
         "seaport-{}-{run_id}-{}",
         agent.as_str(options),
@@ -606,6 +608,7 @@ fn run_trial(
             run_id: &trial_run_id,
             app_dir: &app_dir,
             logs_dir: &logs_dir,
+            artifacts_dir: &artifacts_dir,
             agent: &sandbox_agent,
             envs: &phase_envs,
             backend: options.backend,
