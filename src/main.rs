@@ -428,7 +428,15 @@ fn run_trial_plans(
                 };
                 let plan = plans[index];
 
-                let result = run_trial(plan.task, plan.attempt, job_dir, run_id, options, agent);
+                let result = run_trial(
+                    plan.task,
+                    plan.attempt,
+                    job_dir,
+                    run_id,
+                    options,
+                    agent,
+                    concurrency,
+                );
 
                 if sender.send(TrialEvent { index, result }).is_err() {
                     break;
@@ -555,6 +563,7 @@ fn run_trial(
     run_id: &str,
     options: &RunOptions,
     agent: AgentKind,
+    concurrency: usize,
 ) -> Result<TrialOutcome, CliError> {
     let trial_started = Instant::now();
     let task_name = &task.name;
@@ -595,6 +604,7 @@ fn run_trial(
             envs: &phase_envs,
             backend: options.backend,
             strict_resources: options.strict_resources,
+            concurrency,
         })?;
         let reward = read_reward(&logs_dir)?;
 
@@ -1819,10 +1829,17 @@ impl Default for RunOptions {
 }
 
 fn default_concurrency() -> usize {
-    thread::available_parallelism()
+    // Roughly one trial per three host CPUs. Trials are heavy containers —
+    // frequently emulating a foreign architecture and often memory-hungry — so
+    // packing one per core starves each of CPU (pushing slow tasks past their
+    // timeout) and overcommits the docker VM's memory. A third of the cores
+    // leaves each trial enough headroom while still running several at once.
+    // Override with `-j` when the host or the dataset can take more.
+    let host_cpus = thread::available_parallelism()
         .map(|parallelism| parallelism.get())
-        .unwrap_or(4)
-        .clamp(1, 16)
+        .unwrap_or(4);
+
+    (host_cpus / 3).clamp(2, 16)
 }
 
 impl RunOptions {

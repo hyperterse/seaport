@@ -18,7 +18,6 @@ const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
 const DEFAULT_CONTAINER_MEMORY_MB: u64 = 1024;
 const DEFAULT_CONTAINER_CPUS: &str = "1.0";
 const BOOSTED_CONTAINER_CPUS_MAX: usize = 8;
-const BOOSTED_CONTAINER_MEMORY_MB: u64 = 4096;
 const CONTAINER_PIDS_LIMIT: &str = "4096";
 const DEFAULT_COMPAT_DOCKER_PLATFORM: &str = "linux/amd64";
 const DOCKER_BUILD_ATTEMPTS: usize = 3;
@@ -59,6 +58,7 @@ pub(crate) struct TaskScriptRequest<'a> {
     pub(crate) envs: &'a PhaseEnvs,
     pub(crate) backend: SandboxBackend,
     pub(crate) strict_resources: bool,
+    pub(crate) concurrency: usize,
 }
 
 pub(crate) struct AgentStep {
@@ -125,6 +125,7 @@ pub(crate) fn run_task_scripts(run: TaskScriptRequest<'_>) -> Result<ScriptOutpu
             run.envs,
             &environment,
             run.strict_resources,
+            run.concurrency,
         ),
         SandboxBackend::UnsafeLocal => {
             prepare_task_file_workspace(run.task_path, run.app_dir)?;
@@ -236,12 +237,13 @@ fn run_scripts_in_docker(
     envs: &PhaseEnvs,
     environment: &TaskEnvironment,
     strict_resources: bool,
+    concurrency: usize,
 ) -> Result<ScriptOutputs, CliError> {
     ensure_docker_available()?;
     let resources = if strict_resources {
         environment.resources.clone()
     } else {
-        environment.resources.boosted()
+        environment.resources.boosted(concurrency)
     };
 
     let prepare_started = Instant::now();
@@ -399,30 +401,33 @@ impl Default for DockerResources {
 }
 
 impl DockerResources {
-    /// Relaxes the task's cpu/memory caps. Task authors size `cpus` and
-    /// `memory_mb` for native execution; on this runner (often emulating
-    /// amd64) honoring them strictly starves the workload, so boosted caps are
-    /// the default and `--strict-resources` restores the task's own limits.
-    /// The caps stay bounded so concurrent trials cannot starve each other or
-    /// pressure the docker VM's memory.
-    fn boosted(&self) -> Self {
-        let boosted_memory_mb = self
-            .memory_mb
-            .map(|memory_mb| (memory_mb.saturating_mul(2)).max(BOOSTED_CONTAINER_MEMORY_MB));
-
+    /// Gives each trial a fair share of the host's CPUs rather than the task's
+    /// native `cpus` cap. Task authors size `cpus` for native execution; on
+    /// this runner (often emulating amd64) honoring it strictly starves the
+    /// workload. The share is the host divided by how many trials run at once,
+    /// so a single trial can use many cores while a full slate of concurrent
+    /// trials each gets roughly one — it never promises more CPU than exists.
+    /// Memory is left at the task's declared limit: memory is incompressible,
+    /// and inflating it would let concurrent trials overcommit the docker VM.
+    fn boosted(&self, concurrency: usize) -> Self {
         Self {
-            cpus: Some(boosted_cpu_limit()),
-            memory_mb: boosted_memory_mb,
+            cpus: Some(fair_cpu_share(concurrency)),
+            memory_mb: self.memory_mb,
         }
     }
 }
 
-fn boosted_cpu_limit() -> String {
+fn fair_cpu_share(concurrency: usize) -> String {
     let host_cpus = thread::available_parallelism()
         .map(|cpus| cpus.get())
         .unwrap_or(4);
+    let concurrency = concurrency.max(1);
 
-    host_cpus.min(BOOSTED_CONTAINER_CPUS_MAX).to_string()
+    let share = (host_cpus / concurrency)
+        .clamp(1, BOOSTED_CONTAINER_CPUS_MAX)
+        .min(host_cpus);
+
+    share.to_string()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
