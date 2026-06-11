@@ -37,6 +37,9 @@ const EXIT_USAGE: i32 = 2;
 const EXIT_UNIMPLEMENTED: i32 = 3;
 const EXIT_TASK_FAILED: i32 = 4;
 const PROGRESS_BAR_WIDTH: usize = 30;
+const RETRY_MIN_WAIT_SECS: f64 = 1.0;
+const RETRY_WAIT_MULTIPLIER: f64 = 1.0;
+const RETRY_MAX_WAIT_SECS: f64 = 60.0;
 const TASK_LABEL_WIDTH: usize = 56;
 const FAILURE_TAIL_LINES: usize = 8;
 const VERSION_TEXT: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("SEAPORT_VERSION"));
@@ -569,7 +572,99 @@ fn directory_contains_extension(path: &Path, extensions: &[&str]) -> bool {
     false
 }
 
+/// Runs a trial with whole-trial retries. An errored trial (build/agent/
+/// verifier infra failure) is retried up to `max_retries` times with a short
+/// backoff, unless its error is non-retryable (timeouts and reward-file
+/// problems, matching harbor's default exclude set) or filtered out by
+/// `--retry-include`/`--retry-exclude`. Mirrors harbor's per-trial retry loop.
 fn run_trial(
+    task: &TaskRef,
+    attempt: usize,
+    job_dir: &Path,
+    run_id: &str,
+    options: &RunOptions,
+    agent: AgentKind,
+    concurrency: usize,
+) -> Result<TrialOutcome, CliError> {
+    let trial_name = trial_dir_name(&task.name, attempt, options.attempts);
+    let trial_dir = job_dir.join(&trial_name);
+
+    let mut retries = 0;
+    loop {
+        let mut outcome =
+            run_trial_once(task, attempt, job_dir, run_id, options, agent, concurrency)?;
+
+        let exhausted = retries >= options.max_retries;
+        let retryable = outcome.errored
+            && should_retry_error(
+                outcome.error.as_deref(),
+                &options.retry_include,
+                &options.retry_exclude,
+            );
+
+        if !retryable || exhausted {
+            outcome.retries = retries;
+            return Ok(outcome);
+        }
+
+        // Discard the failed attempt's output and retry after a backoff, as
+        // harbor does (rmtree the trial dir, then re-run).
+        let _ = fs::remove_dir_all(&trial_dir);
+        let delay = retry_backoff_delay(retries);
+        if options.log_mode != LogMode::Quiet {
+            eprintln!(
+                "seaport: retrying {} (attempt {}/{}) in {}: {}",
+                task.name,
+                retries + 1,
+                options.max_retries,
+                format_duration(delay),
+                outcome
+                    .error
+                    .as_deref()
+                    .map(first_error_line)
+                    .unwrap_or("trial failed")
+            );
+        }
+        thread::sleep(delay);
+        retries += 1;
+    }
+}
+
+/// Whether an errored trial should be retried: non-retryable error substrings
+/// (`--retry-exclude`, defaulting to timeouts and reward-file problems) win;
+/// otherwise, if `--retry-include` is set the error must match one of them.
+/// Seaport matches error message substrings where harbor matches exception
+/// types.
+fn should_retry_error(error: Option<&str>, include: &[String], exclude: &[String]) -> bool {
+    let message = error.unwrap_or("");
+
+    if exclude
+        .iter()
+        .any(|pattern| message.contains(pattern.as_str()))
+    {
+        return false;
+    }
+
+    if !include.is_empty()
+        && !include
+            .iter()
+            .any(|pattern| message.contains(pattern.as_str()))
+    {
+        return false;
+    }
+
+    true
+}
+
+/// Backoff before a retry: `min_wait * multiplier^attempt`, capped, matching
+/// harbor's defaults (1s, constant).
+fn retry_backoff_delay(attempt: usize) -> Duration {
+    let seconds =
+        (RETRY_MIN_WAIT_SECS * RETRY_WAIT_MULTIPLIER.powi(attempt as i32)).min(RETRY_MAX_WAIT_SECS);
+    Duration::from_secs_f64(seconds)
+}
+
+fn run_trial_once(
     task: &TaskRef,
     attempt: usize,
     job_dir: &Path,
@@ -1232,6 +1327,8 @@ struct TrialOutcome {
     reward: String,
     rewards: Rewards,
     passed: bool,
+    /// Number of whole-trial retries before this outcome was produced.
+    retries: usize,
     /// True only for trials that errored before/while producing a reward
     /// (build/pull/agent/verifier failure, timeout, or no reward written).
     /// Harbor excludes these from reward stats and counts them as errors.
@@ -1309,6 +1406,7 @@ fn record_completed_trial(record: TrialRecord<'_>) -> Result<TrialOutcome, CliEr
         reward,
         rewards,
         passed,
+        retries: 0,
         errored: false,
         error,
         stdout_tail,
@@ -1402,6 +1500,7 @@ fn record_multi_step_trial(record: MultiStepRecord<'_>) -> Result<TrialOutcome, 
         reward,
         rewards,
         passed,
+        retries: 0,
         errored: false,
         error,
         stdout_tail,
@@ -1480,6 +1579,7 @@ fn record_failed_trial(failure: TrialFailure<'_>) -> Result<TrialOutcome, CliErr
         reward,
         rewards,
         passed: false,
+        retries: 0,
         errored: true,
         stdout_tail: failure_output_tail(&failure.message, "stdout", FAILURE_TAIL_LINES)
             .unwrap_or_default(),
@@ -1763,9 +1863,10 @@ fn job_result_json(outcomes: &[TrialOutcome], eval_key: &str) -> String {
 fn job_stats_json(outcomes: &[TrialOutcome], eval_key: &str) -> String {
     let completed = outcomes.len();
     let errored = outcomes.iter().filter(|outcome| outcome.errored).count();
+    let retries: usize = outcomes.iter().map(|outcome| outcome.retries).sum();
 
     format!(
-        "{{\n    \"n_completed_trials\": {completed},\n    \"n_errored_trials\": {errored},\n    \"n_running_trials\": 0,\n    \"n_pending_trials\": 0,\n    \"n_cancelled_trials\": 0,\n    \"n_retries\": 0,\n    \"evals\": {{\"{}\": {}}}\n  }}",
+        "{{\n    \"n_completed_trials\": {completed},\n    \"n_errored_trials\": {errored},\n    \"n_running_trials\": 0,\n    \"n_pending_trials\": 0,\n    \"n_cancelled_trials\": 0,\n    \"n_retries\": {retries},\n    \"evals\": {{\"{}\": {}}}\n  }}",
         json_escape(eval_key),
         eval_stats_json(outcomes)
     )
@@ -2355,6 +2456,15 @@ Options:
       --strict-resources  Enforce the task's declared cpus/memory exactly
                           (harbor-compatible), instead of the default fair CPU
                           share
+      --max-retries <count>
+                          Retry an errored trial up to this many times (default
+                          0). Timeouts and reward-file errors are never retried.
+      --retry-include <substr>
+                          Only retry errors whose message contains this string
+                          (repeatable)
+      --retry-exclude <substr>
+                          Never retry errors whose message contains this string
+                          (repeatable; defaults to timeout/reward-file errors)
       --timeout-multiplier <factor>
                           Scale all phase timeouts for slow/emulated hosts
                           (default: 1.0)
@@ -2431,6 +2541,9 @@ struct RunOptions {
     attempts: usize,
     backend: SandboxBackend,
     strict_resources: bool,
+    max_retries: usize,
+    retry_include: Vec<String>,
+    retry_exclude: Vec<String>,
     timeout_multiplier: f64,
     agent_timeout_multiplier: Option<f64>,
     verifier_timeout_multiplier: Option<f64>,
@@ -2458,6 +2571,9 @@ impl Default for RunOptions {
             concurrency: default_concurrency(),
             attempts: 1,
             strict_resources: false,
+            max_retries: 0,
+            retry_include: Vec::new(),
+            retry_exclude: default_retry_exclude(),
             timeout_multiplier: 1.0,
             agent_timeout_multiplier: None,
             verifier_timeout_multiplier: None,
@@ -2468,6 +2584,15 @@ impl Default for RunOptions {
             selection: TaskSelection::default(),
         }
     }
+}
+
+/// Error substrings that are never retried by default, mirroring harbor's
+/// exclude set: agent/verifier timeouts and reward-file problems.
+fn default_retry_exclude() -> Vec<String> {
+    ["timed out", "did not write", "unparseable reward"]
+        .iter()
+        .map(|pattern| (*pattern).to_owned())
+        .collect()
 }
 
 fn default_concurrency() -> usize {
@@ -2563,6 +2688,25 @@ impl RunOptions {
                 "--strict-resources" => {
                     options.strict_resources = true;
                     index += 1;
+                }
+                "--max-retries" => {
+                    let value = required_value(args, index, flag)?;
+                    options.max_retries = value.parse::<usize>().map_err(|_| {
+                        CliError::usage(format!("{flag} requires a non-negative integer"))
+                    })?;
+                    index += 2;
+                }
+                "--retry-include" => {
+                    options
+                        .retry_include
+                        .push(required_value(args, index, flag)?);
+                    index += 2;
+                }
+                "--retry-exclude" => {
+                    options
+                        .retry_exclude
+                        .push(required_value(args, index, flag)?);
+                    index += 2;
                 }
                 "--timeout-multiplier" => {
                     let value = required_value(args, index, flag)?;
@@ -2796,6 +2940,7 @@ mod tests {
             reward: rewards.display(),
             passed: rewards.passed(),
             rewards,
+            retries: 0,
             errored: false,
             error: None,
             stdout_tail: Vec::new(),
@@ -2931,6 +3076,7 @@ mod tests {
             reward: rewards.display(),
             passed: rewards.passed(),
             rewards,
+            retries: 0,
             errored: false,
             error: None,
             stdout_tail: Vec::new(),
@@ -3157,6 +3303,57 @@ mod tests {
 
         let args = strings(["-p", "tasks/example", "--agent-timeout-multiplier", "0"]);
         assert!(RunOptions::parse(&args).is_err());
+    }
+
+    #[test]
+    fn retry_filter_excludes_timeouts_and_reward_errors_by_default() {
+        let exclude = default_retry_exclude();
+        // Default-excluded (non-retryable) errors.
+        assert!(!should_retry_error(
+            Some("sandboxed docker command timed out after 120.000s"),
+            &[],
+            &exclude
+        ));
+        assert!(!should_retry_error(
+            Some("verifier did not write reward.txt"),
+            &[],
+            &exclude
+        ));
+        // A transient infra error is retryable by default.
+        assert!(should_retry_error(
+            Some("docker image build failed: 503 service unavailable"),
+            &[],
+            &exclude
+        ));
+    }
+
+    #[test]
+    fn retry_include_filter_restricts_to_matching_errors() {
+        let include = vec!["build failed".to_owned()];
+        assert!(should_retry_error(
+            Some("docker image build failed"),
+            &include,
+            &[]
+        ));
+        assert!(!should_retry_error(Some("agent crashed"), &include, &[]));
+    }
+
+    #[test]
+    fn retry_exclude_takes_precedence_over_include() {
+        let include = vec!["build failed".to_owned()];
+        let exclude = vec!["timed out".to_owned()];
+        assert!(!should_retry_error(
+            Some("docker image build failed; then timed out"),
+            &include,
+            &exclude
+        ));
+    }
+
+    #[test]
+    fn retry_backoff_is_capped() {
+        assert_eq!(retry_backoff_delay(0), Duration::from_secs_f64(1.0));
+        // With the default constant multiplier it stays at the min wait.
+        assert_eq!(retry_backoff_delay(10), Duration::from_secs_f64(1.0));
     }
 
     #[test]
