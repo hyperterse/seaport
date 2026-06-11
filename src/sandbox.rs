@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::logging::{self, LogMode};
+use crate::toml_doc;
 use crate::CliError;
 
 const DEFAULT_DOCKER_IMAGE: &str = "ubuntu:24.04";
@@ -806,30 +807,31 @@ impl DockerNetwork {
 
 fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
     let task_toml = fs::read_to_string(task_path.join("task.toml"))?;
-    let explicit_image = toml_section_value(&task_toml, "environment", "docker_image")
-        .or_else(|| toml_top_level_value(&task_toml, "docker_image"));
+    let doc = toml_doc::parse(&task_toml)?;
+    let explicit_image = toml_doc::section_value(&doc, "environment", "docker_image")
+        .or_else(|| toml_doc::top_level_value(&doc, "docker_image"));
     let image = explicit_image
         .clone()
         .unwrap_or_else(|| DEFAULT_DOCKER_IMAGE.to_owned());
     let prebuilt_image = explicit_image.is_some();
-    let platform = docker_platform(&task_toml);
-    let resources = docker_resources(&task_toml)?;
-    let baseline_network = baseline_network(&task_toml)?;
+    let platform = docker_platform(&doc);
+    let resources = docker_resources(&doc)?;
+    let baseline_network = baseline_network(&doc)?;
     let build_timeout = toml_duration_value_with_default(
-        &task_toml,
+        &doc,
         "environment",
         "build_timeout_sec",
         DOCKER_BUILD_TIMEOUT,
     )?;
-    let agent_timeout = toml_duration_value(&task_toml, "agent", "timeout_sec")?;
-    let verifier_timeout = toml_duration_value(&task_toml, "verifier", "timeout_sec")?;
-    let agent_network = phase_network(&task_toml, "agent")?.unwrap_or(baseline_network);
-    let verifier_network = phase_network(&task_toml, "verifier")?.unwrap_or(baseline_network);
-    let agent_user = toml_section_value(&task_toml, "agent", "user");
+    let agent_timeout = toml_duration_value(&doc, "agent", "timeout_sec")?;
+    let verifier_timeout = toml_duration_value(&doc, "verifier", "timeout_sec")?;
+    let agent_network = phase_network(&doc, "agent")?.unwrap_or(baseline_network);
+    let verifier_network = phase_network(&doc, "verifier")?.unwrap_or(baseline_network);
+    let agent_user = toml_doc::section_value(&doc, "agent", "user");
     let verifier_user =
-        toml_section_value(&task_toml, "verifier", "user").or_else(|| agent_user.clone());
+        toml_doc::section_value(&doc, "verifier", "user").or_else(|| agent_user.clone());
 
-    reject_unsupported_task_os(&task_toml)?;
+    reject_unsupported_task_os(&doc)?;
 
     let mut environment = TaskEnvironment {
         image,
@@ -846,7 +848,7 @@ fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
         verifier_user,
         verifier_environment: None,
     };
-    environment.verifier_environment = verifier_environment(&task_toml, &environment)?;
+    environment.verifier_environment = verifier_environment(&doc, &environment)?;
 
     Ok(environment)
 }
@@ -864,11 +866,11 @@ fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
 /// `[environment]`; unset fields fall back to it, matching harbor's "fresh copy
 /// of the task environment" default.
 fn verifier_environment(
-    contents: &str,
+    doc: &toml::Value,
     base: &TaskEnvironment,
 ) -> Result<Option<VerifierEnvironment>, CliError> {
-    let explicit_mode = toml_section_value(contents, "verifier", "environment_mode");
-    let has_section = toml_has_section(contents, "verifier.environment");
+    let explicit_mode = toml_doc::section_value(doc, "verifier", "environment_mode");
+    let has_section = toml_doc::has_section(doc, "verifier.environment");
 
     let separate = match explicit_mode.as_deref() {
         Some("separate") => true,
@@ -896,31 +898,31 @@ fn verifier_environment(
 
     // Resolve the verifier image from `[verifier.environment]`, falling back to
     // the top-level environment image when unset (harbor's fresh-copy default).
-    let explicit_image = toml_section_value(contents, "verifier.environment", "docker_image");
+    let explicit_image = toml_doc::section_value(doc, "verifier.environment", "docker_image");
     let (image, prebuilt_image) = match explicit_image {
         Some(image) => (image, true),
         None => (base.image.clone(), base.prebuilt_image),
     };
 
-    let platform = toml_section_value(contents, "verifier.environment", "docker_platform")
-        .or_else(|| toml_section_value(contents, "verifier.environment", "platform"))
+    let platform = toml_doc::section_value(doc, "verifier.environment", "docker_platform")
+        .or_else(|| toml_doc::section_value(doc, "verifier.environment", "platform"))
         .or_else(|| base.platform.clone());
 
-    let resources = verifier_docker_resources(contents, &base.resources)?;
+    let resources = verifier_docker_resources(doc, &base.resources)?;
 
-    let build_network = match toml_section_value(contents, "verifier.environment", "network_mode") {
+    let build_network = match toml_doc::section_value(doc, "verifier.environment", "network_mode") {
         Some(value) => parse_network_mode("verifier.environment.network_mode", &value)?,
         None => base.build_network,
     };
 
     let build_timeout = toml_duration_value_with_default(
-        contents,
+        doc,
         "verifier.environment",
         "build_timeout_sec",
         base.build_timeout,
     )?;
 
-    reject_unsupported_verifier_environment_os(contents)?;
+    reject_unsupported_verifier_environment_os(doc)?;
 
     Ok(Some(VerifierEnvironment {
         image,
@@ -932,8 +934,8 @@ fn verifier_environment(
     }))
 }
 
-fn reject_unsupported_verifier_environment_os(contents: &str) -> Result<(), CliError> {
-    let Some(os) = toml_section_value(contents, "verifier.environment", "os") else {
+fn reject_unsupported_verifier_environment_os(doc: &toml::Value) -> Result<(), CliError> {
+    let Some(os) = toml_doc::section_value(doc, "verifier.environment", "os") else {
         return Ok(());
     };
 
@@ -949,12 +951,12 @@ fn reject_unsupported_verifier_environment_os(contents: &str) -> Result<(), CliE
 /// Like `docker_resources`, but for the `[verifier.environment]` section,
 /// defaulting unset fields to the top-level environment's resources.
 fn verifier_docker_resources(
-    contents: &str,
+    doc: &toml::Value,
     base: &DockerResources,
 ) -> Result<DockerResources, CliError> {
     let mut resources = base.clone();
 
-    if let Some(cpus) = toml_section_value(contents, "verifier.environment", "cpus") {
+    if let Some(cpus) = toml_doc::section_value(doc, "verifier.environment", "cpus") {
         let parsed = cpus.parse::<f64>().map_err(|error| {
             CliError::usage(format!(
                 "[verifier.environment].cpus must be a number: {error}"
@@ -970,7 +972,7 @@ fn verifier_docker_resources(
         resources.cpus = Some(cpus);
     }
 
-    if let Some(memory_mb) = toml_section_value(contents, "verifier.environment", "memory_mb") {
+    if let Some(memory_mb) = toml_doc::section_value(doc, "verifier.environment", "memory_mb") {
         let parsed = memory_mb.parse::<u64>().map_err(|error| {
             CliError::usage(format!(
                 "[verifier.environment].memory_mb must be a positive integer: {error}"
@@ -989,22 +991,14 @@ fn verifier_docker_resources(
     Ok(resources)
 }
 
-/// Whether a `[section]` header is present in the TOML. Used to distinguish an
-/// empty-but-present `[verifier.environment]` (implies separate mode) from an
-/// absent one.
-fn toml_has_section(contents: &str, section: &str) -> bool {
-    let header = format!("[{section}]");
-    contents.lines().any(|line| line.trim() == header)
-}
-
-fn baseline_network(contents: &str) -> Result<DockerNetwork, CliError> {
-    if let Some(value) = toml_section_value(contents, "environment", "network_mode")
-        .or_else(|| toml_top_level_value(contents, "network_mode"))
+fn baseline_network(doc: &toml::Value) -> Result<DockerNetwork, CliError> {
+    if let Some(value) = toml_doc::section_value(doc, "environment", "network_mode")
+        .or_else(|| toml_doc::top_level_value(doc, "network_mode"))
     {
         return parse_network_mode("environment.network_mode", &value);
     }
 
-    if let Some(value) = toml_bool_value(contents, "environment", "allow_internet")? {
+    if let Some(value) = toml_bool_value(doc, "environment", "allow_internet")? {
         return Ok(if value {
             DockerNetwork::Bridge
         } else {
@@ -1015,21 +1009,21 @@ fn baseline_network(contents: &str) -> Result<DockerNetwork, CliError> {
     Ok(DockerNetwork::Bridge)
 }
 
-fn phase_network(contents: &str, section: &str) -> Result<Option<DockerNetwork>, CliError> {
-    match toml_section_value(contents, section, "network_mode") {
+fn phase_network(doc: &toml::Value, section: &str) -> Result<Option<DockerNetwork>, CliError> {
+    match toml_doc::section_value(doc, section, "network_mode") {
         Some(value) => parse_network_mode(&format!("{section}.network_mode"), &value).map(Some),
         None => Ok(None),
     }
 }
 
-fn docker_platform(contents: &str) -> Option<String> {
+fn docker_platform(doc: &toml::Value) -> Option<String> {
     if let Ok(platform) = env::var("SEAPORT_DOCKER_PLATFORM") {
         return docker_platform_value(&platform);
     }
 
-    toml_section_value(contents, "environment", "docker_platform")
-        .or_else(|| toml_section_value(contents, "environment", "platform"))
-        .or_else(|| toml_top_level_value(contents, "docker_platform"))
+    toml_doc::section_value(doc, "environment", "docker_platform")
+        .or_else(|| toml_doc::section_value(doc, "environment", "platform"))
+        .or_else(|| toml_doc::top_level_value(doc, "docker_platform"))
 }
 
 fn docker_platform_value(platform: &str) -> Option<String> {
@@ -1042,10 +1036,10 @@ fn docker_platform_value(platform: &str) -> Option<String> {
     }
 }
 
-fn docker_resources(contents: &str) -> Result<DockerResources, CliError> {
+fn docker_resources(doc: &toml::Value) -> Result<DockerResources, CliError> {
     let mut resources = DockerResources::default();
 
-    if let Some(cpus) = toml_section_value(contents, "environment", "cpus") {
+    if let Some(cpus) = toml_doc::section_value(doc, "environment", "cpus") {
         let parsed = cpus.parse::<f64>().map_err(|error| {
             CliError::usage(format!("[environment].cpus must be a number: {error}"))
         })?;
@@ -1059,7 +1053,7 @@ fn docker_resources(contents: &str) -> Result<DockerResources, CliError> {
         resources.cpus = Some(cpus);
     }
 
-    if let Some(memory_mb) = toml_section_value(contents, "environment", "memory_mb") {
+    if let Some(memory_mb) = toml_doc::section_value(doc, "environment", "memory_mb") {
         let parsed = memory_mb.parse::<u64>().map_err(|error| {
             CliError::usage(format!(
                 "[environment].memory_mb must be a positive integer: {error}"
@@ -1091,8 +1085,8 @@ fn parse_network_mode(field: &str, value: &str) -> Result<DockerNetwork, CliErro
     }
 }
 
-fn reject_unsupported_task_os(contents: &str) -> Result<(), CliError> {
-    let Some(os) = toml_section_value(contents, "environment", "os") else {
+fn reject_unsupported_task_os(doc: &toml::Value) -> Result<(), CliError> {
+    let Some(os) = toml_doc::section_value(doc, "environment", "os") else {
         return Ok(());
     };
 
@@ -1105,37 +1099,17 @@ fn reject_unsupported_task_os(contents: &str) -> Result<(), CliError> {
     }
 }
 
-fn toml_top_level_value(contents: &str, key: &str) -> Option<String> {
-    let prefix = format!("{key} = ");
-    let mut in_section = false;
-
-    contents.lines().find_map(|line| {
-        let trimmed = line.trim();
-
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_section = true;
-            return None;
-        }
-
-        if in_section {
-            return None;
-        }
-
-        trimmed.strip_prefix(&prefix).map(toml_scalar_value)
-    })
-}
-
-fn toml_duration_value(contents: &str, section: &str, key: &str) -> Result<Duration, CliError> {
-    toml_duration_value_with_default(contents, section, key, Duration::from_secs(120))
+fn toml_duration_value(doc: &toml::Value, section: &str, key: &str) -> Result<Duration, CliError> {
+    toml_duration_value_with_default(doc, section, key, Duration::from_secs(120))
 }
 
 fn toml_duration_value_with_default(
-    contents: &str,
+    doc: &toml::Value,
     section: &str,
     key: &str,
     default: Duration,
 ) -> Result<Duration, CliError> {
-    match toml_section_value(contents, section, key) {
+    match toml_doc::section_value(doc, section, key) {
         Some(value) => {
             let seconds = value.parse::<f64>().map_err(|error| {
                 CliError::usage(format!("[{section}].{key} must be a number: {error}"))
@@ -1153,31 +1127,8 @@ fn toml_duration_value_with_default(
     }
 }
 
-fn toml_section_value(contents: &str, section: &str, key: &str) -> Option<String> {
-    let section_header = format!("[{section}]");
-    let prefix = format!("{key} = ");
-    let mut in_section = false;
-
-    for line in contents.lines() {
-        let trimmed = line.trim();
-
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_section = trimmed == section_header;
-            continue;
-        }
-
-        if in_section {
-            if let Some(value) = trimmed.strip_prefix(&prefix) {
-                return Some(toml_scalar_value(value));
-            }
-        }
-    }
-
-    None
-}
-
-fn toml_bool_value(contents: &str, section: &str, key: &str) -> Result<Option<bool>, CliError> {
-    let Some(value) = toml_section_value(contents, section, key) else {
+fn toml_bool_value(doc: &toml::Value, section: &str, key: &str) -> Result<Option<bool>, CliError> {
+    let Some(value) = toml_doc::section_value(doc, section, key) else {
         return Ok(None);
     };
 
@@ -1188,35 +1139,6 @@ fn toml_bool_value(contents: &str, section: &str, key: &str) -> Result<Option<bo
             "[{section}].{key} must be true or false, got `{unknown}`"
         ))),
     }
-}
-
-fn toml_scalar_value(value: &str) -> String {
-    strip_inline_comment(value.trim())
-        .trim()
-        .trim_matches('"')
-        .to_owned()
-}
-
-fn strip_inline_comment(value: &str) -> &str {
-    let mut in_quotes = false;
-    let mut escaped = false;
-
-    for (index, character) in value.char_indices() {
-        if character == '"' && !escaped {
-            in_quotes = !in_quotes;
-        }
-
-        if character == '#' && !in_quotes {
-            return &value[..index];
-        }
-
-        escaped = character == '\\' && !escaped;
-        if character != '\\' {
-            escaped = false;
-        }
-    }
-
-    value
 }
 
 /// Materializes packaged task files and COBOL copybook aliases inside the

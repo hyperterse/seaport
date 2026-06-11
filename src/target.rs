@@ -184,7 +184,12 @@ fn dataset_name(path: &Path) -> Result<String, CliError> {
     if manifest_path.is_file() {
         let manifest = fs::read_to_string(manifest_path)?;
 
-        if let Some(name) = toml_section_value(&manifest, "dataset", "name") {
+        // Best-effort: a malformed manifest falls back to the directory name
+        // rather than failing dataset resolution.
+        if let Some(name) = crate::toml_doc::parse(&manifest)
+            .ok()
+            .and_then(|doc| crate::toml_doc::section_value(&doc, "dataset", "name"))
+        {
             return Ok(name);
         }
     }
@@ -194,29 +199,6 @@ fn dataset_name(path: &Path) -> Result<String, CliError> {
         .and_then(|name| name.to_str())
         .unwrap_or("dataset")
         .to_owned())
-}
-
-fn toml_section_value(contents: &str, section: &str, key: &str) -> Option<String> {
-    let section_header = format!("[{section}]");
-    let prefix = format!("{key} = ");
-    let mut in_section = false;
-
-    for line in contents.lines() {
-        let trimmed = line.trim();
-
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_section = trimmed == section_header;
-            continue;
-        }
-
-        if in_section {
-            if let Some(value) = trimmed.strip_prefix(&prefix) {
-                return Some(value.trim().trim_matches('"').to_owned());
-            }
-        }
-    }
-
-    None
 }
 
 #[cfg(test)]

@@ -14,6 +14,7 @@ mod logging;
 mod registry;
 mod sandbox;
 mod target;
+mod toml_doc;
 mod upgrade;
 
 use logging::{
@@ -1381,7 +1382,12 @@ fn reward_passed(reward: f64) -> bool {
 fn task_name(task_path: &Path) -> Result<String, CliError> {
     let task_toml = fs::read_to_string(task_path.join("task.toml"))?;
 
-    if let Some(name) = toml_section_value(&task_toml, "task", "name") {
+    // Best-effort: a malformed task.toml falls back to the directory name here;
+    // the authoritative parse in `task_environment` surfaces the parse error.
+    if let Some(name) = toml_doc::parse(&task_toml)
+        .ok()
+        .and_then(|doc| toml_doc::section_value(&doc, "task", "name"))
+    {
         return Ok(name);
     }
 
@@ -1390,29 +1396,6 @@ fn task_name(task_path: &Path) -> Result<String, CliError> {
         .and_then(|name| name.to_str())
         .unwrap_or("task")
         .to_owned())
-}
-
-fn toml_section_value(contents: &str, section: &str, key: &str) -> Option<String> {
-    let section_header = format!("[{section}]");
-    let prefix = format!("{key} = ");
-    let mut in_section = false;
-
-    for line in contents.lines() {
-        let trimmed = line.trim();
-
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_section = trimmed == section_header;
-            continue;
-        }
-
-        if in_section {
-            if let Some(value) = trimmed.strip_prefix(&prefix) {
-                return Some(value.trim().trim_matches('"').to_owned());
-            }
-        }
-    }
-
-    None
 }
 
 fn timestamp_id() -> Result<String, CliError> {
