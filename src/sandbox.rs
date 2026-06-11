@@ -414,6 +414,7 @@ fn run_scripts_in_docker(
                         invocation: ContainerInvocation::TaskScript("solution/solve.sh"),
                         env: &agent_env,
                         timeout: environment.agent_timeout,
+                        user: environment.agent_user.as_deref(),
                     })?,
                 )
             }
@@ -436,6 +437,7 @@ fn run_scripts_in_docker(
                         invocation: ContainerInvocation::ShellCommand(&agent.command),
                         env: &agent_env,
                         timeout: environment.agent_timeout,
+                        user: environment.agent_user.as_deref(),
                     })?,
                 )
             }
@@ -458,6 +460,7 @@ fn run_scripts_in_docker(
             invocation: ContainerInvocation::TaskScript("tests/test.sh"),
             env: &verifier_env,
             timeout: environment.verifier_timeout,
+            user: environment.verifier_user.as_deref(),
         })?;
 
         Ok(ScriptOutputs { agent, verifier })
@@ -489,6 +492,12 @@ struct TaskEnvironment {
     build_timeout: Duration,
     agent_timeout: Duration,
     verifier_timeout: Duration,
+    /// User to run the agent phase as (`docker exec -u`), from `[agent].user`.
+    /// `None` runs as the image's default user, matching prior behavior.
+    agent_user: Option<String>,
+    /// User to run the verifier phase as, from `[verifier].user`, falling back
+    /// to the agent user. Mirrors harbor running phases as the configured user.
+    verifier_user: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -605,6 +614,9 @@ fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
     let verifier_timeout = toml_duration_value(&task_toml, "verifier", "timeout_sec")?;
     let agent_network = phase_network(&task_toml, "agent")?.unwrap_or(baseline_network);
     let verifier_network = phase_network(&task_toml, "verifier")?.unwrap_or(baseline_network);
+    let agent_user = toml_section_value(&task_toml, "agent", "user");
+    let verifier_user =
+        toml_section_value(&task_toml, "verifier", "user").or_else(|| agent_user.clone());
 
     reject_unsupported_task_os(&task_toml)?;
 
@@ -619,6 +631,8 @@ fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
         build_timeout,
         agent_timeout,
         verifier_timeout,
+        agent_user,
+        verifier_user,
     })
 }
 
@@ -1791,6 +1805,8 @@ struct ContainerExec<'a> {
     invocation: ContainerInvocation<'a>,
     env: &'a [(&'a str, &'a str)],
     timeout: Duration,
+    /// User to run as (`docker exec -u`). `None` uses the image default.
+    user: Option<&'a str>,
 }
 
 fn exec_in_container(exec: ContainerExec<'_>) -> Result<Output, CliError> {
@@ -1832,6 +1848,12 @@ fn docker_exec_command(exec: &ContainerExec<'_>) -> Command {
             .iter()
             .flat_map(|(name, value)| ["--env".to_owned(), format!("{name}={value}")]),
     );
+    // Run as the task-configured user when set, matching harbor's
+    // `docker compose exec -u <user>`. Absent a user, fall back to the image's
+    // default user (prior behavior).
+    if let Some(user) = exec.user {
+        command.arg("--user").arg(user);
+    }
     command.arg(exec.container).arg("bash");
 
     match exec.invocation {
@@ -2621,6 +2643,7 @@ mod tests {
             invocation: ContainerInvocation::TaskScript("tests/test.sh"),
             env: &[("CHECK", "1")],
             timeout: Duration::from_secs(60),
+            user: None,
         });
         let args = command_args(command);
 
@@ -2632,6 +2655,25 @@ mod tests {
             args.last().map(String::as_str),
             Some("/seaport/task/tests/test.sh")
         );
+        // No configured user means no `--user`, preserving the image default.
+        assert!(!args.iter().any(|arg| arg == "--user"));
+    }
+
+    #[test]
+    fn docker_exec_command_runs_as_configured_user() {
+        let command = docker_exec_command(&ContainerExec {
+            container: "seaport-test-container",
+            task_label: "acme/demo",
+            phase: "agent",
+            label: "claude",
+            invocation: ContainerInvocation::ShellCommand("claude --run"),
+            env: &[],
+            timeout: Duration::from_secs(60),
+            user: Some("agent"),
+        });
+        let args = command_args(command);
+
+        assert!(args.windows(2).any(|window| window == ["--user", "agent"]));
     }
 
     #[test]
@@ -2644,6 +2686,7 @@ mod tests {
             invocation: ContainerInvocation::ShellCommand("claude --run"),
             env: &[],
             timeout: Duration::from_secs(60),
+            user: None,
         });
         let args = command_args(command);
 
@@ -2664,6 +2707,8 @@ mod tests {
             build_timeout: Duration::from_secs(60),
             agent_timeout: Duration::from_secs(60),
             verifier_timeout: Duration::from_secs(60),
+            agent_user: None,
+            verifier_user: None,
         };
         let command = docker_build_command(
             "seaport-task-test",
@@ -2758,6 +2803,8 @@ mod tests {
             build_timeout: Duration::from_secs(60),
             agent_timeout: Duration::from_secs(60),
             verifier_timeout: Duration::from_secs(60),
+            agent_user: None,
+            verifier_user: None,
         };
         let task = temp_task_dir("docker-cache-key");
         let environment_dir = task.join("environment");
@@ -2963,6 +3010,55 @@ network_mode = "public"
         assert_eq!(environment.build_timeout, Duration::from_secs_f64(7.5));
         assert_eq!(environment.agent_timeout, Duration::from_secs(3));
         assert_eq!(environment.verifier_timeout, Duration::from_secs(5));
+        // No `user` configured -> image default (preserves prior behavior).
+        assert_eq!(environment.agent_user, None);
+        assert_eq!(environment.verifier_user, None);
+
+        let _ = fs::remove_dir_all(task);
+    }
+
+    #[test]
+    fn task_environment_reads_configured_users() {
+        let task = temp_task_dir("harbor-agent-user");
+        fs::create_dir_all(&task).expect("task dir");
+        fs::write(
+            task.join("task.toml"),
+            r#"
+[agent]
+user = "agent"
+"#,
+        )
+        .expect("task toml");
+
+        let environment = task_environment(&task).expect("environment");
+
+        assert_eq!(environment.agent_user.as_deref(), Some("agent"));
+        // Verifier user falls back to the agent user when unset.
+        assert_eq!(environment.verifier_user.as_deref(), Some("agent"));
+
+        let _ = fs::remove_dir_all(task);
+    }
+
+    #[test]
+    fn task_environment_verifier_user_overrides_agent_user() {
+        let task = temp_task_dir("harbor-verifier-user");
+        fs::create_dir_all(&task).expect("task dir");
+        fs::write(
+            task.join("task.toml"),
+            r#"
+[agent]
+user = "agent"
+
+[verifier]
+user = "root"
+"#,
+        )
+        .expect("task toml");
+
+        let environment = task_environment(&task).expect("environment");
+
+        assert_eq!(environment.agent_user.as_deref(), Some("agent"));
+        assert_eq!(environment.verifier_user.as_deref(), Some("root"));
 
         let _ = fs::remove_dir_all(task);
     }
