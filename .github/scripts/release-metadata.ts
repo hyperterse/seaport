@@ -32,7 +32,10 @@ function latestReleaseNotes(releaseVersion) {
 
   const start = heading.index;
   const rest = changelog.slice(start + heading[0].length);
-  const nextHeading = rest.search(/^#{2,3}\s+/m);
+  // Stop at the next *version* heading (level-2 `## `). `#{2,3}` also matched
+  // the `### Features`/`### Bug Fixes` subsections, which truncated the notes
+  // to just the version heading.
+  const nextHeading = rest.search(/^## /m);
   const end = nextHeading === -1 ? changelog.length : start + heading[0].length + nextHeading;
 
   return `${changelog.slice(start, end).trim()}\n`;
