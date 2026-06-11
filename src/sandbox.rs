@@ -793,8 +793,6 @@ fn docker_start_command(start: &StartTrialContainer<'_>) -> Command {
         start.network.as_docker_run_arg(),
         "--pids-limit",
         CONTAINER_PIDS_LIMIT,
-        "--workdir",
-        "/app",
         "--env",
         "APP_DIR=/app",
         "--env",
@@ -830,6 +828,11 @@ fn docker_start_command(start: &StartTrialContainer<'_>) -> Command {
         .arg(format!(
             "type=bind,source={},target=/tests,readonly",
             start.task_path.join("tests").display()
+        ))
+        .arg("--mount")
+        .arg(format!(
+            "type=bind,source={},target=/solution,readonly",
+            start.task_path.join("solution").display()
         ))
         .arg("--mount")
         .arg(format!(
@@ -1634,8 +1637,11 @@ fn exec_in_container(exec: ContainerExec<'_>) -> Result<Output, CliError> {
 }
 
 fn docker_exec_command(exec: &ContainerExec<'_>) -> Command {
+    // No `--workdir`: scripts run in the image's configured WORKDIR, where
+    // the task expects its files (some tasks set WORKDIR to a subdirectory
+    // such as a checked-out repo). This matches harbor.
     let mut command = Command::new("docker");
-    command.args(["exec", "--workdir", "/app"]).args(
+    command.args(["exec"]).args(
         exec.env
             .iter()
             .flat_map(|(name, value)| ["--env".to_owned(), format!("{name}={value}")]),
@@ -2331,10 +2337,11 @@ mod tests {
             .any(|arg| arg == "type=bind,source=/tmp/task/tests,target=/tests,readonly"));
         assert!(args
             .iter()
-            .any(|arg| arg == "type=bind,source=/tmp/logs,target=/logs"));
+            .any(|arg| arg == "type=bind,source=/tmp/task/solution,target=/solution,readonly"));
         assert!(args
-            .windows(2)
-            .any(|window| window == ["--workdir", "/app"]));
+            .iter()
+            .any(|arg| arg == "type=bind,source=/tmp/logs,target=/logs"));
+        assert!(!args.iter().any(|arg| arg == "--workdir"));
         assert_eq!(
             args.last().map(String::as_str),
             Some("while true; do sleep 3600; done")
@@ -2355,9 +2362,7 @@ mod tests {
         let args = command_args(command);
 
         assert_eq!(args.first().map(String::as_str), Some("exec"));
-        assert!(args
-            .windows(2)
-            .any(|window| window == ["--workdir", "/app"]));
+        assert!(!args.iter().any(|arg| arg == "--workdir"));
         assert!(args.windows(2).any(|window| window == ["--env", "CHECK=1"]));
         assert!(args.iter().any(|arg| arg == "seaport-test-container"));
         assert_eq!(
