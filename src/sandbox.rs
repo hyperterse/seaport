@@ -353,7 +353,7 @@ fn run_scripts_in_docker(
 ) -> Result<ScriptOutputs, CliError> {
     ensure_docker_available()?;
     let resources = if strict_resources {
-        environment.resources.clone()
+        environment.resources.strict()
     } else {
         environment.resources.boosted(concurrency)
     };
@@ -501,6 +501,13 @@ struct CompatPlatformInference {
 struct DockerResources {
     cpus: Option<String>,
     memory_mb: Option<u64>,
+    /// When true, the container is started with `--memory-swap` equal to
+    /// `--memory`, which disables swap entirely. The fair-share default pins
+    /// swap off so a boosted trial cannot quietly exceed its memory budget by
+    /// paging. Harbor parity (strict mode) leaves this false so Docker applies
+    /// its default swap allowance, matching harbor's compose `deploy.resources`
+    /// which only sets a memory limit.
+    pin_swap: bool,
 }
 
 impl Default for DockerResources {
@@ -508,6 +515,7 @@ impl Default for DockerResources {
         Self {
             cpus: Some(DEFAULT_CONTAINER_CPUS.to_owned()),
             memory_mb: Some(DEFAULT_CONTAINER_MEMORY_MB),
+            pin_swap: true,
         }
     }
 }
@@ -525,6 +533,18 @@ impl DockerResources {
         Self {
             cpus: Some(fair_cpu_share(concurrency)),
             memory_mb: self.memory_mb,
+            pin_swap: self.pin_swap,
+        }
+    }
+
+    /// Enforces the task's declared cpus/memory exactly, mirroring harbor's
+    /// compose `deploy.resources.limits`. Harbor sets only a memory limit and
+    /// lets Docker manage swap, so strict mode does not pin swap off.
+    fn strict(&self) -> Self {
+        Self {
+            cpus: self.cpus.clone(),
+            memory_mb: self.memory_mb,
+            pin_swap: false,
         }
     }
 }
@@ -926,7 +946,14 @@ fn docker_start_command(start: &StartTrialContainer<'_>) -> Command {
 
     if let Some(memory_mb) = start.resources.memory_mb {
         let memory = format!("{memory_mb}m");
-        command.args(["--memory", &memory, "--memory-swap", &memory]);
+        command.args(["--memory", &memory]);
+        // Pinning `--memory-swap` to the memory limit disables swap. The
+        // fair-share default does this so boosted trials cannot page past
+        // their budget; strict (harbor-parity) mode omits it so Docker applies
+        // its default swap allowance, matching harbor's memory-only limit.
+        if start.resources.pin_swap {
+            command.args(["--memory-swap", &memory]);
+        }
     }
 
     if let Some(cpus) = start.resources.cpus.as_deref() {
@@ -2525,6 +2552,63 @@ mod tests {
             args.last().map(String::as_str),
             Some("while true; do sleep 3600; done")
         );
+    }
+
+    #[test]
+    fn docker_start_command_strict_resources_mirror_harbor_limits() {
+        // Strict (harbor-parity) mode enforces the task's declared cpus/memory
+        // exactly and, like harbor's memory-only limit, leaves swap to Docker's
+        // default rather than pinning it off.
+        let resources = DockerResources {
+            cpus: Some("2.5".to_owned()),
+            memory_mb: Some(2048),
+            pin_swap: true,
+        }
+        .strict();
+
+        let command = docker_start_command(&StartTrialContainer {
+            container_name: "seaport-test-container",
+            image: "seaport-task-test",
+            task_path: Path::new("/tmp/task"),
+            logs_root: Path::new("/tmp/logs"),
+            network: DockerNetwork::None,
+            platform: Some("linux/amd64"),
+            resources: &resources,
+        });
+        let args = command_args(command);
+
+        // Task cpus/memory are honored exactly.
+        assert!(args.windows(2).any(|window| window == ["--cpus", "2.5"]));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--memory", "2048m"]));
+        // Harbor parity: swap is not disabled.
+        assert!(!args.iter().any(|arg| arg == "--memory-swap"));
+    }
+
+    #[test]
+    fn docker_start_command_fair_share_disables_swap() {
+        // The non-strict default boosts cpus to a fair share and pins swap off
+        // so a boosted trial cannot page past its memory budget.
+        let resources = DockerResources::default().boosted(4);
+
+        let command = docker_start_command(&StartTrialContainer {
+            container_name: "seaport-test-container",
+            image: "seaport-task-test",
+            task_path: Path::new("/tmp/task"),
+            logs_root: Path::new("/tmp/logs"),
+            network: DockerNetwork::None,
+            platform: Some("linux/amd64"),
+            resources: &resources,
+        });
+        let args = command_args(command);
+
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--memory", "1024m"]));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--memory-swap", "1024m"]));
     }
 
     #[test]

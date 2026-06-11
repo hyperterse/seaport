@@ -1792,8 +1792,9 @@ Options:
   -n <count>              Concurrency
   -k, --n-attempts <count>
                           Number of attempts per task
-      --strict-resources  Enforce task cpu/memory limits on sandbox containers
-                          (default: containers may use all idle host resources)
+      --strict-resources  Enforce the task's declared cpus/memory exactly
+                          (harbor-compatible), instead of the default fair CPU
+                          share
       --timeout-multiplier <factor>
                           Scale all phase timeouts for slow/emulated hosts
                           (default: 1.0)
