@@ -2,9 +2,7 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::Path;
-#[cfg(unix)]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -443,25 +441,44 @@ fn run_scripts_in_docker(
             }
         };
 
-        if environment.verifier_network != environment.agent_network {
-            switch_container_network(
-                &container,
-                environment.agent_network,
-                environment.verifier_network,
-            )?;
-        }
-
         let verifier_env = env_refs(&envs.verifier);
-        let verifier = exec_in_container(ContainerExec {
-            container: &container,
-            task_label: runtime.task_label,
-            phase: "verifier",
-            label: "tests/test.sh",
-            invocation: ContainerInvocation::TaskScript("tests/test.sh"),
-            env: &verifier_env,
-            timeout: environment.verifier_timeout,
-            user: environment.verifier_user.as_deref(),
-        })?;
+
+        let verifier = match &environment.verifier_environment {
+            // Separate verifier mode (harbor parity): isolate the verifier from
+            // the agent's installed packages, $HOME, and non-/app filesystem
+            // changes by running it in a fresh container that sees only the
+            // agent's work product.
+            Some(verifier_env_cfg) => run_verifier_in_separate_container(
+                &runtime,
+                &container,
+                environment,
+                verifier_env_cfg,
+                logs_root,
+                &verifier_env,
+            )?,
+            // Shared verifier mode (default): exec the verifier in the agent
+            // container, where state outside /app is still present.
+            None => {
+                if environment.verifier_network != environment.agent_network {
+                    switch_container_network(
+                        &container,
+                        environment.agent_network,
+                        environment.verifier_network,
+                    )?;
+                }
+
+                exec_in_container(ContainerExec {
+                    container: &container,
+                    task_label: runtime.task_label,
+                    phase: "verifier",
+                    label: "tests/test.sh",
+                    invocation: ContainerInvocation::TaskScript("tests/test.sh"),
+                    env: &verifier_env,
+                    timeout: environment.verifier_timeout,
+                    user: environment.verifier_user.as_deref(),
+                })?
+            }
+        };
 
         Ok(ScriptOutputs { agent, verifier })
     })();
@@ -475,12 +492,186 @@ fn run_scripts_in_docker(
     result
 }
 
+/// Runs the verifier in a dedicated container (harbor's "separate" mode).
+///
+/// The agent's `/app` workspace is copied out of the agent container and
+/// seeded into a fresh verifier container started from the verifier image, on
+/// the verifier network, with the same /tests, /solution, /seaport/task and
+/// /logs mounts. `tests/test.sh` then runs there, isolated from the agent's
+/// installed packages, $HOME, and any filesystem changes outside /app.
+///
+/// Fidelity gap vs harbor: harbor uploads only the task-declared *artifacts*
+/// into the clean verifier environment. Seaport has no artifact-declaration
+/// mechanism, so it seeds the verifier with the agent's entire `/app`
+/// workspace. The verifier is still isolated from the agent's installed
+/// packages, $HOME, and non-/app filesystem side-effects — which is the main
+/// point of separate mode — but it is not restricted to a curated artifact set.
+fn run_verifier_in_separate_container(
+    runtime: &TaskRuntime<'_>,
+    agent_container: &str,
+    environment: &TaskEnvironment,
+    verifier_env_cfg: &VerifierEnvironment,
+    logs_root: &Path,
+    verifier_env: &[(&str, &str)],
+) -> Result<Output, CliError> {
+    // Build a synthetic TaskEnvironment so the verifier image reuses the exact
+    // same prepare/pull/build path as the agent image.
+    let verifier_image_env = TaskEnvironment {
+        image: verifier_env_cfg.image.clone(),
+        prebuilt_image: verifier_env_cfg.prebuilt_image,
+        platform: verifier_env_cfg.platform.clone(),
+        resources: verifier_env_cfg.resources.clone(),
+        build_network: verifier_env_cfg.build_network,
+        build_timeout: verifier_env_cfg.build_timeout,
+        ..environment.clone()
+    };
+
+    let prepare_started = Instant::now();
+    let image = prepare_docker_image(runtime.task_label, runtime.task_path, &verifier_image_env)?;
+    logging::log_timing(
+        runtime.task_label,
+        "image",
+        &format!("prepare verifier image -> {}", image.reference),
+        prepare_started.elapsed(),
+    );
+
+    // Capture the agent's /app into a unique host temp dir, then seed it into
+    // the fresh verifier container. Cleaned up unconditionally below.
+    let workspace = AgentWorkspaceCopy::capture(agent_container, runtime)?;
+
+    let verifier_container = docker_container_name(runtime.run_id, "verifier");
+    let start_started = Instant::now();
+    let result = (|| {
+        start_trial_container(
+            StartTrialContainer {
+                container_name: &verifier_container,
+                image: &image.reference,
+                task_path: runtime.task_path,
+                logs_root,
+                network: environment.verifier_network,
+                platform: image.platform.as_deref(),
+                resources: &verifier_env_cfg.resources,
+            },
+            runtime.task_label,
+        )?;
+        logging::log_timing(
+            runtime.task_label,
+            "container",
+            "start verifier container",
+            start_started.elapsed(),
+        );
+
+        // Seed /app with the captured workspace, then re-run the prep chmod so
+        // the tree is world-writable for whatever user the verifier image picks
+        // (matching the agent container's prep).
+        workspace.seed_into(&verifier_container)?;
+        prep_container_workspace(&verifier_container, runtime.task_label)?;
+
+        exec_in_container(ContainerExec {
+            container: &verifier_container,
+            task_label: runtime.task_label,
+            phase: "verifier",
+            label: "tests/test.sh",
+            invocation: ContainerInvocation::TaskScript("tests/test.sh"),
+            env: verifier_env,
+            timeout: environment.verifier_timeout,
+            user: environment.verifier_user.as_deref(),
+        })
+    })();
+
+    cleanup_docker_container(&verifier_container);
+    // The agent container's image lifecycle is owned by the caller; only the
+    // verifier image (when separately built/pulled and marked for removal) is
+    // cleaned up here.
+    if image.remove_after_run {
+        cleanup_docker_image(&image.reference);
+    }
+    drop(workspace);
+
+    result
+}
+
+/// A host temp directory holding a copy of the agent container's `/app`,
+/// removed on drop. Used to transfer the agent's work product into a fresh
+/// verifier container in separate mode.
+struct AgentWorkspaceCopy {
+    dir: PathBuf,
+}
+
+impl AgentWorkspaceCopy {
+    fn capture(agent_container: &str, runtime: &TaskRuntime<'_>) -> Result<Self, CliError> {
+        let dir = env::temp_dir().join(format!("seaport-verifier-app-{}", runtime.run_id));
+        // Start from a clean directory in case a prior run left one behind.
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+
+        // `docker cp <container>:/app/.` copies the *contents* of /app into the
+        // destination directory (the trailing `/.`), so we can later copy them
+        // back into the verifier's /app the same way.
+        let output = Command::new("docker")
+            .arg("cp")
+            .arg(format!("{agent_container}:/app/."))
+            .arg(&dir)
+            .output()?;
+
+        if !output.status.success() {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(CliError::task_failed(format!(
+                "docker cp of agent /app failed (status: {})\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        Ok(Self { dir })
+    }
+
+    /// Copies the captured workspace into the target container's `/app`.
+    fn seed_into(&self, container: &str) -> Result<(), CliError> {
+        // Ensure /app exists in the fresh container before copying into it.
+        let mkdir = Command::new("docker")
+            .args(["exec", "--user", "0:0", container, "mkdir", "-p", "/app"])
+            .output()?;
+        if !mkdir.status.success() {
+            return Err(CliError::task_failed(format!(
+                "could not create /app in verifier container {container} (status: {})\nstderr:\n{}",
+                mkdir.status,
+                String::from_utf8_lossy(&mkdir.stderr)
+            )));
+        }
+
+        let source = self.dir.join(".");
+        let output = Command::new("docker")
+            .arg("cp")
+            .arg(&source)
+            .arg(format!("{container}:/app"))
+            .output()?;
+
+        if !output.status.success() {
+            return Err(CliError::task_failed(format!(
+                "docker cp of agent workspace into verifier {container} failed (status: {})\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for AgentWorkspaceCopy {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
 struct DockerImage {
     reference: String,
     remove_after_run: bool,
     platform: Option<String>,
 }
 
+#[derive(Clone)]
 struct TaskEnvironment {
     image: String,
     prebuilt_image: bool,
@@ -498,6 +689,26 @@ struct TaskEnvironment {
     /// User to run the verifier phase as, from `[verifier].user`, falling back
     /// to the agent user. Mirrors harbor running phases as the configured user.
     verifier_user: Option<String>,
+    /// When `Some`, the verifier runs in its own fresh container (harbor's
+    /// "separate" verifier mode) rather than sharing the agent container. The
+    /// image/platform/resources here describe that verifier container. `None`
+    /// keeps the default shared-container behavior, byte-for-byte unchanged.
+    verifier_environment: Option<VerifierEnvironment>,
+}
+
+/// The container configuration for a separate (isolated) verifier, declared via
+/// `[verifier].environment_mode = "separate"` and/or a `[verifier.environment]`
+/// section in task.toml. Fields not set under `[verifier.environment]` fall
+/// back to the top-level `[environment]`, mirroring harbor, where an unset
+/// verifier environment defaults to a fresh copy of the task environment.
+#[derive(Clone)]
+struct VerifierEnvironment {
+    image: String,
+    prebuilt_image: bool,
+    platform: Option<String>,
+    resources: DockerResources,
+    build_network: DockerNetwork,
+    build_timeout: Duration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -620,7 +831,7 @@ fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
 
     reject_unsupported_task_os(&task_toml)?;
 
-    Ok(TaskEnvironment {
+    let mut environment = TaskEnvironment {
         image,
         prebuilt_image,
         platform,
@@ -633,7 +844,157 @@ fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
         verifier_timeout,
         agent_user,
         verifier_user,
-    })
+        verifier_environment: None,
+    };
+    environment.verifier_environment = verifier_environment(&task_toml, &environment)?;
+
+    Ok(environment)
+}
+
+/// Detects harbor's "separate" verifier mode from task.toml and resolves the
+/// verifier container's environment.
+///
+/// Mirrors harbor's `_resolve_mode`: the mode is `separate` when
+/// `[verifier].environment_mode = "separate"`, or when a `[verifier.environment]`
+/// section is present without an explicit `shared` mode. Otherwise the verifier
+/// shares the agent container (the default, unchanged behavior) and this returns
+/// `None`.
+///
+/// When separate, fields under `[verifier.environment]` override the top-level
+/// `[environment]`; unset fields fall back to it, matching harbor's "fresh copy
+/// of the task environment" default.
+fn verifier_environment(
+    contents: &str,
+    base: &TaskEnvironment,
+) -> Result<Option<VerifierEnvironment>, CliError> {
+    let explicit_mode = toml_section_value(contents, "verifier", "environment_mode");
+    let has_section = toml_has_section(contents, "verifier.environment");
+
+    let separate = match explicit_mode.as_deref() {
+        Some("separate") => true,
+        Some("shared") => {
+            if has_section {
+                return Err(CliError::usage(
+                    "[verifier].environment_mode = `shared` is incompatible with a \
+                     [verifier.environment] section; omit the section or set \
+                     environment_mode = `separate`",
+                ));
+            }
+            false
+        }
+        Some(unknown) => {
+            return Err(CliError::usage(format!(
+                "[verifier].environment_mode must be `shared` or `separate`, got `{unknown}`"
+            )));
+        }
+        None => has_section,
+    };
+
+    if !separate {
+        return Ok(None);
+    }
+
+    // Resolve the verifier image from `[verifier.environment]`, falling back to
+    // the top-level environment image when unset (harbor's fresh-copy default).
+    let explicit_image = toml_section_value(contents, "verifier.environment", "docker_image");
+    let (image, prebuilt_image) = match explicit_image {
+        Some(image) => (image, true),
+        None => (base.image.clone(), base.prebuilt_image),
+    };
+
+    let platform = toml_section_value(contents, "verifier.environment", "docker_platform")
+        .or_else(|| toml_section_value(contents, "verifier.environment", "platform"))
+        .or_else(|| base.platform.clone());
+
+    let resources = verifier_docker_resources(contents, &base.resources)?;
+
+    let build_network = match toml_section_value(contents, "verifier.environment", "network_mode") {
+        Some(value) => parse_network_mode("verifier.environment.network_mode", &value)?,
+        None => base.build_network,
+    };
+
+    let build_timeout = toml_duration_value_with_default(
+        contents,
+        "verifier.environment",
+        "build_timeout_sec",
+        base.build_timeout,
+    )?;
+
+    reject_unsupported_verifier_environment_os(contents)?;
+
+    Ok(Some(VerifierEnvironment {
+        image,
+        prebuilt_image,
+        platform,
+        resources,
+        build_network,
+        build_timeout,
+    }))
+}
+
+fn reject_unsupported_verifier_environment_os(contents: &str) -> Result<(), CliError> {
+    let Some(os) = toml_section_value(contents, "verifier.environment", "os") else {
+        return Ok(());
+    };
+
+    if os == "linux" {
+        Ok(())
+    } else {
+        Err(CliError::unimplemented(format!(
+            "[verifier.environment].os = `{os}` is not implemented by Seaport's docker backend yet"
+        )))
+    }
+}
+
+/// Like `docker_resources`, but for the `[verifier.environment]` section,
+/// defaulting unset fields to the top-level environment's resources.
+fn verifier_docker_resources(
+    contents: &str,
+    base: &DockerResources,
+) -> Result<DockerResources, CliError> {
+    let mut resources = base.clone();
+
+    if let Some(cpus) = toml_section_value(contents, "verifier.environment", "cpus") {
+        let parsed = cpus.parse::<f64>().map_err(|error| {
+            CliError::usage(format!(
+                "[verifier.environment].cpus must be a number: {error}"
+            ))
+        })?;
+
+        if parsed <= 0.0 {
+            return Err(CliError::usage(
+                "[verifier.environment].cpus must be greater than zero",
+            ));
+        }
+
+        resources.cpus = Some(cpus);
+    }
+
+    if let Some(memory_mb) = toml_section_value(contents, "verifier.environment", "memory_mb") {
+        let parsed = memory_mb.parse::<u64>().map_err(|error| {
+            CliError::usage(format!(
+                "[verifier.environment].memory_mb must be a positive integer: {error}"
+            ))
+        })?;
+
+        if parsed == 0 {
+            return Err(CliError::usage(
+                "[verifier.environment].memory_mb must be greater than zero",
+            ));
+        }
+
+        resources.memory_mb = Some(parsed);
+    }
+
+    Ok(resources)
+}
+
+/// Whether a `[section]` header is present in the TOML. Used to distinguish an
+/// empty-but-present `[verifier.environment]` (implies separate mode) from an
+/// absent one.
+fn toml_has_section(contents: &str, section: &str) -> bool {
+    let header = format!("[{section}]");
+    contents.lines().any(|line| line.trim() == header)
 }
 
 fn baseline_network(contents: &str) -> Result<DockerNetwork, CliError> {
@@ -2709,6 +3070,7 @@ mod tests {
             verifier_timeout: Duration::from_secs(60),
             agent_user: None,
             verifier_user: None,
+            verifier_environment: None,
         };
         let command = docker_build_command(
             "seaport-task-test",
@@ -2805,6 +3167,7 @@ mod tests {
             verifier_timeout: Duration::from_secs(60),
             agent_user: None,
             verifier_user: None,
+            verifier_environment: None,
         };
         let task = temp_task_dir("docker-cache-key");
         let environment_dir = task.join("environment");
@@ -3105,6 +3468,192 @@ build_timeout_sec = 7.5
         assert_eq!(environment.platform, None);
 
         let _ = fs::remove_dir_all(task);
+    }
+
+    #[test]
+    fn task_environment_defaults_to_shared_verifier() {
+        // No verifier environment declared -> shared mode (default, unchanged).
+        let task = temp_task_dir("shared-verifier-default");
+        fs::create_dir_all(&task).expect("task dir");
+        fs::write(
+            task.join("task.toml"),
+            r#"
+[environment]
+docker_image = "python:3.12"
+
+[verifier]
+timeout_sec = 5
+"#,
+        )
+        .expect("task toml");
+
+        let environment = task_environment(&task).expect("environment");
+
+        assert!(environment.verifier_environment.is_none());
+
+        let _ = fs::remove_dir_all(task);
+    }
+
+    #[test]
+    fn task_environment_detects_separate_verifier_from_environment_section() {
+        // A [verifier.environment] section implies separate mode and overrides
+        // the verifier image while falling back to the top-level environment
+        // for unset fields (harbor's fresh-copy default).
+        let task = temp_task_dir("separate-verifier-section");
+        fs::create_dir_all(&task).expect("task dir");
+        fs::write(
+            task.join("task.toml"),
+            r#"
+[environment]
+docker_image = "agent-image:latest"
+docker_platform = "linux/arm64"
+cpus = 4
+memory_mb = 4096
+network_mode = "public"
+
+[verifier]
+timeout_sec = 5
+
+[verifier.environment]
+docker_image = "verifier-image:latest"
+memory_mb = 2048
+"#,
+        )
+        .expect("task toml");
+
+        let environment = task_environment(&task).expect("environment");
+        let verifier = environment
+            .verifier_environment
+            .as_ref()
+            .expect("separate verifier environment");
+
+        assert_eq!(verifier.image, "verifier-image:latest");
+        assert!(verifier.prebuilt_image);
+        // Memory overridden under [verifier.environment]; cpus and platform
+        // inherited from the top-level environment.
+        assert_eq!(verifier.resources.memory_mb, Some(2048));
+        assert_eq!(verifier.resources.cpus.as_deref(), Some("4"));
+        assert_eq!(verifier.platform.as_deref(), Some("linux/arm64"));
+        assert_eq!(verifier.build_network, DockerNetwork::Bridge);
+
+        let _ = fs::remove_dir_all(task);
+    }
+
+    #[test]
+    fn task_environment_detects_separate_verifier_from_explicit_mode() {
+        // environment_mode = "separate" without a [verifier.environment] section
+        // runs the verifier in a fresh copy of the top-level environment.
+        let task = temp_task_dir("separate-verifier-mode");
+        fs::create_dir_all(&task).expect("task dir");
+        fs::write(
+            task.join("task.toml"),
+            r#"
+[environment]
+docker_image = "shared-image:latest"
+
+[verifier]
+environment_mode = "separate"
+"#,
+        )
+        .expect("task toml");
+
+        let environment = task_environment(&task).expect("environment");
+        let verifier = environment
+            .verifier_environment
+            .as_ref()
+            .expect("separate verifier environment");
+
+        // Falls back to the top-level environment image.
+        assert_eq!(verifier.image, "shared-image:latest");
+        assert!(verifier.prebuilt_image);
+
+        let _ = fs::remove_dir_all(task);
+    }
+
+    #[test]
+    fn task_environment_explicit_shared_mode_stays_shared() {
+        let task = temp_task_dir("explicit-shared-verifier");
+        fs::create_dir_all(&task).expect("task dir");
+        fs::write(
+            task.join("task.toml"),
+            r#"
+[environment]
+docker_image = "shared-image:latest"
+
+[verifier]
+environment_mode = "shared"
+"#,
+        )
+        .expect("task toml");
+
+        let environment = task_environment(&task).expect("environment");
+
+        assert!(environment.verifier_environment.is_none());
+
+        let _ = fs::remove_dir_all(task);
+    }
+
+    #[test]
+    fn task_environment_rejects_shared_mode_with_environment_section() {
+        let task = temp_task_dir("conflicting-verifier-mode");
+        fs::create_dir_all(&task).expect("task dir");
+        fs::write(
+            task.join("task.toml"),
+            r#"
+[verifier]
+environment_mode = "shared"
+
+[verifier.environment]
+docker_image = "verifier-image:latest"
+"#,
+        )
+        .expect("task toml");
+
+        assert!(task_environment(&task).is_err());
+
+        let _ = fs::remove_dir_all(task);
+    }
+
+    #[test]
+    fn docker_start_command_configures_verifier_container() {
+        // The fresh verifier container uses the verifier image, the verifier
+        // network, the verifier resources, and the same task mounts.
+        let resources = DockerResources {
+            cpus: Some("2".to_owned()),
+            memory_mb: Some(2048),
+            pin_swap: false,
+        };
+        let command = docker_start_command(&StartTrialContainer {
+            container_name: "seaport-verifier-abc",
+            image: "verifier-image:latest",
+            task_path: Path::new("/tmp/task"),
+            logs_root: Path::new("/tmp/logs"),
+            network: DockerNetwork::None,
+            platform: Some("linux/amd64"),
+            resources: &resources,
+        });
+        let args = command_args(command);
+
+        assert!(args.iter().any(|arg| arg == "verifier-image:latest"));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--name", "seaport-verifier-abc"]));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--network", "none"]));
+        assert!(args.windows(2).any(|window| window == ["--cpus", "2"]));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--memory", "2048m"]));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "type=bind,source=/tmp/task/tests,target=/tests,readonly"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "type=bind,source=/tmp/task,target=/seaport/task,readonly"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "type=bind,source=/tmp/logs,target=/logs"));
     }
 
     fn command_args(command: Command) -> Vec<String> {
