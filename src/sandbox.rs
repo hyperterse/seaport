@@ -443,6 +443,10 @@ fn run_scripts_in_docker(
     let result = (|| {
         prep_container_workspace(&container, runtime.task_label)?;
 
+        if let Some(healthcheck) = &environment.healthcheck {
+            run_healthcheck(&container, healthcheck, runtime.task_label)?;
+        }
+
         if multi_step {
             return run_steps_in_container(
                 &container,
@@ -602,6 +606,32 @@ fn run_steps_in_container(
                     name: step.name.clone(),
                     agent: AgentStep::nop(),
                     verifier: setup,
+                    rewards: crate::Rewards::default(),
+                });
+                break;
+            }
+        }
+
+        // Per-step healthcheck runs after setup and before the agent
+        // (supplementing any environment-level healthcheck). A failure aborts
+        // the remaining steps, matching harbor.
+        if let Some(healthcheck) = &step.healthcheck {
+            if let Err(error) = run_healthcheck(container, healthcheck, runtime.task_label) {
+                print_backend_notice(
+                    runtime.task_label,
+                    "steps",
+                    &format!(
+                        "step `{}` healthcheck failed ({error}); aborting remaining steps",
+                        step.name
+                    ),
+                );
+                outcomes.push(StepOutcome {
+                    name: step.name.clone(),
+                    agent: AgentStep::nop(),
+                    verifier: placeholder_output(&format!(
+                        "step `{}` healthcheck failed: {error}",
+                        step.name
+                    )),
                     rewards: crate::Rewards::default(),
                 });
                 break;
@@ -1235,6 +1265,9 @@ struct TaskEnvironment {
     /// How a multi-step task's trial-level reward is derived from per-step
     /// rewards. Ignored for single-step tasks.
     reward_strategy: RewardStrategy,
+    /// Optional environment readiness healthcheck (`[environment.healthcheck]`),
+    /// run after the container starts and before the agent. Mirrors harbor.
+    healthcheck: Option<HealthcheckConfig>,
 }
 
 /// The container configuration for a separate (isolated) verifier, declared via
@@ -1382,6 +1415,11 @@ fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
         verifier_user.as_deref(),
     )?;
     let reward_strategy = parse_reward_strategy(&doc)?;
+    let healthcheck = parse_healthcheck(
+        doc.get("environment")
+            .and_then(|env| env.get("healthcheck")),
+        "[environment.healthcheck]",
+    )?;
 
     let mut environment = TaskEnvironment {
         image,
@@ -1400,6 +1438,7 @@ fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
         artifacts,
         steps,
         reward_strategy,
+        healthcheck,
     };
     environment.verifier_environment = verifier_environment(&doc, &environment)?;
 
@@ -1668,6 +1707,154 @@ struct StepConfig {
     verifier_user: Option<String>,
     min_reward: Option<MinReward>,
     artifacts: Vec<ArtifactSpec>,
+    healthcheck: Option<HealthcheckConfig>,
+}
+
+/// Environment readiness healthcheck, mirroring docker HEALTHCHECK options and
+/// harbor's `HealthcheckConfig`. The command is polled until it exits 0 or the
+/// retry budget is exhausted (failures during the start period don't count).
+#[derive(Clone, Debug, PartialEq)]
+struct HealthcheckConfig {
+    command: String,
+    interval: Duration,
+    timeout: Duration,
+    start_period: Duration,
+    start_interval: Duration,
+    retries: u32,
+}
+
+fn parse_healthcheck(
+    value: Option<&toml::Value>,
+    label: &str,
+) -> Result<Option<HealthcheckConfig>, CliError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let table = value
+        .as_table()
+        .ok_or_else(|| CliError::usage(format!("{label} must be a table")))?;
+
+    let command = table
+        .get("command")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| CliError::usage(format!("{label} requires a `command`")))?
+        .to_owned();
+
+    let duration = |key: &str, default: f64| -> Result<Duration, CliError> {
+        match table.get(key) {
+            None => Ok(Duration::from_secs_f64(default)),
+            Some(value) => {
+                let seconds = value
+                    .as_float()
+                    .or_else(|| value.as_integer().map(|seconds| seconds as f64))
+                    .ok_or_else(|| CliError::usage(format!("{label}.{key} must be a number")))?;
+                if seconds < 0.0 {
+                    return Err(CliError::usage(format!(
+                        "{label}.{key} must not be negative"
+                    )));
+                }
+                Ok(Duration::from_secs_f64(seconds))
+            }
+        }
+    };
+
+    let retries = match table.get("retries") {
+        None => 3,
+        Some(value) => {
+            let retries = value
+                .as_integer()
+                .filter(|retries| *retries > 0)
+                .ok_or_else(|| {
+                    CliError::usage(format!("{label}.retries must be a positive integer"))
+                })?;
+            retries as u32
+        }
+    };
+
+    Ok(Some(HealthcheckConfig {
+        command,
+        interval: duration("interval_sec", 5.0)?,
+        timeout: duration("timeout_sec", 30.0)?,
+        start_period: duration("start_period_sec", 0.0)?,
+        start_interval: duration("start_interval_sec", 5.0)?,
+        retries,
+    }))
+}
+
+/// Polls the healthcheck command in the container until it succeeds or the
+/// retry budget is exhausted. Mirrors docker HEALTHCHECK / harbor semantics:
+/// during the start period, failures don't count toward retries.
+fn run_healthcheck(
+    container: &str,
+    healthcheck: &HealthcheckConfig,
+    task_label: &str,
+) -> Result<(), CliError> {
+    let started = Instant::now();
+    let mut consecutive_failures = 0u32;
+
+    loop {
+        let in_start_period = started.elapsed() < healthcheck.start_period;
+
+        let mut command = Command::new("docker");
+        command
+            .args(["exec", container, "sh", "-c", &healthcheck.command])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let timed = run_command_with_timeout(command, healthcheck.timeout, None)?;
+
+        if !timed.timed_out && timed.output.status.success() {
+            return Ok(());
+        }
+
+        if in_start_period {
+            thread::sleep(healthcheck.start_interval);
+            continue;
+        }
+
+        consecutive_failures += 1;
+        if consecutive_failures >= healthcheck.retries {
+            return Err(CliError::task_failed(format!(
+                "healthcheck failed after {} attempts: {}",
+                healthcheck.retries, healthcheck.command
+            )));
+        }
+
+        print_backend_notice(
+            task_label,
+            "healthcheck",
+            &format!(
+                "not ready (attempt {}/{}); retrying in {}",
+                consecutive_failures,
+                healthcheck.retries,
+                format_duration(healthcheck.interval)
+            ),
+        );
+        thread::sleep(healthcheck.interval);
+    }
+}
+
+/// A synthetic non-zero `Output` for recording a step that was aborted before
+/// its verifier ran (e.g. a failed healthcheck), so it can be stored like any
+/// other step result.
+fn placeholder_output(message: &str) -> Output {
+    Output {
+        status: placeholder_failed_status(),
+        stdout: Vec::new(),
+        stderr: message.as_bytes().to_vec(),
+    }
+}
+
+#[cfg(unix)]
+fn placeholder_failed_status() -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt;
+    // Raw wait status whose exit code is 1.
+    std::process::ExitStatus::from_raw(1 << 8)
+}
+
+#[cfg(not(unix))]
+fn placeholder_failed_status() -> std::process::ExitStatus {
+    use std::os::windows::process::ExitStatusExt;
+    std::process::ExitStatus::from_raw(1)
 }
 
 fn parse_reward_strategy(doc: &toml::Value) -> Result<RewardStrategy, CliError> {
@@ -1711,6 +1898,7 @@ fn parse_steps(
         let step_verifier_user = step_phase_string(item, "verifier", "user")
             .or_else(|| verifier_user.map(str::to_owned));
         let min_reward = parse_min_reward(table.get("min_reward"), &name)?;
+        let healthcheck = parse_healthcheck(item.get("healthcheck"), "[steps.healthcheck]")?;
         let artifacts = table
             .get("artifacts")
             .and_then(toml::Value::as_array)
@@ -1725,6 +1913,7 @@ fn parse_steps(
             verifier_user: step_verifier_user,
             min_reward,
             artifacts,
+            healthcheck,
         });
     }
 
@@ -3998,6 +4187,7 @@ mod tests {
             artifacts: Vec::new(),
             steps: Vec::new(),
             reward_strategy: RewardStrategy::Mean,
+            healthcheck: None,
         };
         let command = docker_build_command(
             "seaport-task-test",
@@ -4098,6 +4288,7 @@ mod tests {
             artifacts: Vec::new(),
             steps: Vec::new(),
             reward_strategy: RewardStrategy::Mean,
+            healthcheck: None,
         };
         let task = temp_task_dir("docker-cache-key");
         let environment_dir = task.join("environment");
@@ -4763,6 +4954,64 @@ min_reward = { core_pass_rate = 0.0 }
         );
 
         let _ = fs::remove_dir_all(task);
+    }
+
+    #[test]
+    fn parses_environment_healthcheck_with_defaults_and_overrides() {
+        let doc = toml_doc::parse(
+            r#"
+[environment.healthcheck]
+command = "curl -fsS localhost:8080/health"
+retries = 5
+interval_sec = 2
+"#,
+        )
+        .expect("toml");
+        let hc = parse_healthcheck(
+            doc.get("environment")
+                .and_then(|env| env.get("healthcheck")),
+            "[environment.healthcheck]",
+        )
+        .expect("parse")
+        .expect("present");
+
+        assert_eq!(hc.command, "curl -fsS localhost:8080/health");
+        assert_eq!(hc.retries, 5);
+        assert_eq!(hc.interval, Duration::from_secs(2));
+        // Unset fields keep harbor's defaults.
+        assert_eq!(hc.timeout, Duration::from_secs(30));
+        assert_eq!(hc.start_period, Duration::from_secs(0));
+        assert_eq!(hc.start_interval, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn healthcheck_requires_command_and_positive_retries() {
+        let no_cmd = toml_doc::parse("[environment.healthcheck]\nretries = 3\n").expect("toml");
+        assert!(parse_healthcheck(
+            no_cmd.get("environment").and_then(|e| e.get("healthcheck")),
+            "[environment.healthcheck]"
+        )
+        .is_err());
+
+        let bad_retries =
+            toml_doc::parse("[environment.healthcheck]\ncommand = \"true\"\nretries = 0\n")
+                .expect("toml");
+        assert!(parse_healthcheck(
+            bad_retries
+                .get("environment")
+                .and_then(|e| e.get("healthcheck")),
+            "[environment.healthcheck]"
+        )
+        .is_err());
+
+        // Absent section -> None.
+        let none = toml_doc::parse("[environment]\ncpus = 1\n").expect("toml");
+        assert!(parse_healthcheck(
+            none.get("environment").and_then(|e| e.get("healthcheck")),
+            "[environment.healthcheck]"
+        )
+        .expect("ok")
+        .is_none());
     }
 
     #[test]
