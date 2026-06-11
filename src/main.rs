@@ -599,7 +599,7 @@ fn run_trial(
 
     let sandbox_agent = agent.sandbox_agent(options)?;
     let phase_envs = options.phase_envs();
-    let execution: Result<(ScriptOutputs, f64), CliError> = (|| {
+    let execution: Result<(ScriptOutputs, Rewards), CliError> = (|| {
         let outputs = run_task_scripts(TaskScriptRequest {
             task_label: task_name,
             task_path: &task.path,
@@ -1156,6 +1156,7 @@ struct TrialOutcome {
     task_name: String,
     attempt: usize,
     reward: String,
+    rewards: Rewards,
     passed: bool,
     error: Option<String>,
     stdout_tail: Vec<String>,
@@ -1173,7 +1174,7 @@ struct TrialRecord<'a> {
     agent_dir: &'a Path,
     verifier_dir: &'a Path,
     outputs: ScriptOutputs,
-    reward: f64,
+    reward: Rewards,
 }
 
 struct TrialFailure<'a> {
@@ -1189,8 +1190,9 @@ struct TrialFailure<'a> {
 }
 
 fn record_completed_trial(record: TrialRecord<'_>) -> Result<TrialOutcome, CliError> {
-    let reward = format_reward(record.reward);
-    let passed = reward_passed(record.reward);
+    let rewards = record.reward;
+    let reward = rewards.display();
+    let passed = rewards.passed();
     let stdout_tail = tail_lines_bytes(&record.outputs.verifier.stdout, FAILURE_TAIL_LINES);
     let stderr_tail = tail_lines_bytes(&record.outputs.verifier.stderr, FAILURE_TAIL_LINES);
     let error = if passed {
@@ -1219,7 +1221,7 @@ fn record_completed_trial(record: TrialRecord<'_>) -> Result<TrialOutcome, CliEr
         agent: record.agent,
         options: record.options,
         passed,
-        reward: &reward,
+        rewards: &rewards,
         error: error.as_deref(),
     })?;
 
@@ -1227,6 +1229,7 @@ fn record_completed_trial(record: TrialRecord<'_>) -> Result<TrialOutcome, CliEr
         task_name: record.task_name.to_owned(),
         attempt: record.attempt,
         reward,
+        rewards,
         passed,
         error,
         stdout_tail,
@@ -1237,7 +1240,8 @@ fn record_completed_trial(record: TrialRecord<'_>) -> Result<TrialOutcome, CliEr
 }
 
 fn record_failed_trial(failure: TrialFailure<'_>) -> Result<TrialOutcome, CliError> {
-    let reward = "0";
+    let rewards = Rewards::single(0.0);
+    let reward = rewards.display();
     let failed_agent = AgentStep {
         command: "execution failed".to_owned(),
         status: 1,
@@ -1263,14 +1267,15 @@ fn record_failed_trial(failure: TrialFailure<'_>) -> Result<TrialOutcome, CliErr
         agent: failure.agent,
         options: failure.options,
         passed: false,
-        reward,
+        rewards: &rewards,
         error: Some(&failure.message),
     })?;
 
     Ok(TrialOutcome {
         task_name: failure.task_name.to_owned(),
         attempt: failure.attempt,
-        reward: reward.to_owned(),
+        reward,
+        rewards,
         passed: false,
         stdout_tail: failure_output_tail(&failure.message, "stdout", FAILURE_TAIL_LINES)
             .unwrap_or_default(),
@@ -1289,7 +1294,7 @@ struct TrialMetadata<'a> {
     agent: AgentKind,
     options: &'a RunOptions,
     passed: bool,
-    reward: &'a str,
+    rewards: &'a Rewards,
     error: Option<&'a str>,
 }
 
@@ -1305,7 +1310,7 @@ fn write_trial_metadata(metadata: TrialMetadata<'_>) -> Result<(), CliError> {
     )?;
     fs::write(
         metadata.trial_dir.join("result.json"),
-        trial_result_json(metadata.passed, metadata.reward, metadata.error),
+        trial_result_json(metadata.passed, metadata.rewards, metadata.error),
     )?;
 
     Ok(())
@@ -1314,7 +1319,74 @@ fn write_trial_metadata(metadata: TrialMetadata<'_>) -> Result<(), CliError> {
 /// Reads the verifier reward, preferring `reward.json` over `reward.txt`
 /// (matching harbor). `reward.json` may be a bare number or an object with a
 /// numeric `reward` field; `reward.txt` is parsed as a single float.
-fn read_reward(logs_dir: &Path) -> Result<f64, CliError> {
+/// A verifier reward: a set of named scores in a stable order. The `reward`
+/// key is the 1-D convention used by single-step tasks; multi-key rewards (for
+/// example `{core_pass_rate, strict_pass_rate}`) are preserved whole for output
+/// fidelity and per-key gating.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Rewards {
+    entries: Vec<(String, f64)>,
+}
+
+impl Rewards {
+    /// The 1-D reward: a single `reward` score.
+    fn single(value: f64) -> Self {
+        Self {
+            entries: vec![("reward".to_owned(), value)],
+        }
+    }
+
+    fn get(&self, key: &str) -> Option<f64> {
+        self.entries
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| *value)
+    }
+
+    /// The scalar reward used for display and cross-trial aggregation: the
+    /// `reward` key when present (the 1-D convention), otherwise the mean of all
+    /// named scores.
+    fn primary(&self) -> f64 {
+        if let Some(value) = self.get("reward") {
+            return value;
+        }
+
+        if self.entries.is_empty() {
+            return 0.0;
+        }
+
+        self.entries.iter().map(|(_, value)| value).sum::<f64>() / self.entries.len() as f64
+    }
+
+    /// A reward passes only at full credit: the `reward` key equals 1.0, or, for
+    /// a multi-key reward with no `reward` key, every named score equals 1.0.
+    fn passed(&self) -> bool {
+        if let Some(value) = self.get("reward") {
+            return reward_is_full(value);
+        }
+
+        !self.entries.is_empty() && self.entries.iter().all(|(_, value)| reward_is_full(*value))
+    }
+
+    /// The reward rendered for display/storage (the primary scalar).
+    fn display(&self) -> String {
+        format_reward(self.primary())
+    }
+
+    /// The full reward map as a JSON object, for trial result output.
+    fn to_json(&self) -> String {
+        let body = self
+            .entries
+            .iter()
+            .map(|(key, value)| format!("\"{}\":{}", json_escape(key), format_reward(*value)))
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!("{{{body}}}")
+    }
+}
+
+fn read_reward(logs_dir: &Path) -> Result<Rewards, CliError> {
     let json_path = logs_dir.join("reward.json");
     let text_path = logs_dir.join("reward.txt");
 
@@ -1330,12 +1402,14 @@ fn read_reward(logs_dir: &Path) -> Result<f64, CliError> {
 
     if text_path.is_file() {
         let contents = fs::read_to_string(&text_path)?;
-        return contents.trim().parse::<f64>().map_err(|_| {
+        let value = contents.trim().parse::<f64>().map_err(|_| {
             CliError::task_failed(format!(
                 "verifier wrote an unparseable reward to {}",
                 text_path.display()
             ))
-        });
+        })?;
+
+        return Ok(Rewards::single(value));
     }
 
     Err(CliError::task_failed(format!(
@@ -1344,14 +1418,25 @@ fn read_reward(logs_dir: &Path) -> Result<f64, CliError> {
     )))
 }
 
-/// Parses a reward from `reward.json`: either a bare number, or an object with
-/// a numeric `reward` field (the canonical single-reward case).
-fn parse_reward_json(contents: &str) -> Option<f64> {
+/// Parses `reward.json`: either a bare number (the 1-D convention) or an object
+/// of named numeric scores. Returns `None` when there are no numeric rewards.
+fn parse_reward_json(contents: &str) -> Option<Rewards> {
     let value: serde_json::Value = serde_json::from_str(contents).ok()?;
 
     match value {
-        serde_json::Value::Number(number) => number.as_f64(),
-        serde_json::Value::Object(map) => map.get("reward").and_then(serde_json::Value::as_f64),
+        serde_json::Value::Number(number) => number.as_f64().map(Rewards::single),
+        serde_json::Value::Object(map) => {
+            let entries = map
+                .iter()
+                .filter_map(|(key, value)| value.as_f64().map(|value| (key.clone(), value)))
+                .collect::<Vec<_>>();
+
+            if entries.is_empty() {
+                None
+            } else {
+                Some(Rewards { entries })
+            }
+        }
         _ => None,
     }
 }
@@ -1373,9 +1458,9 @@ fn format_reward(reward: f64) -> String {
     }
 }
 
-/// A reward counts as `passed` only at full credit (1.0), using an epsilon
-/// comparison to tolerate float representation noise.
-fn reward_passed(reward: f64) -> bool {
+/// Whether a single score is full credit (1.0), using an epsilon comparison to
+/// tolerate float representation noise.
+fn reward_is_full(reward: f64) -> bool {
     (reward - 1.0).abs() < f64::EPSILON
 }
 
@@ -1454,18 +1539,23 @@ fn job_result_json(outcomes: &[TrialOutcome]) -> String {
     )
 }
 
-fn trial_result_json(passed: bool, reward: &str, error: Option<&str>) -> String {
+fn trial_result_json(passed: bool, rewards: &Rewards, error: Option<&str>) -> String {
+    let reward = rewards.display();
+    let rewards_json = rewards.to_json();
+
     match error {
         Some(error) => format!(
-            "{{\n  \"passed\": {},\n  \"reward\": \"{}\",\n  \"error\": \"{}\"\n}}\n",
+            "{{\n  \"passed\": {},\n  \"reward\": \"{}\",\n  \"rewards\": {},\n  \"error\": \"{}\"\n}}\n",
             passed,
-            json_escape(reward),
+            json_escape(&reward),
+            rewards_json,
             json_escape(error)
         ),
         None => format!(
-            "{{\n  \"passed\": {},\n  \"reward\": \"{}\"\n}}\n",
+            "{{\n  \"passed\": {},\n  \"reward\": \"{}\",\n  \"rewards\": {}\n}}\n",
             passed,
-            json_escape(reward)
+            json_escape(&reward),
+            rewards_json
         ),
     }
 }
@@ -1517,11 +1607,12 @@ fn trial_outcomes_json(outcomes: &[TrialOutcome]) -> String {
                 .unwrap_or_default();
 
             format!(
-                "{{\"task\":\"{}\",\"attempt\":{},\"passed\":{},\"reward\":\"{}\"{}}}",
+                "{{\"task\":\"{}\",\"attempt\":{},\"passed\":{},\"reward\":\"{}\",\"rewards\":{}{}}}",
                 json_escape(&outcome.task_name),
                 outcome.attempt,
                 outcome.passed,
                 json_escape(&outcome.reward),
+                outcome.rewards.to_json(),
                 error
             )
         })
@@ -2212,11 +2303,13 @@ mod tests {
     use super::*;
 
     fn reward_outcome(reward: f64) -> TrialOutcome {
+        let rewards = Rewards::single(reward);
         TrialOutcome {
             task_name: "acme/task".to_owned(),
             attempt: 1,
-            reward: format_reward(reward),
-            passed: reward_passed(reward),
+            reward: rewards.display(),
+            passed: rewards.passed(),
+            rewards,
             error: None,
             stdout_tail: Vec::new(),
             stderr_tail: Vec::new(),
@@ -2233,9 +2326,9 @@ mod tests {
 
         let reward = read_reward(&dir).expect("reward");
 
-        assert_eq!(reward, 0.5);
-        assert!(!reward_passed(reward));
-        assert_eq!(format_reward(reward), "0.5");
+        assert_eq!(reward.primary(), 0.5);
+        assert!(!reward.passed());
+        assert_eq!(reward.display(), "0.5");
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -2248,8 +2341,8 @@ mod tests {
 
         let reward = read_reward(&dir).expect("reward");
 
-        assert!(reward_passed(reward));
-        assert_eq!(format_reward(reward), "1");
+        assert!(reward.passed());
+        assert_eq!(reward.display(), "1");
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -2263,7 +2356,7 @@ mod tests {
 
         let reward = read_reward(&dir).expect("reward");
 
-        assert_eq!(reward, 0.25);
+        assert_eq!(reward.primary(), 0.25);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -2276,8 +2369,52 @@ mod tests {
 
         let reward = read_reward(&dir).expect("reward");
 
-        assert!(reward_passed(reward));
-        assert_eq!(format_reward(reward), "1");
+        assert!(reward.passed());
+        assert_eq!(reward.display(), "1");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reward_json_named_scores_pass_only_when_all_full() {
+        let dir = temp_test_dir("reward-json-named");
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(
+            dir.join("reward.json"),
+            "{\"core_pass_rate\": 1.0, \"strict_pass_rate\": 0.5}",
+        )
+        .expect("reward.json");
+
+        let reward = read_reward(&dir).expect("reward");
+
+        // No 1-D `reward` key: every named score must be full to pass.
+        assert!(!reward.passed());
+        assert_eq!(reward.get("core_pass_rate"), Some(1.0));
+        assert_eq!(reward.get("strict_pass_rate"), Some(0.5));
+        // Primary scalar is the mean of named scores; full map is preserved.
+        assert_eq!(reward.primary(), 0.75);
+        assert_eq!(
+            reward.to_json(),
+            "{\"core_pass_rate\":1,\"strict_pass_rate\":0.5}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reward_json_named_scores_all_full_passes() {
+        let dir = temp_test_dir("reward-json-named-full");
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(
+            dir.join("reward.json"),
+            "{\"core_pass_rate\": 1.0, \"strict_pass_rate\": 1.0}",
+        )
+        .expect("reward.json");
+
+        let reward = read_reward(&dir).expect("reward");
+
+        assert!(reward.passed());
+        assert_eq!(reward.display(), "1");
 
         let _ = fs::remove_dir_all(dir);
     }
