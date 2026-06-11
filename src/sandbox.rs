@@ -1008,6 +1008,11 @@ fn prepare_docker_image(
             platform.as_deref(),
             environment.build_timeout,
         )?;
+        // Prebuilt images may only exist for a foreign architecture (for
+        // example amd64-only benchmark images on an arm64 host). Requesting
+        // the image's actual platform explicitly keeps docker from warning on
+        // every run and makes the emulation visible in the container config.
+        let platform = platform.or_else(|| docker_image_platform_mismatch(&environment.image));
 
         return Ok(DockerImage {
             reference: environment.image.clone(),
@@ -1208,6 +1213,40 @@ fn hash_cache_bytes(hash: &mut u64, bytes: &[u8]) {
 
     *hash ^= 0xff;
     *hash = hash.wrapping_mul(FNV_PRIME);
+}
+
+/// Returns the image's `os/arch` when it differs from the host platform.
+fn docker_image_platform_mismatch(reference: &str) -> Option<String> {
+    let output = Command::new("docker")
+        .args([
+            "image",
+            "inspect",
+            "--format",
+            "{{.Os}}/{{.Architecture}}",
+            reference,
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let actual = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+
+    if actual.is_empty() || actual == host_docker_platform() {
+        None
+    } else {
+        Some(actual)
+    }
+}
+
+fn host_docker_platform() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "linux/arm64"
+    } else {
+        "linux/amd64"
+    }
 }
 
 fn docker_image_exists(reference: &str) -> bool {
