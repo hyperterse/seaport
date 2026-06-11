@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -17,8 +19,7 @@ const DEFAULT_CONTAINER_MEMORY_MB: u64 = 1024;
 const DEFAULT_CONTAINER_CPUS: &str = "1.0";
 const BOOSTED_CONTAINER_CPUS_MAX: usize = 8;
 const BOOSTED_CONTAINER_MEMORY_MB: u64 = 4096;
-const CONTAINER_PIDS_LIMIT: &str = "256";
-const DEFAULT_TMPFS_SIZE: &str = "256m";
+const CONTAINER_PIDS_LIMIT: &str = "4096";
 const DEFAULT_COMPAT_DOCKER_PLATFORM: &str = "linux/amd64";
 const DOCKER_BUILD_ATTEMPTS: usize = 3;
 const DOCKER_BUILD_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -251,85 +252,104 @@ fn run_scripts_in_docker(
         &format!("prepare_docker_image -> {}", image.reference),
         prepare_started.elapsed(),
     );
-    let image_platform = image.platform.as_deref();
-    // /app lives in a per-trial docker volume instead of a host bind mount:
-    // build/test I/O stays inside the VM filesystem, which is dramatically
-    // faster than macOS file sharing, and the volume carries solution state
-    // into the verifier container.
-    let app_volume = docker_volume_name(runtime.run_id);
+    let logs_root = runtime
+        .logs_dir
+        .parent()
+        .ok_or_else(|| CliError::usage("logs directory has no parent"))?;
+
+    // One long-lived container hosts the whole trial and scripts run in it
+    // via `docker exec`, so state the solution creates outside /app (installed
+    // packages, tool caches, $HOME) is still present for the verifier and the
+    // root filesystem stays writable for tasks that install at runtime. This
+    // matches how tasks behave under harbor.
+    let container = docker_container_name(runtime.run_id, "trial");
+    let start_started = Instant::now();
+    start_trial_container(
+        StartTrialContainer {
+            container_name: &container,
+            image: &image.reference,
+            task_path: runtime.task_path,
+            logs_root,
+            network: environment.agent_network,
+            platform: image.platform.as_deref(),
+            resources: &resources,
+        },
+        runtime.task_label,
+    )?;
+    logging::log_timing(
+        runtime.task_label,
+        "container",
+        "start trial container",
+        start_started.elapsed(),
+    );
+
     let result = (|| {
-        let seed_started = Instant::now();
-        seed_docker_volume_workspace(
-            runtime.task_label,
-            runtime.run_id,
-            &image.reference,
-            runtime.task_path,
-            &app_volume,
-            image_platform,
-        )?;
-        logging::log_timing(
-            runtime.task_label,
-            "seed",
-            "seed app volume (task files + copybook aliases)",
-            seed_started.elapsed(),
-        );
+        prep_container_workspace(&container, runtime.task_label)?;
 
         let agent = match agent_kind {
-            SandboxAgent::Oracle => AgentStep::from_output(
-                "solution/solve.sh",
-                run_script_in_docker(DockerScriptRun {
-                    image: &image.reference,
-                    run_id: runtime.run_id,
-                    task_path: runtime.task_path,
-                    app_volume: &app_volume,
-                    logs_dir: runtime.logs_dir,
-                    task_label: runtime.task_label,
-                    script: "solution/solve.sh",
-                    network: environment.agent_network,
-                    platform: image_platform,
-                    resources: &resources,
-                    env: &envs.agent,
-                    timeout: environment.agent_timeout,
-                })?,
-            ),
+            SandboxAgent::Oracle => {
+                let agent_env = env_refs(&envs.agent);
+
+                AgentStep::from_output(
+                    "solution/solve.sh",
+                    exec_in_container(ContainerExec {
+                        container: &container,
+                        task_label: runtime.task_label,
+                        phase: "solution",
+                        label: "solution/solve.sh",
+                        invocation: ContainerInvocation::TaskScript("solution/solve.sh"),
+                        env: &agent_env,
+                        timeout: environment.agent_timeout,
+                    })?,
+                )
+            }
             SandboxAgent::Nop => AgentStep::nop(),
-            SandboxAgent::External(agent) => AgentStep::from_output(
-                agent.command.clone(),
-                run_shell_in_docker(DockerShellRun {
-                    image: &image.reference,
-                    run_id: runtime.run_id,
-                    task_path: runtime.task_path,
-                    app_volume: &app_volume,
-                    logs_dir: runtime.logs_dir,
-                    task_label: runtime.task_label,
-                    agent,
-                    network: environment.agent_network,
-                    platform: image_platform,
-                    resources: &resources,
-                    env: &envs.agent,
-                    timeout: environment.agent_timeout,
-                })?,
-            ),
+            SandboxAgent::External(agent) => {
+                let mut agent_env = env_refs(&envs.agent);
+                agent_env.push(("SEAPORT_AGENT_NAME", agent.name.as_str()));
+
+                if let Some(model) = agent.model.as_deref() {
+                    agent_env.push(("SEAPORT_MODEL", model));
+                }
+
+                AgentStep::from_output(
+                    agent.command.clone(),
+                    exec_in_container(ContainerExec {
+                        container: &container,
+                        task_label: runtime.task_label,
+                        phase: "agent",
+                        label: &agent.name,
+                        invocation: ContainerInvocation::ShellCommand(&agent.command),
+                        env: &agent_env,
+                        timeout: environment.agent_timeout,
+                    })?,
+                )
+            }
         };
-        let verifier = run_script_in_docker(DockerScriptRun {
-            image: &image.reference,
-            run_id: runtime.run_id,
-            task_path: runtime.task_path,
-            app_volume: &app_volume,
-            logs_dir: runtime.logs_dir,
+
+        if environment.verifier_network != environment.agent_network {
+            switch_container_network(
+                &container,
+                environment.agent_network,
+                environment.verifier_network,
+            )?;
+        }
+
+        let verifier_env = env_refs(&envs.verifier);
+        let verifier = exec_in_container(ContainerExec {
+            container: &container,
             task_label: runtime.task_label,
-            script: "tests/test.sh",
-            network: environment.verifier_network,
-            platform: image_platform,
-            resources: &resources,
-            env: &envs.verifier,
+            phase: "verifier",
+            label: "tests/test.sh",
+            invocation: ContainerInvocation::TaskScript("tests/test.sh"),
+            env: &verifier_env,
             timeout: environment.verifier_timeout,
         })?;
 
         Ok(ScriptOutputs { agent, verifier })
     })();
 
-    cleanup_docker_volume(&app_volume);
+    cleanup_docker_container(&container);
 
     if image.remove_after_run {
         cleanup_docker_image(&image.reference);
@@ -367,7 +387,6 @@ struct CompatPlatformInference {
 struct DockerResources {
     cpus: Option<String>,
     memory_mb: Option<u64>,
-    tmpfs_size: String,
 }
 
 impl Default for DockerResources {
@@ -375,7 +394,6 @@ impl Default for DockerResources {
         Self {
             cpus: Some(DEFAULT_CONTAINER_CPUS.to_owned()),
             memory_mb: Some(DEFAULT_CONTAINER_MEMORY_MB),
-            tmpfs_size: DEFAULT_TMPFS_SIZE.to_owned(),
         }
     }
 }
@@ -395,7 +413,6 @@ impl DockerResources {
         Self {
             cpus: Some(boosted_cpu_limit()),
             memory_mb: boosted_memory_mb,
-            tmpfs_size: self.tmpfs_size.clone(),
         }
     }
 }
@@ -690,50 +707,11 @@ fn strip_inline_comment(value: &str) -> &str {
     value
 }
 
-fn docker_volume_name(run_id: &str) -> String {
-    format!("seaport-app-{run_id}")
-}
-
-/// Populates the per-trial /app volume. Mounting the volume at /app lets
-/// dockerd copy the image's /app content into it on first use, so the seed
-/// container only layers task files on top, materializes COBOL copybook
-/// aliases, and makes the tree world-writable.
-fn seed_docker_volume_workspace(
-    task_label: &str,
-    run_id: &str,
-    image: &str,
-    task_path: &Path,
-    app_volume: &str,
-    platform: Option<&str>,
-) -> Result<(), CliError> {
-    let container_name = docker_container_name(run_id, "seed");
-    let timed_output = run_command_with_timeout(
-        docker_seed_command(&container_name, image, task_path, app_volume, platform),
-        DOCKER_WORKSPACE_TIMEOUT,
-        Some(CommandLog::new(task_label, "workspace")),
-    )?;
-
-    if timed_output.timed_out {
-        cleanup_docker_container(&container_name);
-        return Err(CliError::task_failed(format!(
-            "docker workspace seeding timed out after {:.3}s",
-            DOCKER_WORKSPACE_TIMEOUT.as_secs_f64()
-        )));
-    }
-
-    if !timed_output.output.status.success() {
-        return Err(CliError::task_failed(format!(
-            "docker workspace seeding failed (status: {})\nstdout:\n{}\nstderr:\n{}",
-            timed_output.output.status,
-            String::from_utf8_lossy(&timed_output.output.stdout),
-            String::from_utf8_lossy(&timed_output.output.stderr)
-        )));
-    }
-
-    Ok(())
-}
-
-const SEED_WORKSPACE_SCRIPT: &str = r#"set -e
+/// Materializes packaged task files and COBOL copybook aliases inside the
+/// trial container's /app, then makes the tree world-writable so scripts can
+/// run as any user the image selects.
+const PREP_WORKSPACE_SCRIPT: &str = r#"set -e
+mkdir -p /app
 if [ -d /seaport/task/environment/task_file ]; then
   rm -rf /app/task_file
   mkdir -p /app/task_file
@@ -760,64 +738,160 @@ done < /tmp/seaport-copybooks
 chmod -R a+rwX /app
 "#;
 
-fn docker_seed_command(
-    container_name: &str,
-    image: &str,
-    task_path: &Path,
-    app_volume: &str,
-    platform: Option<&str>,
-) -> Command {
+struct StartTrialContainer<'a> {
+    container_name: &'a str,
+    image: &'a str,
+    task_path: &'a Path,
+    logs_root: &'a Path,
+    network: DockerNetwork,
+    platform: Option<&'a str>,
+    resources: &'a DockerResources,
+}
+
+fn start_trial_container(start: StartTrialContainer<'_>, task_label: &str) -> Result<(), CliError> {
+    let container_name = start.container_name;
+    let timed_output = run_command_with_timeout(
+        docker_start_command(&start),
+        DOCKER_WORKSPACE_TIMEOUT,
+        Some(CommandLog::new(task_label, "container")),
+    )?;
+
+    if timed_output.timed_out {
+        cleanup_docker_container(container_name);
+        return Err(CliError::task_failed(format!(
+            "docker trial container start timed out after {:.3}s",
+            DOCKER_WORKSPACE_TIMEOUT.as_secs_f64()
+        )));
+    }
+
+    if !timed_output.output.status.success() {
+        cleanup_docker_container(container_name);
+        return Err(CliError::task_failed(format!(
+            "docker trial container start failed (status: {})\nstdout:\n{}\nstderr:\n{}",
+            timed_output.output.status,
+            String::from_utf8_lossy(&timed_output.output.stdout),
+            String::from_utf8_lossy(&timed_output.output.stderr)
+        )));
+    }
+
+    Ok(())
+}
+
+fn docker_start_command(start: &StartTrialContainer<'_>) -> Command {
     let mut command = Command::new("docker");
     command.args([
         "run",
-        "--rm",
+        "-d",
         "--name",
-        container_name,
+        start.container_name,
         "--network",
-        "none",
-        "--user",
-        "0:0",
+        start.network.as_docker_run_arg(),
+        "--pids-limit",
+        CONTAINER_PIDS_LIMIT,
+        "--workdir",
+        "/app",
+        "--env",
+        "APP_DIR=/app",
+        "--env",
+        "LOGS_DIR=/logs/verifier",
+        "--env",
+        "SEAPORT_TASK_DIR=/seaport/task",
+        "--env",
+        "SEAPORT_INSTRUCTION_PATH=/seaport/task/instruction.md",
+        "--env",
+        "COBCPY=/app/copybooks:/app/COPYBOOKS:/app/src/copybooks:/app/src/COPYBOOKS",
     ]);
 
-    if let Some(platform) = platform {
+    if let Some(memory_mb) = start.resources.memory_mb {
+        let memory = format!("{memory_mb}m");
+        command.args(["--memory", &memory, "--memory-swap", &memory]);
+    }
+
+    if let Some(cpus) = start.resources.cpus.as_deref() {
+        command.args(["--cpus", cpus]);
+    }
+
+    if let Some(platform) = start.platform {
         command.args(["--platform", platform]);
     }
 
     command
         .arg("--mount")
-        .arg(format!("type=volume,source={app_volume},target=/app"))
+        .arg(format!(
+            "type=bind,source={},target=/logs",
+            start.logs_root.display()
+        ))
+        .arg("--mount")
+        .arg(format!(
+            "type=bind,source={},target=/tests,readonly",
+            start.task_path.join("tests").display()
+        ))
         .arg("--mount")
         .arg(format!(
             "type=bind,source={},target=/seaport/task,readonly",
-            task_path.display()
+            start.task_path.display()
         ))
-        .args([image, "bash", "-c", SEED_WORKSPACE_SCRIPT]);
+        .arg(start.image)
+        .args(["bash", "-c", "while true; do sleep 3600; done"]);
     command
 }
 
-fn cleanup_docker_volume(app_volume: &str) {
-    if docker_api_remove_volume(app_volume) {
-        return;
+fn prep_container_workspace(container: &str, task_label: &str) -> Result<(), CliError> {
+    let mut command = Command::new("docker");
+    command
+        .args(["exec", "--user", "0:0", container, "bash", "-c"])
+        .arg(PREP_WORKSPACE_SCRIPT);
+
+    let timed_output = run_command_with_timeout(
+        command,
+        DOCKER_WORKSPACE_TIMEOUT,
+        Some(CommandLog::new(task_label, "workspace")),
+    )?;
+
+    if timed_output.timed_out {
+        cleanup_docker_container(container);
+        return Err(CliError::task_failed(format!(
+            "docker workspace preparation timed out after {:.3}s",
+            DOCKER_WORKSPACE_TIMEOUT.as_secs_f64()
+        )));
     }
 
-    match Command::new("docker")
-        .args(["volume", "rm", "-f", app_volume])
-        .output()
-    {
-        Ok(output) if output.status.success() => {}
-        Ok(output) => {
-            eprintln!(
-                "seaport: warning: could not remove docker volume {app_volume} (status: {})\nstderr:\n{}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        Err(error) => {
-            eprintln!("seaport: warning: could not remove docker volume {app_volume}: {error}");
-        }
+    if !timed_output.output.status.success() {
+        return Err(CliError::task_failed(format!(
+            "docker workspace preparation failed (status: {})\nstdout:\n{}\nstderr:\n{}",
+            timed_output.output.status,
+            String::from_utf8_lossy(&timed_output.output.stdout),
+            String::from_utf8_lossy(&timed_output.output.stderr)
+        )));
     }
+
+    Ok(())
 }
 
+fn switch_container_network(
+    container: &str,
+    from: DockerNetwork,
+    to: DockerNetwork,
+) -> Result<(), CliError> {
+    for (action, network) in [
+        ("disconnect", from.as_docker_run_arg()),
+        ("connect", to.as_docker_run_arg()),
+    ] {
+        let output = Command::new("docker")
+            .args(["network", action, network, container])
+            .output()?;
+
+        if !output.status.success() {
+            return Err(CliError::task_failed(format!(
+                "docker network {action} {network} failed for {container} (status: {})\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+    }
+
+    Ok(())
+}
 fn ensure_docker_image_available(
     task_label: &str,
     image: &str,
@@ -1507,75 +1581,44 @@ fn ensure_docker_available() -> Result<(), CliError> {
     }
 }
 
-struct DockerScriptRun<'a> {
-    image: &'a str,
-    run_id: &'a str,
-    task_path: &'a Path,
-    app_volume: &'a str,
-    logs_dir: &'a Path,
+enum ContainerInvocation<'a> {
+    TaskScript(&'a str),
+    ShellCommand(&'a str),
+}
+
+struct ContainerExec<'a> {
+    container: &'a str,
     task_label: &'a str,
-    script: &'a str,
-    network: DockerNetwork,
-    platform: Option<&'a str>,
-    resources: &'a DockerResources,
-    env: &'a [(String, String)],
+    phase: &'static str,
+    label: &'a str,
+    invocation: ContainerInvocation<'a>,
+    env: &'a [(&'a str, &'a str)],
     timeout: Duration,
 }
 
-struct DockerShellRun<'a> {
-    image: &'a str,
-    run_id: &'a str,
-    task_path: &'a Path,
-    app_volume: &'a str,
-    logs_dir: &'a Path,
-    task_label: &'a str,
-    agent: &'a ExternalAgent,
-    network: DockerNetwork,
-    platform: Option<&'a str>,
-    resources: &'a DockerResources,
-    env: &'a [(String, String)],
-    timeout: Duration,
-}
-
-fn run_script_in_docker(run: DockerScriptRun<'_>) -> Result<Output, CliError> {
-    let logs_root = run
-        .logs_dir
-        .parent()
-        .ok_or_else(|| CliError::usage("logs directory has no parent"))?;
-    let container_name = docker_container_name(run.run_id, run.script);
-    let extra_env = env_refs(run.env);
-    let command = docker_run_command(DockerRunCommand {
-        image: run.image,
-        container_name: &container_name,
-        task_path: run.task_path,
-        app_volume: run.app_volume,
-        logs_root,
-        invocation: DockerInvocation::TaskScript(run.script),
-        network: run.network,
-        platform: run.platform,
-        resources: run.resources,
-        extra_env: &extra_env,
-    });
+fn exec_in_container(exec: ContainerExec<'_>) -> Result<Output, CliError> {
     let timed_output = run_command_with_timeout(
-        command,
-        run.timeout,
-        Some(CommandLog::new(run.task_label, script_phase(run.script))),
+        docker_exec_command(&exec),
+        exec.timeout,
+        Some(CommandLog::new(exec.task_label, exec.phase)),
     )?;
     let output = timed_output.output;
 
     if timed_output.timed_out {
-        cleanup_docker_container(&container_name);
+        // Killing the docker exec client does not stop the process inside the
+        // container, so tear the container down to enforce the timeout.
+        cleanup_docker_container(exec.container);
         return Err(CliError::task_failed(format!(
             "sandboxed docker command timed out after {:.3}s: {}",
-            run.timeout.as_secs_f64(),
-            run.script
+            exec.timeout.as_secs_f64(),
+            exec.label
         )));
     }
 
     if !output.status.success() {
         return Err(CliError::task_failed(format!(
             "sandboxed docker command failed: {} (status: {})\nstdout:\n{}\nstderr:\n{}",
-            run.script,
+            exec.label,
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -1585,160 +1628,20 @@ fn run_script_in_docker(run: DockerScriptRun<'_>) -> Result<Output, CliError> {
     Ok(output)
 }
 
-fn run_shell_in_docker(run: DockerShellRun<'_>) -> Result<Output, CliError> {
-    let logs_root = run
-        .logs_dir
-        .parent()
-        .ok_or_else(|| CliError::usage("logs directory has no parent"))?;
-    let container_name = docker_container_name(run.run_id, "agent");
-    let mut extra_env = env_refs(run.env);
-    extra_env.push(("SEAPORT_AGENT_NAME", run.agent.name.as_str()));
-
-    if let Some(model) = run.agent.model.as_deref() {
-        extra_env.push(("SEAPORT_MODEL", model));
-    }
-
-    let command = docker_run_command(DockerRunCommand {
-        image: run.image,
-        container_name: &container_name,
-        task_path: run.task_path,
-        app_volume: run.app_volume,
-        logs_root,
-        invocation: DockerInvocation::ShellCommand(&run.agent.command),
-        network: run.network,
-        platform: run.platform,
-        resources: run.resources,
-        extra_env: &extra_env,
-    });
-    let timed_output = run_command_with_timeout(
-        command,
-        run.timeout,
-        Some(CommandLog::new(run.task_label, "agent")),
-    )?;
-    let output = timed_output.output;
-
-    if timed_output.timed_out {
-        cleanup_docker_container(&container_name);
-        return Err(CliError::task_failed(format!(
-            "sandboxed docker agent timed out after {:.3}s: {}",
-            run.timeout.as_secs_f64(),
-            run.agent.name
-        )));
-    }
-
-    if !output.status.success() {
-        return Err(CliError::task_failed(format!(
-            "sandboxed docker agent failed: {} (status: {})\nstdout:\n{}\nstderr:\n{}",
-            run.agent.name,
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-
-    Ok(output)
-}
-
-enum DockerInvocation<'a> {
-    TaskScript(&'a str),
-    ShellCommand(&'a str),
-}
-
-struct DockerRunCommand<'a> {
-    image: &'a str,
-    container_name: &'a str,
-    task_path: &'a Path,
-    app_volume: &'a str,
-    logs_root: &'a Path,
-    invocation: DockerInvocation<'a>,
-    network: DockerNetwork,
-    platform: Option<&'a str>,
-    resources: &'a DockerResources,
-    extra_env: &'a [(&'a str, &'a str)],
-}
-
-fn docker_run_command(run: DockerRunCommand<'_>) -> Command {
+fn docker_exec_command(exec: &ContainerExec<'_>) -> Command {
     let mut command = Command::new("docker");
-    command
-        .args([
-            "run",
-            "--rm",
-            "--name",
-            run.container_name,
-            "--network",
-            run.network.as_docker_run_arg(),
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
-            "--pids-limit",
-            CONTAINER_PIDS_LIMIT,
-            "--read-only",
-            "--workdir",
-            "/app",
-            "--tmpfs",
-            &format!(
-                "/tmp:rw,exec,nosuid,nodev,size={}",
-                run.resources.tmpfs_size
-            ),
-            "--tmpfs",
-            "/run:rw,nosuid,nodev,size=16m",
-            "--env",
-            "APP_DIR=/app",
-            "--env",
-            "LOGS_DIR=/logs/verifier",
-            "--env",
-            "SEAPORT_TASK_DIR=/seaport/task",
-            "--env",
-            "SEAPORT_INSTRUCTION_PATH=/seaport/task/instruction.md",
-            "--env",
-            "COBCPY=/app/copybooks:/app/COPYBOOKS:/app/src/copybooks:/app/src/COPYBOOKS",
-        ])
-        .args(
-            run.extra_env
-                .iter()
-                .flat_map(|(name, value)| ["--env".to_owned(), format!("{name}={value}")]),
-        );
+    command.args(["exec", "--workdir", "/app"]).args(
+        exec.env
+            .iter()
+            .flat_map(|(name, value)| ["--env".to_owned(), format!("{name}={value}")]),
+    );
+    command.arg(exec.container).arg("bash");
 
-    if let Some(memory_mb) = run.resources.memory_mb {
-        let memory = format!("{memory_mb}m");
-        command.args(["--memory", &memory, "--memory-swap", &memory]);
-    }
-
-    if let Some(cpus) = run.resources.cpus.as_deref() {
-        command.args(["--cpus", cpus]);
-    }
-
-    if let Some(platform) = run.platform {
-        command.args(["--platform", platform]);
-    }
-
-    command
-        .arg("--mount")
-        .arg(format!("type=volume,source={},target=/app", run.app_volume))
-        .arg("--mount")
-        .arg(format!(
-            "type=bind,source={},target=/logs",
-            run.logs_root.display()
-        ))
-        .arg("--mount")
-        .arg(format!(
-            "type=bind,source={},target=/tests,readonly",
-            run.task_path.join("tests").display()
-        ))
-        .arg("--mount")
-        .arg(format!(
-            "type=bind,source={},target=/seaport/task,readonly",
-            run.task_path.display()
-        ))
-        .arg(run.image)
-        .arg("bash");
-
-    match run.invocation {
-        DockerInvocation::TaskScript(script) => {
+    match exec.invocation {
+        ContainerInvocation::TaskScript(script) => {
             command.arg(format!("/seaport/task/{script}"));
         }
-        DockerInvocation::ShellCommand(shell_command) => {
+        ContainerInvocation::ShellCommand(shell_command) => {
             command.arg("-lc").arg(shell_command);
         }
     }
@@ -1754,16 +1657,6 @@ fn docker_container_name(run_id: &str, script: &str) -> String {
         .unwrap_or_else(|| "script".to_owned());
 
     format!("seaport-{phase}-{run_id}")
-}
-
-fn script_phase(script: &str) -> &'static str {
-    if script.starts_with("solution/") {
-        "solution"
-    } else if script.starts_with("tests/") {
-        "verifier"
-    } else {
-        "script"
-    }
 }
 
 fn cleanup_docker_container(container_name: &str) {
@@ -1837,10 +1730,6 @@ fn docker_api_remove_container(container_name: &str) -> bool {
 
 fn docker_api_remove_image(image: &str) -> bool {
     docker_api_delete_success(&format!("/images/{image}?force=true"))
-}
-
-fn docker_api_remove_volume(volume: &str) -> bool {
-    docker_api_delete_success(&format!("/volumes/{volume}?force=true"))
 }
 
 fn docker_api_delete_success(path: &str) -> bool {
@@ -2387,21 +2276,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn docker_command_uses_sandbox_flags() {
-        let command = docker_run_command(DockerRunCommand {
-            image: "seaport-task-test",
+    fn docker_start_command_configures_trial_container() {
+        let command = docker_start_command(&StartTrialContainer {
             container_name: "seaport-test-container",
+            image: "seaport-task-test",
             task_path: Path::new("/tmp/task"),
-            app_volume: "seaport-app-test",
             logs_root: Path::new("/tmp/logs"),
-            invocation: DockerInvocation::TaskScript("tests/test.sh"),
             network: DockerNetwork::None,
             platform: Some("linux/amd64"),
             resources: &DockerResources::default(),
-            extra_env: &[],
         });
         let args = command_args(command);
 
+        assert_eq!(args.first().map(String::as_str), Some("run"));
+        assert_eq!(args.get(1).map(String::as_str), Some("-d"));
         assert!(args
             .windows(2)
             .any(|window| window == ["--network", "none"]));
@@ -2410,13 +2298,7 @@ mod tests {
             .any(|window| window == ["--platform", "linux/amd64"]));
         assert!(args
             .windows(2)
-            .any(|window| window == ["--cap-drop", "ALL"]));
-        assert!(args
-            .windows(2)
-            .any(|window| window == ["--security-opt", "no-new-privileges"]));
-        assert!(args
-            .windows(2)
-            .any(|window| window == ["--pids-limit", "256"]));
+            .any(|window| window == ["--pids-limit", "4096"]));
         assert!(args
             .windows(2)
             .any(|window| window == ["--memory", "1024m"]));
@@ -2424,11 +2306,13 @@ mod tests {
             .windows(2)
             .any(|window| window == ["--memory-swap", "1024m"]));
         assert!(args.windows(2).any(|window| window == ["--cpus", "1.0"]));
-        assert!(args.iter().any(|arg| arg == "--read-only"));
-        assert!(!args.iter().any(|arg| arg == "--user"));
-        assert!(args
-            .windows(2)
-            .any(|window| window == ["--tmpfs", "/tmp:rw,exec,nosuid,nodev,size=256m"]));
+        // Tasks install packages and write outside /app at runtime, so the
+        // container root filesystem must stay writable with default
+        // capabilities, matching harbor's execution environment.
+        assert!(!args.iter().any(|arg| arg == "--read-only"));
+        assert!(!args.iter().any(|arg| arg == "--cap-drop"));
+        assert!(!args.iter().any(|arg| arg == "--security-opt"));
+        assert!(!args.iter().any(|arg| arg == "--tmpfs"));
         assert!(args.windows(2).any(|window| window
             == [
                 "--env",
@@ -2440,6 +2324,58 @@ mod tests {
         assert!(args
             .iter()
             .any(|arg| arg == "type=bind,source=/tmp/task/tests,target=/tests,readonly"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "type=bind,source=/tmp/logs,target=/logs"));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--workdir", "/app"]));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("while true; do sleep 3600; done")
+        );
+    }
+
+    #[test]
+    fn docker_exec_command_runs_task_scripts_with_phase_env() {
+        let command = docker_exec_command(&ContainerExec {
+            container: "seaport-test-container",
+            task_label: "acme/demo",
+            phase: "verifier",
+            label: "tests/test.sh",
+            invocation: ContainerInvocation::TaskScript("tests/test.sh"),
+            env: &[("CHECK", "1")],
+            timeout: Duration::from_secs(60),
+        });
+        let args = command_args(command);
+
+        assert_eq!(args.first().map(String::as_str), Some("exec"));
+        assert!(args
+            .windows(2)
+            .any(|window| window == ["--workdir", "/app"]));
+        assert!(args.windows(2).any(|window| window == ["--env", "CHECK=1"]));
+        assert!(args.iter().any(|arg| arg == "seaport-test-container"));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("/seaport/task/tests/test.sh")
+        );
+    }
+
+    #[test]
+    fn docker_exec_command_runs_shell_agents_via_login_shell() {
+        let command = docker_exec_command(&ContainerExec {
+            container: "seaport-test-container",
+            task_label: "acme/demo",
+            phase: "agent",
+            label: "claude",
+            invocation: ContainerInvocation::ShellCommand("claude --run"),
+            env: &[],
+            timeout: Duration::from_secs(60),
+        });
+        let args = command_args(command);
+
+        assert_eq!(args.last().map(String::as_str), Some("claude --run"));
+        assert!(args.iter().any(|arg| arg == "-lc"));
     }
 
     #[test]
