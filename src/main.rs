@@ -598,7 +598,7 @@ fn run_trial(
 
     let sandbox_agent = agent.sandbox_agent(options)?;
     let phase_envs = options.phase_envs();
-    let execution: Result<(ScriptOutputs, String), CliError> = (|| {
+    let execution: Result<(ScriptOutputs, f64), CliError> = (|| {
         let outputs = run_task_scripts(TaskScriptRequest {
             task_label: task_name,
             task_path: &task.path,
@@ -1171,7 +1171,7 @@ struct TrialRecord<'a> {
     agent_dir: &'a Path,
     verifier_dir: &'a Path,
     outputs: ScriptOutputs,
-    reward: String,
+    reward: f64,
 }
 
 struct TrialFailure<'a> {
@@ -1187,8 +1187,8 @@ struct TrialFailure<'a> {
 }
 
 fn record_completed_trial(record: TrialRecord<'_>) -> Result<TrialOutcome, CliError> {
-    let reward = record.reward.trim().to_owned();
-    let passed = reward == "1" || reward == "1.0";
+    let reward = format_reward(record.reward);
+    let passed = reward_passed(record.reward);
     let stdout_tail = tail_lines_bytes(&record.outputs.verifier.stdout, FAILURE_TAIL_LINES);
     let stderr_tail = tail_lines_bytes(&record.outputs.verifier.stderr, FAILURE_TAIL_LINES);
     let error = if passed {
@@ -1209,7 +1209,7 @@ fn record_completed_trial(record: TrialRecord<'_>) -> Result<TrialOutcome, CliEr
         record.verifier_dir.join("test-stderr.txt"),
         &record.outputs.verifier.stderr,
     )?;
-    fs::write(record.verifier_dir.join("reward.txt"), &record.reward)?;
+    fs::write(record.verifier_dir.join("reward.txt"), &reward)?;
     write_trial_metadata(TrialMetadata {
         trial_dir: record.trial_dir,
         task_name: record.task_name,
@@ -1309,17 +1309,72 @@ fn write_trial_metadata(metadata: TrialMetadata<'_>) -> Result<(), CliError> {
     Ok(())
 }
 
-fn read_reward(logs_dir: &Path) -> Result<String, CliError> {
-    let reward_path = logs_dir.join("reward.txt");
+/// Reads the verifier reward, preferring `reward.json` over `reward.txt`
+/// (matching harbor). `reward.json` may be a bare number or an object with a
+/// numeric `reward` field; `reward.txt` is parsed as a single float.
+fn read_reward(logs_dir: &Path) -> Result<f64, CliError> {
+    let json_path = logs_dir.join("reward.json");
+    let text_path = logs_dir.join("reward.txt");
 
-    if !reward_path.is_file() {
-        return Err(CliError::task_failed(format!(
-            "verifier did not write {}",
-            reward_path.display()
-        )));
+    if json_path.is_file() {
+        let contents = fs::read_to_string(&json_path)?;
+        return parse_reward_json(&contents).ok_or_else(|| {
+            CliError::task_failed(format!(
+                "verifier wrote an unparseable reward to {}",
+                json_path.display()
+            ))
+        });
     }
 
-    Ok(fs::read_to_string(reward_path)?)
+    if text_path.is_file() {
+        let contents = fs::read_to_string(&text_path)?;
+        return contents.trim().parse::<f64>().map_err(|_| {
+            CliError::task_failed(format!(
+                "verifier wrote an unparseable reward to {}",
+                text_path.display()
+            ))
+        });
+    }
+
+    Err(CliError::task_failed(format!(
+        "verifier did not write {}",
+        text_path.display()
+    )))
+}
+
+/// Parses a reward from `reward.json`: either a bare number, or an object with
+/// a numeric `reward` field (the canonical single-reward case).
+fn parse_reward_json(contents: &str) -> Option<f64> {
+    let value: serde_json::Value = serde_json::from_str(contents).ok()?;
+
+    match value {
+        serde_json::Value::Number(number) => number.as_f64(),
+        serde_json::Value::Object(map) => map.get("reward").and_then(serde_json::Value::as_f64),
+        _ => None,
+    }
+}
+
+/// Renders a reward for display/storage: integral values stay integer-shaped
+/// ("0", "1") while fractional values keep their decimal form ("0.5").
+fn format_reward(reward: f64) -> String {
+    if reward.fract() == 0.0 && reward.is_finite() {
+        format!("{}", reward as i64)
+    } else {
+        let mut formatted = format!("{reward:.6}");
+        while formatted.ends_with('0') {
+            formatted.pop();
+        }
+        if formatted.ends_with('.') {
+            formatted.pop();
+        }
+        formatted
+    }
+}
+
+/// A reward counts as `passed` only at full credit (1.0), using an epsilon
+/// comparison to tolerate float representation noise.
+fn reward_passed(reward: f64) -> bool {
+    (reward - 1.0).abs() < f64::EPSILON
 }
 
 fn task_name(task_path: &Path) -> Result<String, CliError> {
@@ -1464,7 +1519,7 @@ fn aggregate_reward(outcomes: &[TrialOutcome]) -> String {
         total += reward;
     }
 
-    format!("{:.6}", total / outcomes.len() as f64)
+    format_reward(total / outcomes.len() as f64)
 }
 
 fn trial_outcomes_json(outcomes: &[TrialOutcome]) -> String {
@@ -2109,6 +2164,96 @@ impl From<std::io::Error> for CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn reward_outcome(reward: f64) -> TrialOutcome {
+        TrialOutcome {
+            task_name: "acme/task".to_owned(),
+            attempt: 1,
+            reward: format_reward(reward),
+            passed: reward_passed(reward),
+            error: None,
+            stdout_tail: Vec::new(),
+            stderr_tail: Vec::new(),
+            trial_dir: PathBuf::new(),
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn reward_json_object_fractional_is_not_passed() {
+        let dir = temp_test_dir("reward-json-fractional");
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(dir.join("reward.json"), "{\"reward\": 0.5}").expect("reward.json");
+
+        let reward = read_reward(&dir).expect("reward");
+
+        assert_eq!(reward, 0.5);
+        assert!(!reward_passed(reward));
+        assert_eq!(format_reward(reward), "0.5");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reward_json_bare_number_full_credit_passes() {
+        let dir = temp_test_dir("reward-json-bare");
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(dir.join("reward.json"), "1.0").expect("reward.json");
+
+        let reward = read_reward(&dir).expect("reward");
+
+        assert!(reward_passed(reward));
+        assert_eq!(format_reward(reward), "1");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reward_json_takes_precedence_over_reward_txt() {
+        let dir = temp_test_dir("reward-json-precedence");
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(dir.join("reward.json"), "0.25").expect("reward.json");
+        fs::write(dir.join("reward.txt"), "1\n").expect("reward.txt");
+
+        let reward = read_reward(&dir).expect("reward");
+
+        assert_eq!(reward, 0.25);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reward_txt_integer_one_still_passes() {
+        let dir = temp_test_dir("reward-txt-one");
+        fs::create_dir_all(&dir).expect("dir");
+        fs::write(dir.join("reward.txt"), "1\n").expect("reward.txt");
+
+        let reward = read_reward(&dir).expect("reward");
+
+        assert!(reward_passed(reward));
+        assert_eq!(format_reward(reward), "1");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_reward_errors_when_no_reward_file_present() {
+        let dir = temp_test_dir("reward-missing");
+        fs::create_dir_all(&dir).expect("dir");
+
+        let error = read_reward(&dir).expect_err("missing reward");
+
+        assert!(error.is_task_failure());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn aggregate_reward_averages_fractional_values() {
+        let outcomes = [reward_outcome(0.5), reward_outcome(1.0)];
+
+        assert_eq!(aggregate_reward(&outcomes), "0.75");
+    }
 
     #[test]
     fn parses_local_run_options() {
