@@ -65,6 +65,51 @@ pub(crate) struct TaskScriptRequest<'a> {
     pub(crate) backend: SandboxBackend,
     pub(crate) strict_resources: bool,
     pub(crate) concurrency: usize,
+    pub(crate) timeout_multipliers: TimeoutMultipliers,
+}
+
+/// Resolved per-phase scaling factors for task-derived timeouts. Each phase
+/// uses its own multiplier when one was given, otherwise the global one, so a
+/// slow or emulated host can stretch every phase at once (global) or just the
+/// phase that needs it (per-phase).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TimeoutMultipliers {
+    pub(crate) agent: f64,
+    pub(crate) verifier: f64,
+    pub(crate) build: f64,
+}
+
+impl Default for TimeoutMultipliers {
+    fn default() -> Self {
+        Self {
+            agent: 1.0,
+            verifier: 1.0,
+            build: 1.0,
+        }
+    }
+}
+
+impl TimeoutMultipliers {
+    /// Resolves each phase to its specific multiplier when present, falling back
+    /// to the global multiplier otherwise — mirroring harbor's
+    /// `effective = base * (specific or global)` rule.
+    pub(crate) fn resolve(
+        global: f64,
+        agent: Option<f64>,
+        verifier: Option<f64>,
+        build: Option<f64>,
+    ) -> Self {
+        Self {
+            agent: agent.unwrap_or(global),
+            verifier: verifier.unwrap_or(global),
+            build: build.unwrap_or(global),
+        }
+    }
+}
+
+/// Scales a base timeout by a multiplier: `base * mult`.
+fn scale_timeout(base: Duration, mult: f64) -> Duration {
+    Duration::from_secs_f64(base.as_secs_f64() * mult)
 }
 
 pub(crate) struct AgentStep {
@@ -115,7 +160,15 @@ pub(crate) struct PhaseEnvs {
 }
 
 pub(crate) fn run_task_scripts(run: TaskScriptRequest<'_>) -> Result<ScriptOutputs, CliError> {
-    let environment = task_environment(run.task_path)?;
+    let mut environment = task_environment(run.task_path)?;
+    // `task_environment` stays pure (task.toml only); scaling lives here so the
+    // multipliers reach the build path (incl. image pull, derived from
+    // `build_timeout`) as well as the agent/verifier phases.
+    let multipliers = run.timeout_multipliers;
+    environment.agent_timeout = scale_timeout(environment.agent_timeout, multipliers.agent);
+    environment.verifier_timeout =
+        scale_timeout(environment.verifier_timeout, multipliers.verifier);
+    environment.build_timeout = scale_timeout(environment.build_timeout, multipliers.build);
     let runtime = TaskRuntime {
         task_label: run.task_label,
         task_path: run.task_path,
@@ -2394,6 +2447,23 @@ impl SandboxBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timeout_multipliers_resolve_per_phase_with_global_fallback() {
+        let resolved = TimeoutMultipliers::resolve(2.0, Some(5.0), None, None);
+
+        assert_eq!(resolved.agent, 5.0);
+        assert_eq!(resolved.verifier, 2.0);
+        assert_eq!(resolved.build, 2.0);
+    }
+
+    #[test]
+    fn scale_timeout_multiplies_base_duration() {
+        let base = Duration::from_secs(120);
+
+        assert_eq!(scale_timeout(base, 2.5), Duration::from_secs_f64(300.0));
+        assert_eq!(scale_timeout(base, 1.0), base);
+    }
 
     #[test]
     fn docker_start_command_configures_trial_container() {

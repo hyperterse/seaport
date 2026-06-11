@@ -28,7 +28,7 @@ use sandbox::{
     cleanup_orphaned_trial_containers, ensure_sandbox_backend_available,
     prepare_container_writable_dir, run_task_scripts, set_log_mode as set_sandbox_log_mode,
     AgentStep, ExternalAgent, PhaseEnvs, SandboxAgent, SandboxBackend, ScriptOutputs,
-    TaskScriptRequest,
+    TaskScriptRequest, TimeoutMultipliers,
 };
 use target::{RunTarget, TaskRef, TaskSelection};
 
@@ -610,6 +610,7 @@ fn run_trial(
             backend: options.backend,
             strict_resources: options.strict_resources,
             concurrency,
+            timeout_multipliers: options.timeout_multipliers(),
         })?;
         let reward = read_reward(&logs_dir)?;
 
@@ -1793,6 +1794,18 @@ Options:
                           Number of attempts per task
       --strict-resources  Enforce task cpu/memory limits on sandbox containers
                           (default: containers may use all idle host resources)
+      --timeout-multiplier <factor>
+                          Scale all phase timeouts for slow/emulated hosts
+                          (default: 1.0)
+      --agent-timeout-multiplier <factor>
+                          Scale only the agent timeout (falls back to
+                          --timeout-multiplier)
+      --verifier-timeout-multiplier <factor>
+                          Scale only the verifier timeout (falls back to
+                          --timeout-multiplier)
+      --build-timeout-multiplier <factor>
+                          Scale only the build/image-pull timeout (falls back
+                          to --timeout-multiplier)
       --jobs-dir <path>   Directory where job results are written
       --backend <name>    Execution backend: docker or unsafe-local
       --env <name>        Alias for --backend
@@ -1839,7 +1852,7 @@ Usage:
     );
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 struct RunOptions {
     path: Option<String>,
     dataset: Option<String>,
@@ -1857,6 +1870,10 @@ struct RunOptions {
     attempts: usize,
     backend: SandboxBackend,
     strict_resources: bool,
+    timeout_multiplier: f64,
+    agent_timeout_multiplier: Option<f64>,
+    verifier_timeout_multiplier: Option<f64>,
+    build_timeout_multiplier: Option<f64>,
     jobs_dir: Option<String>,
     log_mode: LogMode,
     selection: TaskSelection,
@@ -1880,6 +1897,10 @@ impl Default for RunOptions {
             concurrency: default_concurrency(),
             attempts: 1,
             strict_resources: false,
+            timeout_multiplier: 1.0,
+            agent_timeout_multiplier: None,
+            verifier_timeout_multiplier: None,
+            build_timeout_multiplier: None,
             backend: SandboxBackend::Docker,
             jobs_dir: None,
             log_mode: LogMode::Concise,
@@ -1982,6 +2003,26 @@ impl RunOptions {
                     options.strict_resources = true;
                     index += 1;
                 }
+                "--timeout-multiplier" => {
+                    let value = required_value(args, index, flag)?;
+                    options.timeout_multiplier = parse_positive_f64(flag, &value)?;
+                    index += 2;
+                }
+                "--agent-timeout-multiplier" => {
+                    let value = required_value(args, index, flag)?;
+                    options.agent_timeout_multiplier = Some(parse_positive_f64(flag, &value)?);
+                    index += 2;
+                }
+                "--verifier-timeout-multiplier" => {
+                    let value = required_value(args, index, flag)?;
+                    options.verifier_timeout_multiplier = Some(parse_positive_f64(flag, &value)?);
+                    index += 2;
+                }
+                "--build-timeout-multiplier" => {
+                    let value = required_value(args, index, flag)?;
+                    options.build_timeout_multiplier = Some(parse_positive_f64(flag, &value)?);
+                    index += 2;
+                }
                 "--jobs-dir" => {
                     options.jobs_dir = Some(required_value(args, index, flag)?);
                     index += 2;
@@ -2071,6 +2112,15 @@ impl RunOptions {
             verifier: self.verifier_env.clone(),
         }
     }
+
+    fn timeout_multipliers(&self) -> TimeoutMultipliers {
+        TimeoutMultipliers::resolve(
+            self.timeout_multiplier,
+            self.agent_timeout_multiplier,
+            self.verifier_timeout_multiplier,
+            self.build_timeout_multiplier,
+        )
+    }
 }
 
 fn required_value(args: &[String], index: usize, flag: &str) -> Result<String, CliError> {
@@ -2097,6 +2147,18 @@ fn parse_positive_usize(flag: &str, value: &str) -> Result<usize, CliError> {
         .map_err(|error| CliError::usage(format!("{flag} must be a positive integer: {error}")))?;
 
     if parsed == 0 {
+        return Err(CliError::usage(format!("{flag} must be greater than zero")));
+    }
+
+    Ok(parsed)
+}
+
+fn parse_positive_f64(flag: &str, value: &str) -> Result<f64, CliError> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|error| CliError::usage(format!("{flag} must be a positive number: {error}")))?;
+
+    if !parsed.is_finite() || parsed <= 0.0 {
         return Err(CliError::usage(format!("{flag} must be greater than zero")));
     }
 
@@ -2312,6 +2374,79 @@ mod tests {
         assert_eq!(options.selection.include_task_names, ["bench/*"]);
         assert_eq!(options.selection.exclude_task_names, ["bench/skip-*"]);
         assert_eq!(options.selection.task_limit, Some(5));
+    }
+
+    #[test]
+    fn parses_timeout_multiplier_options() {
+        let args = strings([
+            "-p",
+            "tasks/example",
+            "--timeout-multiplier",
+            "2",
+            "--agent-timeout-multiplier",
+            "3.5",
+            "--verifier-timeout-multiplier",
+            "1.5",
+            "--build-timeout-multiplier",
+            "4",
+        ]);
+
+        let options = RunOptions::parse(&args).expect("options");
+
+        assert_eq!(options.timeout_multiplier, 2.0);
+        assert_eq!(options.agent_timeout_multiplier, Some(3.5));
+        assert_eq!(options.verifier_timeout_multiplier, Some(1.5));
+        assert_eq!(options.build_timeout_multiplier, Some(4.0));
+
+        let resolved = options.timeout_multipliers();
+        assert_eq!(resolved.agent, 3.5);
+        assert_eq!(resolved.verifier, 1.5);
+        assert_eq!(resolved.build, 4.0);
+    }
+
+    #[test]
+    fn timeout_multiplier_defaults_to_one() {
+        let args = strings(["-p", "tasks/example"]);
+
+        let options = RunOptions::parse(&args).expect("options");
+
+        assert_eq!(options.timeout_multiplier, 1.0);
+        assert_eq!(options.agent_timeout_multiplier, None);
+        let resolved = options.timeout_multipliers();
+        assert_eq!(resolved.agent, 1.0);
+        assert_eq!(resolved.verifier, 1.0);
+        assert_eq!(resolved.build, 1.0);
+    }
+
+    #[test]
+    fn per_phase_timeout_multiplier_falls_back_to_global() {
+        let args = strings([
+            "-p",
+            "tasks/example",
+            "--timeout-multiplier",
+            "2.5",
+            "--agent-timeout-multiplier",
+            "5",
+        ]);
+
+        let options = RunOptions::parse(&args).expect("options");
+        let resolved = options.timeout_multipliers();
+
+        assert_eq!(resolved.agent, 5.0);
+        // Unset per-phase multipliers fall back to the global value.
+        assert_eq!(resolved.verifier, 2.5);
+        assert_eq!(resolved.build, 2.5);
+    }
+
+    #[test]
+    fn rejects_non_positive_timeout_multiplier() {
+        for value in ["0", "-1", "-2.5"] {
+            let args = strings(["-p", "tasks/example", "--timeout-multiplier", value]);
+            assert!(RunOptions::parse(&args).is_err());
+        }
+
+        let args = strings(["-p", "tasks/example", "--agent-timeout-multiplier", "0"]);
+        assert!(RunOptions::parse(&args).is_err());
     }
 
     #[test]
