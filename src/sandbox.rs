@@ -25,6 +25,10 @@ const DOCKER_BUILD_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DOCKER_PULL_ATTEMPTS: usize = 3;
 const DOCKER_PULL_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DOCKER_BUILD_TIMEOUT: Duration = Duration::from_secs(600);
+/// Floor for image pulls. Prebuilt benchmark images can be many gigabytes and,
+/// under concurrency, several pull at once; the per-task build timeout (often
+/// 600s) is too tight for that, so pulls get at least this long.
+const DOCKER_PULL_TIMEOUT_MIN: Duration = Duration::from_secs(1800);
 const DOCKER_BUILDER_TIMEOUT: Duration = Duration::from_secs(60);
 const DOCKER_WORKSPACE_TIMEOUT: Duration = Duration::from_secs(120);
 const DOCKER_IMAGE_CACHE_NAMESPACE: &str = "seaport-env-cache-v1";
@@ -900,6 +904,10 @@ fn switch_container_network(
 
     Ok(())
 }
+fn image_pull_timeout(build_timeout: Duration) -> Duration {
+    build_timeout.max(DOCKER_PULL_TIMEOUT_MIN)
+}
+
 fn ensure_docker_image_available(
     task_label: &str,
     image: &str,
@@ -1006,7 +1014,7 @@ fn prepare_docker_image(
             task_label,
             &environment.image,
             platform.as_deref(),
-            environment.build_timeout,
+            image_pull_timeout(environment.build_timeout),
         )?;
         // Prebuilt images may only exist for a foreign architecture (for
         // example amd64-only benchmark images on an arm64 host). Requesting
