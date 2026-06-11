@@ -715,6 +715,7 @@ fn run_trial_once(
         artifacts_dir: &artifacts_dir,
         steps_dir: &steps_dir,
         agent: &sandbox_agent,
+        agent_setup: options.agent_setup.as_deref(),
         envs: &phase_envs,
         backend: options.backend,
         strict_resources: options.strict_resources,
@@ -2443,6 +2444,8 @@ Options:
       --registry-url <url>
                           Remote registry URL; defaults to the package registry
   -a, --agent <agent>     Agent adapter name; defaults to oracle
+      --agent-setup <shell>   Command run in the container before the agent (e.g.
+                          to install the agent CLI); runs as the agent user
       --agent-command <shell>
                           Shell command for custom or not-yet-native agents
       --ae, --agent-env KEY=VALUE
@@ -2534,6 +2537,7 @@ struct RunOptions {
     registry_url: Option<String>,
     agent: Option<String>,
     agent_command: Option<String>,
+    agent_setup: Option<String>,
     agent_env: Vec<(String, String)>,
     verifier_env: Vec<(String, String)>,
     model: Option<String>,
@@ -2565,6 +2569,7 @@ impl Default for RunOptions {
             registry_url: None,
             agent: None,
             agent_command: None,
+            agent_setup: None,
             agent_env: Vec::new(),
             verifier_env: Vec::new(),
             model: None,
@@ -2652,6 +2657,10 @@ impl RunOptions {
                 }
                 "--agent-command" => {
                     options.agent_command = Some(required_value(args, index, flag)?);
+                    index += 2;
+                }
+                "--agent-setup" => {
+                    options.agent_setup = Some(required_value(args, index, flag)?);
                     index += 2;
                 }
                 "--ae" | "--agent-env" => {
@@ -2835,15 +2844,24 @@ fn required_value(args: &[String], index: usize, flag: &str) -> Result<String, C
 }
 
 fn parse_env_assignment(flag: &str, value: &str) -> Result<(String, String), CliError> {
-    let (name, value) = value
-        .split_once('=')
-        .ok_or_else(|| CliError::usage(format!("{flag} requires KEY=VALUE")))?;
-
-    if name.is_empty() {
-        return Err(CliError::usage(format!("{flag} requires a non-empty KEY")));
+    // `KEY=VALUE` sets an explicit value; a bare `KEY` forwards that variable
+    // from the host environment (harbor reads e.g. ANTHROPIC_API_KEY from the
+    // host), so secrets need not appear on the command line.
+    match value.split_once('=') {
+        Some(("", _)) => Err(CliError::usage(format!("{flag} requires a non-empty KEY"))),
+        Some((name, value)) => Ok((name.to_owned(), value.to_owned())),
+        None if value.is_empty() => {
+            Err(CliError::usage(format!("{flag} requires a non-empty KEY")))
+        }
+        None => {
+            let resolved = env::var(value).map_err(|_| {
+                CliError::usage(format!(
+                    "{flag} {value}: variable is not set in the environment"
+                ))
+            })?;
+            Ok((value.to_owned(), resolved))
+        }
     }
-
-    Ok((name.to_owned(), value.to_owned()))
 }
 
 fn parse_positive_usize(flag: &str, value: &str) -> Result<usize, CliError> {
@@ -3303,6 +3321,30 @@ mod tests {
 
         let args = strings(["-p", "tasks/example", "--agent-timeout-multiplier", "0"]);
         assert!(RunOptions::parse(&args).is_err());
+    }
+
+    #[test]
+    fn env_assignment_supports_explicit_and_host_passthrough() {
+        // Explicit KEY=VALUE.
+        assert_eq!(
+            parse_env_assignment("--ae", "API_KEY=secret").unwrap(),
+            ("API_KEY".to_owned(), "secret".to_owned())
+        );
+        // Bare KEY forwards from the host environment.
+        std::env::set_var("SEAPORT_TEST_PASSTHROUGH", "from-host");
+        assert_eq!(
+            parse_env_assignment("--ae", "SEAPORT_TEST_PASSTHROUGH").unwrap(),
+            (
+                "SEAPORT_TEST_PASSTHROUGH".to_owned(),
+                "from-host".to_owned()
+            )
+        );
+        std::env::remove_var("SEAPORT_TEST_PASSTHROUGH");
+        // Bare KEY that is unset is an error.
+        assert!(parse_env_assignment("--ae", "SEAPORT_DEFINITELY_UNSET_VAR").is_err());
+        // Empty is rejected.
+        assert!(parse_env_assignment("--ae", "").is_err());
+        assert!(parse_env_assignment("--ae", "=v").is_err());
     }
 
     #[test]

@@ -82,6 +82,7 @@ pub(crate) struct TaskScriptRequest<'a> {
     pub(crate) artifacts_dir: &'a Path,
     pub(crate) steps_dir: &'a Path,
     pub(crate) agent: &'a SandboxAgent,
+    pub(crate) agent_setup: Option<&'a str>,
     pub(crate) envs: &'a PhaseEnvs,
     pub(crate) backend: SandboxBackend,
     pub(crate) strict_resources: bool,
@@ -204,6 +205,7 @@ pub(crate) fn run_task_scripts(run: TaskScriptRequest<'_>) -> Result<TrialScript
         SandboxBackend::Docker => run_scripts_in_docker(
             runtime,
             run.agent,
+            run.agent_setup,
             run.envs,
             &environment,
             run.strict_resources,
@@ -384,6 +386,7 @@ fn prepare_container_writable_tree(_path: &Path) -> Result<(), CliError> {
 fn run_scripts_in_docker(
     runtime: TaskRuntime<'_>,
     agent_kind: &SandboxAgent,
+    agent_setup: Option<&str>,
     envs: &PhaseEnvs,
     environment: &TaskEnvironment,
     strict_resources: bool,
@@ -445,6 +448,17 @@ fn run_scripts_in_docker(
 
         if let Some(healthcheck) = &environment.healthcheck {
             run_healthcheck(&container, healthcheck, runtime.task_label)?;
+        }
+
+        if let Some(setup) = agent_setup {
+            run_agent_setup(
+                &container,
+                setup,
+                &env_refs(&envs.agent),
+                environment.agent_user.as_deref(),
+                environment.agent_timeout,
+                runtime.task_label,
+            )?;
         }
 
         if multi_step {
@@ -575,6 +589,41 @@ fn run_scripts_in_docker(
 /// into `/tests`. Each step runs its agent, collects that step's artifacts, runs
 /// its verifier (reading the freshly reset reward files), and may gate the rest
 /// of the run via `min_reward`.
+/// Runs the optional agent setup command in the container before the agent
+/// (e.g. to install the agent CLI), as the agent user with the agent env so
+/// credentials are available. A non-zero exit fails the trial. Mirrors harbor's
+/// per-trial agent setup step.
+fn run_agent_setup(
+    container: &str,
+    command: &str,
+    env: &[(&str, &str)],
+    user: Option<&str>,
+    timeout: Duration,
+    task_label: &str,
+) -> Result<(), CliError> {
+    let output = exec_in_container(ContainerExec {
+        container,
+        task_label,
+        phase: "setup",
+        label: "agent-setup",
+        invocation: ContainerInvocation::ShellCommand(command),
+        env,
+        timeout,
+        user,
+    })?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(CliError::task_failed(format!(
+            "agent setup command failed (status: {})\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )))
+    }
+}
+
 fn run_steps_in_container(
     container: &str,
     runtime: &TaskRuntime<'_>,
@@ -2451,17 +2500,21 @@ fn docker_start_command(start: &StartTrialContainer<'_>) -> Command {
     // `steps/<name>/solution`), and the always-present `/seaport/task` mount
     // already exposes those per-step paths, so both binds are skipped.
     if start.bind_tests {
-        command
-            .arg("--mount")
-            .arg(format!(
-                "type=bind,source={},target=/tests,readonly",
-                start.task_path.join("tests").display()
-            ))
-            .arg("--mount")
-            .arg(format!(
+        command.arg("--mount").arg(format!(
+            "type=bind,source={},target=/tests,readonly",
+            start.task_path.join("tests").display()
+        ));
+
+        // Only bind `/solution` when the task ships one: a task driven by an
+        // external agent (no oracle) need not have a `solution/` directory, and
+        // docker rejects a bind whose source path does not exist.
+        let solution = start.task_path.join("solution");
+        if solution.is_dir() {
+            command.arg("--mount").arg(format!(
                 "type=bind,source={},target=/solution,readonly",
-                start.task_path.join("solution").display()
+                solution.display()
             ));
+        }
     }
 
     command
@@ -4035,9 +4088,9 @@ mod tests {
         assert!(args
             .iter()
             .any(|arg| arg == "type=bind,source=/tmp/task/tests,target=/tests,readonly"));
-        assert!(args
-            .iter()
-            .any(|arg| arg == "type=bind,source=/tmp/task/solution,target=/solution,readonly"));
+        // /solution is bound only when the task ships one; /tmp/task/solution
+        // does not exist here, so it must be absent.
+        assert!(!args.iter().any(|arg| arg.contains("target=/solution")));
         assert!(args
             .iter()
             .any(|arg| arg == "type=bind,source=/tmp/logs,target=/logs"));
