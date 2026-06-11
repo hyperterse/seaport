@@ -218,7 +218,14 @@ fn run_target(
         job_dir.join("config.json"),
         job_config_json(target, options, agent),
     )?;
-    fs::write(job_dir.join("result.json"), job_result_json(&outcomes))?;
+    let eval_key = match options.model.as_deref() {
+        Some(model) => format!("{}__{}__{}", agent.as_str(options), model, target.name),
+        None => format!("{}__{}", agent.as_str(options), target.name),
+    };
+    fs::write(
+        job_dir.join("result.json"),
+        job_result_json(&outcomes, &eval_key),
+    )?;
 
     let passed = outcomes.iter().all(|outcome| outcome.passed);
     let passed_count = outcomes.iter().filter(|outcome| outcome.passed).count();
@@ -1225,6 +1232,10 @@ struct TrialOutcome {
     reward: String,
     rewards: Rewards,
     passed: bool,
+    /// True only for trials that errored before/while producing a reward
+    /// (build/pull/agent/verifier failure, timeout, or no reward written).
+    /// Harbor excludes these from reward stats and counts them as errors.
+    errored: bool,
     error: Option<String>,
     stdout_tail: Vec<String>,
     stderr_tail: Vec<String>,
@@ -1298,6 +1309,7 @@ fn record_completed_trial(record: TrialRecord<'_>) -> Result<TrialOutcome, CliEr
         reward,
         rewards,
         passed,
+        errored: false,
         error,
         stdout_tail,
         stderr_tail,
@@ -1390,6 +1402,7 @@ fn record_multi_step_trial(record: MultiStepRecord<'_>) -> Result<TrialOutcome, 
         reward,
         rewards,
         passed,
+        errored: false,
         error,
         stdout_tail,
         stderr_tail,
@@ -1467,6 +1480,7 @@ fn record_failed_trial(failure: TrialFailure<'_>) -> Result<TrialOutcome, CliErr
         reward,
         rewards,
         passed: false,
+        errored: true,
         stdout_tail: failure_output_tail(&failure.message, "stdout", FAILURE_TAIL_LINES)
             .unwrap_or_default(),
         stderr_tail: failure_output_tail(&failure.message, "stderr", FAILURE_TAIL_LINES)
@@ -1725,19 +1739,290 @@ fn job_config_json(target: &RunTarget, options: &RunOptions, agent: AgentKind) -
     )
 }
 
-fn job_result_json(outcomes: &[TrialOutcome]) -> String {
+fn job_result_json(outcomes: &[TrialOutcome], eval_key: &str) -> String {
     let passed_count = outcomes.iter().filter(|outcome| outcome.passed).count();
     let reward = aggregate_reward(outcomes);
 
     format!(
-        "{{\n  \"passed\": {},\n  \"reward\": \"{}\",\n  \"tasks_total\": {},\n  \"tasks_passed\": {},\n  \"tasks_failed\": {},\n  \"tasks\": {}\n}}\n",
+        "{{\n  \"passed\": {},\n  \"reward\": \"{}\",\n  \"tasks_total\": {},\n  \"tasks_passed\": {},\n  \"tasks_failed\": {},\n  \"tasks\": {},\n  \"stats\": {}\n}}\n",
         passed_count == outcomes.len(),
         json_escape(&reward),
         outcomes.len(),
         passed_count,
         outcomes.len() - passed_count,
-        trial_outcomes_json(outcomes)
+        trial_outcomes_json(outcomes),
+        job_stats_json(outcomes, eval_key)
     )
+}
+
+/// Harbor-compatible per-eval statistics: for the eval (agent[/model]/dataset),
+/// `reward_stats` groups trials by each reward key's value, `metrics` is the
+/// per-key mean (or `{"mean": x}` for a 1-D reward), and `pass_at_k` is the
+/// unbiased estimate (only for single-key binary rewards). Errored trials
+/// (no reward) are excluded from reward stats and counted in `exception_stats`.
+fn job_stats_json(outcomes: &[TrialOutcome], eval_key: &str) -> String {
+    let completed = outcomes.len();
+    let errored = outcomes.iter().filter(|outcome| outcome.errored).count();
+
+    format!(
+        "{{\n    \"n_completed_trials\": {completed},\n    \"n_errored_trials\": {errored},\n    \"n_running_trials\": 0,\n    \"n_pending_trials\": 0,\n    \"n_cancelled_trials\": 0,\n    \"n_retries\": 0,\n    \"evals\": {{\"{}\": {}}}\n  }}",
+        json_escape(eval_key),
+        eval_stats_json(outcomes)
+    )
+}
+
+/// The stats for one eval: see `job_stats_json`.
+fn eval_stats_json(outcomes: &[TrialOutcome]) -> String {
+    // Harbor counts only trials that produced a reward (non-errored) in n_trials
+    // and reward_stats; errored trials go to exception_stats.
+    let scored: Vec<&TrialOutcome> = outcomes.iter().filter(|outcome| !outcome.errored).collect();
+    let n_trials = scored.len();
+    let n_errors = outcomes.len() - n_trials;
+
+    format!(
+        "{{\"n_trials\": {n_trials}, \"n_errors\": {n_errors}, \"metrics\": {}, \"pass_at_k\": {}, \"reward_stats\": {}, \"exception_stats\": {}}}",
+        reward_metrics_json(&scored),
+        pass_at_k_json(&scored),
+        reward_stats_json(&scored),
+        exception_stats_json(outcomes)
+    )
+}
+
+fn trial_identifier(outcome: &TrialOutcome) -> String {
+    outcome
+        .trial_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| outcome.task_name.clone())
+}
+
+/// Renders a float the way harbor's reward_stats keys appear (shortest
+/// round-trippable form, e.g. `1.0`, `0.5`, `0.182625`).
+fn reward_value_key(value: f64) -> String {
+    format!("{value:?}")
+}
+
+/// The sorted union of reward keys across the scored trials.
+fn reward_key_union(scored: &[&TrialOutcome]) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for outcome in scored {
+        for (key, _) in outcome.rewards.entries() {
+            if !keys.iter().any(|seen| seen == key) {
+                keys.push(key.clone());
+            }
+        }
+    }
+    keys.sort();
+    keys
+}
+
+/// `metrics`: a single Mean entry. With <=1 reward key it is `{"mean": x}`
+/// (1-D convention); otherwise a per-key mean. Mirrors harbor's
+/// `aggregate_reward_dicts`.
+fn reward_metrics_json(scored: &[&TrialOutcome]) -> String {
+    let keys = reward_key_union(scored);
+
+    let mean = |values: Vec<f64>| -> f64 {
+        if values.is_empty() {
+            0.0
+        } else {
+            values.iter().sum::<f64>() / values.len() as f64
+        }
+    };
+
+    if keys.len() <= 1 {
+        let values = scored
+            .iter()
+            .map(|outcome| {
+                outcome
+                    .rewards
+                    .entries()
+                    .first()
+                    .map(|(_, v)| *v)
+                    .unwrap_or(0.0)
+            })
+            .collect::<Vec<_>>();
+        return format!("[{{\"mean\": {}}}]", json_number(mean(values)));
+    }
+
+    let entries = keys
+        .iter()
+        .map(|key| {
+            let values = scored
+                .iter()
+                .map(|outcome| outcome.rewards.get(key).unwrap_or(0.0))
+                .collect::<Vec<_>>();
+            format!("\"{}\": {}", json_escape(key), json_number(mean(values)))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{{{entries}}}]")
+}
+
+/// `reward_stats`: per reward key, a map from each observed value to the list of
+/// trials that got it.
+fn reward_stats_json(scored: &[&TrialOutcome]) -> String {
+    let keys = reward_key_union(scored);
+    if keys.is_empty() {
+        return "{}".to_owned();
+    }
+
+    let per_key = keys
+        .iter()
+        .map(|key| {
+            // Preserve first-seen value order, grouping trials per value.
+            let mut values: Vec<(String, Vec<String>)> = Vec::new();
+            for outcome in scored {
+                if let Some(value) = outcome.rewards.get(key) {
+                    let value_key = reward_value_key(value);
+                    let name = trial_identifier(outcome);
+                    match values.iter_mut().find(|(seen, _)| *seen == value_key) {
+                        Some((_, names)) => names.push(name),
+                        None => values.push((value_key, vec![name])),
+                    }
+                }
+            }
+            let body = values
+                .iter()
+                .map(|(value, names)| format!("\"{}\": {}", value, json_string_array(names)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("\"{}\": {{{body}}}", json_escape(key))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{{per_key}}}")
+}
+
+/// `pass_at_k`: harbor's unbiased estimate, but only when every scored trial has
+/// a single binary (0/1) reward; otherwise empty. Empty at one attempt per task
+/// (k starts at 2).
+fn pass_at_k_json(scored: &[&TrialOutcome]) -> String {
+    let mut successes: Vec<(String, Vec<u32>)> = Vec::new();
+    for outcome in scored {
+        let entries = outcome.rewards.entries();
+        if entries.len() != 1 {
+            return "{}".to_owned();
+        }
+        let value = entries[0].1;
+        let bit = if value == 0.0 {
+            0
+        } else if value == 1.0 {
+            1
+        } else {
+            return "{}".to_owned();
+        };
+        match successes
+            .iter_mut()
+            .find(|(task, _)| *task == outcome.task_name)
+        {
+            Some((_, bits)) => bits.push(bit),
+            None => successes.push((outcome.task_name.clone(), vec![bit])),
+        }
+    }
+
+    if successes.is_empty() {
+        return "{}".to_owned();
+    }
+
+    let min_trials = successes
+        .iter()
+        .map(|(_, bits)| bits.len())
+        .min()
+        .unwrap_or(0);
+    let ks = eligible_k_values(min_trials);
+    if ks.is_empty() {
+        return "{}".to_owned();
+    }
+
+    let task_count = successes.len() as f64;
+    let entries = ks
+        .iter()
+        .map(|k| {
+            let total: f64 = successes
+                .iter()
+                .map(|(_, bits)| {
+                    pass_at_k_for_task(bits.len(), bits.iter().filter(|b| **b == 1).count(), *k)
+                })
+                .sum();
+            format!("\"{k}\": {}", json_number(total / task_count))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{{entries}}}")
+}
+
+fn eligible_k_values(max_k: usize) -> Vec<usize> {
+    let mut ks: Vec<usize> = Vec::new();
+    let mut k = 2;
+    while k <= max_k {
+        ks.push(k);
+        k *= 2;
+    }
+    let mut k = 5;
+    while k <= max_k {
+        if !ks.contains(&k) {
+            ks.push(k);
+        }
+        k += 5;
+    }
+    ks.sort_unstable();
+    ks
+}
+
+fn pass_at_k_for_task(n: usize, c: usize, k: usize) -> f64 {
+    if n - c < k {
+        return 1.0;
+    }
+    let mut product = 1.0;
+    for i in 0..k {
+        product *= (n - c - i) as f64 / (n - i) as f64;
+    }
+    1.0 - product
+}
+
+/// `exception_stats`: errored trials grouped by the first line of their error,
+/// the closest analog to harbor's exception-type grouping.
+fn exception_stats_json(outcomes: &[TrialOutcome]) -> String {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for outcome in outcomes.iter().filter(|outcome| outcome.errored) {
+        let kind = outcome
+            .error
+            .as_deref()
+            .map(|error| first_error_line(error).to_owned())
+            .unwrap_or_else(|| "error".to_owned());
+        let name = trial_identifier(outcome);
+        match groups.iter_mut().find(|(seen, _)| *seen == kind) {
+            Some((_, names)) => names.push(name),
+            None => groups.push((kind, vec![name])),
+        }
+    }
+    let body = groups
+        .iter()
+        .map(|(kind, names)| format!("\"{}\": {}", json_escape(kind), json_string_array(names)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{{{body}}}")
+}
+
+fn json_string_array(items: &[String]) -> String {
+    let body = items
+        .iter()
+        .map(|item| format!("\"{}\"", json_escape(item)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{body}]")
+}
+
+/// Renders a reward/metric number: integral values stay integer-shaped, others
+/// use the shortest round-trippable float form.
+fn json_number(value: f64) -> String {
+    if value.fract() == 0.0 && value.is_finite() {
+        format!("{}", value as i64)
+    } else {
+        format!("{value:?}")
+    }
 }
 
 fn trial_result_json(passed: bool, rewards: &Rewards, error: Option<&str>) -> String {
@@ -2511,6 +2796,7 @@ mod tests {
             reward: rewards.display(),
             passed: rewards.passed(),
             rewards,
+            errored: false,
             error: None,
             stdout_tail: Vec::new(),
             stderr_tail: Vec::new(),
@@ -2630,6 +2916,108 @@ mod tests {
         assert!(error.is_task_failure());
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    fn scored_outcome(task: &str, dir: &str, entries: Vec<(&str, f64)>) -> TrialOutcome {
+        let rewards = Rewards::from_entries(
+            entries
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v))
+                .collect(),
+        );
+        TrialOutcome {
+            task_name: task.to_owned(),
+            attempt: 1,
+            reward: rewards.display(),
+            passed: rewards.passed(),
+            rewards,
+            errored: false,
+            error: None,
+            stdout_tail: Vec::new(),
+            stderr_tail: Vec::new(),
+            trial_dir: PathBuf::from(dir),
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn reward_stats_groups_trials_by_per_key_value() {
+        let outcomes = [
+            scored_outcome(
+                "acme/a",
+                "acme-a",
+                vec![("core_pass_rate", 1.0), ("verbosity", 0.25)],
+            ),
+            scored_outcome(
+                "acme/b",
+                "acme-b",
+                vec![("core_pass_rate", 1.0), ("verbosity", 0.5)],
+            ),
+        ];
+        let scored: Vec<&TrialOutcome> = outcomes.iter().collect();
+        let stats = reward_stats_json(&scored);
+
+        // core_pass_rate is 1.0 for both trials; verbosity differs per trial.
+        assert!(stats.contains("\"core_pass_rate\": {\"1.0\": [\"acme-a\", \"acme-b\"]}"));
+        assert!(stats.contains("\"verbosity\": {\"0.25\": [\"acme-a\"], \"0.5\": [\"acme-b\"]}"));
+    }
+
+    #[test]
+    fn metrics_are_per_key_mean_or_one_d_mean() {
+        // Multi-key -> per-key mean.
+        let multi = [
+            scored_outcome(
+                "acme/a",
+                "a",
+                vec![("core_pass_rate", 1.0), ("verbosity", 0.25)],
+            ),
+            scored_outcome(
+                "acme/b",
+                "b",
+                vec![("core_pass_rate", 0.0), ("verbosity", 0.75)],
+            ),
+        ];
+        let scored: Vec<&TrialOutcome> = multi.iter().collect();
+        assert_eq!(
+            reward_metrics_json(&scored),
+            "[{\"core_pass_rate\": 0.5, \"verbosity\": 0.5}]"
+        );
+
+        // Single 1-D reward -> {"mean": x}.
+        let single = [
+            scored_outcome("acme/a", "a", vec![("reward", 1.0)]),
+            scored_outcome("acme/b", "b", vec![("reward", 0.0)]),
+        ];
+        let scored: Vec<&TrialOutcome> = single.iter().collect();
+        assert_eq!(reward_metrics_json(&scored), "[{\"mean\": 0.5}]");
+    }
+
+    #[test]
+    fn pass_at_k_empty_for_single_attempt_and_for_multi_key() {
+        // Single binary reward, one attempt per task -> no eligible k -> {}.
+        let single = [scored_outcome("acme/a", "a", vec![("reward", 1.0)])];
+        let scored: Vec<&TrialOutcome> = single.iter().collect();
+        assert_eq!(pass_at_k_json(&scored), "{}");
+
+        // Multi-key reward -> never produces pass@k.
+        let multi = [scored_outcome(
+            "acme/a",
+            "a",
+            vec![("core_pass_rate", 1.0), ("x", 0.5)],
+        )];
+        let scored: Vec<&TrialOutcome> = multi.iter().collect();
+        assert_eq!(pass_at_k_json(&scored), "{}");
+    }
+
+    #[test]
+    fn pass_at_k_two_attempts_binary() {
+        // Two attempts of one task, one success one failure -> pass@2 = 1.0.
+        let outcomes = [
+            scored_outcome("acme/a", "a-1", vec![("reward", 1.0)]),
+            scored_outcome("acme/a", "a-2", vec![("reward", 0.0)]),
+        ];
+        let scored: Vec<&TrialOutcome> = outcomes.iter().collect();
+        assert_eq!(pass_at_k_json(&scored), "{\"2\": 1}");
     }
 
     #[test]
