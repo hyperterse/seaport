@@ -53,6 +53,26 @@ pub(crate) struct ScriptOutputs {
     pub(crate) verifier: Output,
 }
 
+/// One completed step of a multi-step trial: the agent and verifier outputs plus
+/// the reward the verifier wrote for that step.
+pub(crate) struct StepOutcome {
+    pub(crate) name: String,
+    pub(crate) agent: AgentStep,
+    pub(crate) verifier: Output,
+    pub(crate) rewards: crate::Rewards,
+}
+
+/// What a trial's scripts produced. A single-step task yields one agent/verifier
+/// pair (byte-for-byte the prior behavior); a multi-step task yields the per-step
+/// outcomes plus the aggregated trial-level reward.
+pub(crate) enum TrialScripts {
+    Single(ScriptOutputs),
+    MultiStep {
+        steps: Vec<StepOutcome>,
+        reward: crate::Rewards,
+    },
+}
+
 pub(crate) struct TaskScriptRequest<'a> {
     pub(crate) task_label: &'a str,
     pub(crate) task_path: &'a Path,
@@ -60,6 +80,7 @@ pub(crate) struct TaskScriptRequest<'a> {
     pub(crate) app_dir: &'a Path,
     pub(crate) logs_dir: &'a Path,
     pub(crate) artifacts_dir: &'a Path,
+    pub(crate) steps_dir: &'a Path,
     pub(crate) agent: &'a SandboxAgent,
     pub(crate) envs: &'a PhaseEnvs,
     pub(crate) backend: SandboxBackend,
@@ -159,7 +180,7 @@ pub(crate) struct PhaseEnvs {
     pub(crate) verifier: Vec<(String, String)>,
 }
 
-pub(crate) fn run_task_scripts(run: TaskScriptRequest<'_>) -> Result<ScriptOutputs, CliError> {
+pub(crate) fn run_task_scripts(run: TaskScriptRequest<'_>) -> Result<TrialScripts, CliError> {
     let mut environment = task_environment(run.task_path)?;
     // `task_environment` stays pure (task.toml only); scaling lives here so the
     // multipliers reach the build path (incl. image pull, derived from
@@ -176,6 +197,7 @@ pub(crate) fn run_task_scripts(run: TaskScriptRequest<'_>) -> Result<ScriptOutpu
         app_dir: run.app_dir,
         logs_dir: run.logs_dir,
         artifacts_dir: run.artifacts_dir,
+        steps_dir: run.steps_dir,
     };
 
     match run.backend {
@@ -188,8 +210,18 @@ pub(crate) fn run_task_scripts(run: TaskScriptRequest<'_>) -> Result<ScriptOutpu
             run.concurrency,
         ),
         SandboxBackend::UnsafeLocal => {
+            // Multi-step tasks rely on the docker backend's live container (the
+            // writable /tests population, per-step network switching, and reward
+            // resets); there is no local equivalent.
+            if !environment.steps.is_empty() {
+                return Err(CliError::unimplemented(
+                    "multi-step tasks require the docker backend",
+                ));
+            }
+
             prepare_task_file_workspace(run.task_path, run.app_dir)?;
             run_scripts_locally(runtime, run.agent, run.envs, &environment)
+                .map(TrialScripts::Single)
         }
     }
 }
@@ -262,6 +294,10 @@ struct TaskRuntime<'a> {
     app_dir: &'a Path,
     logs_dir: &'a Path,
     artifacts_dir: &'a Path,
+    /// Host directory for per-step outputs (`<trial_dir>/steps`); per-step
+    /// artifacts land under `<steps_dir>/<name>/artifacts`. Unused for
+    /// single-step tasks.
+    steps_dir: &'a Path,
 }
 
 #[cfg(unix)]
@@ -352,8 +388,12 @@ fn run_scripts_in_docker(
     environment: &TaskEnvironment,
     strict_resources: bool,
     concurrency: usize,
-) -> Result<ScriptOutputs, CliError> {
+) -> Result<TrialScripts, CliError> {
     ensure_docker_available()?;
+    // Decided before the container starts so `/tests` is mounted (single-step)
+    // or left for in-container population (multi-step). A multi-step task's
+    // step `test.sh` writes into `/tests`, so it must be writable.
+    let multi_step = !environment.steps.is_empty();
     let resources = if strict_resources {
         environment.resources.strict()
     } else {
@@ -389,6 +429,7 @@ fn run_scripts_in_docker(
             network: environment.agent_network,
             platform: image.platform.as_deref(),
             resources: &resources,
+            bind_tests: !multi_step,
         },
         runtime.task_label,
     )?;
@@ -401,6 +442,11 @@ fn run_scripts_in_docker(
 
     let result = (|| {
         prep_container_workspace(&container, runtime.task_label)?;
+
+        if multi_step {
+            return run_steps_in_container(&container, &runtime, environment, agent_kind, envs)
+                .map(|(steps, reward)| TrialScripts::MultiStep { steps, reward });
+        }
 
         let agent = match agent_kind {
             SandboxAgent::Oracle => {
@@ -494,7 +540,7 @@ fn run_scripts_in_docker(
             }
         };
 
-        Ok(ScriptOutputs { agent, verifier })
+        Ok(TrialScripts::Single(ScriptOutputs { agent, verifier }))
     })();
 
     cleanup_docker_container(&container);
@@ -504,6 +550,262 @@ fn run_scripts_in_docker(
     }
 
     result
+}
+
+/// Runs each step of a multi-step task in order inside the live trial container,
+/// returning the per-step outcomes plus the aggregated trial-level reward.
+///
+/// `/tests` is populated (writable) from the read-only `/seaport/task/tests`
+/// mount before the steps run, since each step's `test.sh` reads from and writes
+/// into `/tests`. Each step runs its agent, collects that step's artifacts, runs
+/// its verifier (reading the freshly reset reward files), and may gate the rest
+/// of the run via `min_reward`.
+fn run_steps_in_container(
+    container: &str,
+    runtime: &TaskRuntime<'_>,
+    environment: &TaskEnvironment,
+    agent_kind: &SandboxAgent,
+    envs: &PhaseEnvs,
+) -> Result<(Vec<StepOutcome>, crate::Rewards), CliError> {
+    populate_writable_tests(container)?;
+
+    let mut outcomes: Vec<StepOutcome> = Vec::with_capacity(environment.steps.len());
+
+    for step in &environment.steps {
+        let agent = run_step_agent(container, runtime, step, agent_kind, envs)?;
+
+        collect_artifacts(
+            container,
+            &step.artifacts,
+            &runtime.steps_dir.join(&step.name).join("artifacts"),
+            runtime.task_label,
+        );
+
+        // The verifier may run on a different network than the agent; switch to
+        // it for the verifier, then back so the next step's agent runs on the
+        // agent network again.
+        let switch_network = environment.verifier_network != environment.agent_network;
+        if switch_network {
+            switch_container_network(
+                container,
+                environment.agent_network,
+                environment.verifier_network,
+            )?;
+        }
+
+        // Reset the reward files so we read this step's reward, not a prior
+        // step's. Best-effort: a fresh `/logs/verifier` may have neither file.
+        reset_reward_files(container);
+
+        let verifier_env = env_refs(&envs.verifier);
+        let verifier = exec_in_container(ContainerExec {
+            container,
+            task_label: runtime.task_label,
+            phase: "verifier",
+            label: "steps/tests/test.sh",
+            invocation: ContainerInvocation::TaskScript(&format!(
+                "steps/{}/tests/test.sh",
+                step.name
+            )),
+            env: &verifier_env,
+            timeout: step.verifier_timeout,
+            user: step.verifier_user.as_deref(),
+        })?;
+
+        if switch_network {
+            switch_container_network(
+                container,
+                environment.verifier_network,
+                environment.agent_network,
+            )?;
+        }
+
+        // A step that wrote no reward contributes an empty reward (which the
+        // aggregation treats as "no valid reward" for the mean strategy).
+        let rewards = crate::read_reward(runtime.logs_dir).unwrap_or_default();
+
+        let gate_met = step
+            .min_reward
+            .as_ref()
+            .map(|min_reward| min_reward_met(min_reward, &rewards))
+            .unwrap_or(true);
+
+        outcomes.push(StepOutcome {
+            name: step.name.clone(),
+            agent,
+            verifier,
+            rewards,
+        });
+
+        if !gate_met {
+            break;
+        }
+    }
+
+    let reward = aggregate_step_rewards(environment.reward_strategy, &outcomes);
+
+    Ok((outcomes, reward))
+}
+
+fn run_step_agent(
+    container: &str,
+    runtime: &TaskRuntime<'_>,
+    step: &StepConfig,
+    agent_kind: &SandboxAgent,
+    envs: &PhaseEnvs,
+) -> Result<AgentStep, CliError> {
+    let solve_script = format!("steps/{}/solution/solve.sh", step.name);
+    let instruction_path = format!("/seaport/task/steps/{}/instruction.md", step.name);
+
+    match agent_kind {
+        SandboxAgent::Oracle => {
+            let agent_env = env_refs(&envs.agent);
+
+            Ok(AgentStep::from_output(
+                solve_script.clone(),
+                exec_in_container(ContainerExec {
+                    container,
+                    task_label: runtime.task_label,
+                    phase: "solution",
+                    label: &solve_script,
+                    invocation: ContainerInvocation::TaskScript(&solve_script),
+                    env: &agent_env,
+                    timeout: step.agent_timeout,
+                    user: step.agent_user.as_deref(),
+                })?,
+            ))
+        }
+        SandboxAgent::Nop => Ok(AgentStep::nop()),
+        SandboxAgent::External(agent) => {
+            let mut agent_env = env_refs(&envs.agent);
+            agent_env.push(("SEAPORT_AGENT_NAME", agent.name.as_str()));
+
+            if let Some(model) = agent.model.as_deref() {
+                agent_env.push(("SEAPORT_MODEL", model));
+            }
+
+            // Point the agent at this step's instruction rather than the
+            // task-level one.
+            agent_env.push(("SEAPORT_INSTRUCTION_PATH", instruction_path.as_str()));
+
+            Ok(AgentStep::from_output(
+                agent.command.clone(),
+                exec_in_container(ContainerExec {
+                    container,
+                    task_label: runtime.task_label,
+                    phase: "agent",
+                    label: &agent.name,
+                    invocation: ContainerInvocation::ShellCommand(&agent.command),
+                    env: &agent_env,
+                    timeout: step.agent_timeout,
+                    user: step.agent_user.as_deref(),
+                })?,
+            ))
+        }
+    }
+}
+
+/// Populates a writable `/tests` inside the container from the read-only
+/// `/seaport/task/tests` mount. Multi-step step verifiers read from and write
+/// into `/tests`, so it cannot be a read-only bind mount.
+fn populate_writable_tests(container: &str) -> Result<(), CliError> {
+    let script = "mkdir -p /tests && if [ -d /seaport/task/tests ]; then \
+         cp -a /seaport/task/tests/. /tests/; fi && chmod -R a+rwX /tests";
+
+    let output = Command::new("docker")
+        .args(["exec", "--user", "0:0", container, "sh", "-c", script])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(CliError::task_failed(format!(
+            "could not populate writable /tests in {container} (status: {})\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+
+    Ok(())
+}
+
+/// Best-effort removal of the verifier reward files between steps so each step's
+/// reward read reflects only that step.
+fn reset_reward_files(container: &str) {
+    let _ = Command::new("docker")
+        .args([
+            "exec",
+            container,
+            "sh",
+            "-c",
+            "rm -f /logs/verifier/reward.txt /logs/verifier/reward.json",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Whether a step's reward meets its `min_reward` gate. A missing key (or any
+/// missing reward) counts as `NEG_INFINITY`, so it fails the gate.
+fn min_reward_met(min_reward: &MinReward, rewards: &crate::Rewards) -> bool {
+    match min_reward {
+        MinReward::Scalar(threshold) => {
+            rewards.get("reward").unwrap_or(f64::NEG_INFINITY) >= *threshold
+        }
+        MinReward::Keyed(thresholds) => thresholds
+            .iter()
+            .all(|(key, threshold)| rewards.get(key).unwrap_or(f64::NEG_INFINITY) >= *threshold),
+    }
+}
+
+/// Derives the trial-level reward from the collected per-step rewards.
+///
+/// `Final` takes the last step's reward verbatim. `Mean` averages each key over
+/// the steps that produced a (non-empty) reward, treating a step that lacks a
+/// key as contributing 0.0 for that key, with keys emitted in first-seen order.
+fn aggregate_step_rewards(strategy: RewardStrategy, outcomes: &[StepOutcome]) -> crate::Rewards {
+    let rewards: Vec<crate::Rewards> = outcomes
+        .iter()
+        .map(|outcome| outcome.rewards.clone())
+        .collect();
+    aggregate_rewards(strategy, &rewards)
+}
+
+fn aggregate_rewards(strategy: RewardStrategy, rewards: &[crate::Rewards]) -> crate::Rewards {
+    match strategy {
+        RewardStrategy::Final => rewards.last().cloned().unwrap_or_default(),
+        RewardStrategy::Mean => {
+            let valid: Vec<&crate::Rewards> = rewards
+                .iter()
+                .filter(|rewards| !rewards.entries().is_empty())
+                .collect();
+
+            if valid.is_empty() {
+                return crate::Rewards::default();
+            }
+
+            let mut keys: Vec<String> = Vec::new();
+            for rewards in &valid {
+                for (key, _) in rewards.entries() {
+                    if !keys.iter().any(|seen| seen == key) {
+                        keys.push(key.clone());
+                    }
+                }
+            }
+
+            let count = valid.len() as f64;
+            let entries = keys
+                .into_iter()
+                .map(|key| {
+                    let sum: f64 = valid
+                        .iter()
+                        .map(|rewards| rewards.get(&key).unwrap_or(0.0))
+                        .sum();
+                    (key, sum / count)
+                })
+                .collect();
+
+            crate::Rewards::from_entries(entries)
+        }
+    }
 }
 
 /// Runs the verifier in a dedicated container (harbor's "separate" mode).
@@ -565,6 +867,7 @@ fn run_verifier_in_separate_container(
                 network: environment.verifier_network,
                 platform: image.platform.as_deref(),
                 resources: &verifier_env_cfg.resources,
+                bind_tests: true,
             },
             runtime.task_label,
         )?;
@@ -713,6 +1016,12 @@ struct TaskEnvironment {
     /// artifact collection; the conventional `/logs/artifacts` dir is always
     /// collected in addition to these.
     artifacts: Vec<ArtifactSpec>,
+    /// Sequential named steps for a multi-step task (harbor `[[steps]]`). Empty
+    /// for an ordinary single-step task.
+    steps: Vec<StepConfig>,
+    /// How a multi-step task's trial-level reward is derived from per-step
+    /// rewards. Ignored for single-step tasks.
+    reward_strategy: RewardStrategy,
 }
 
 /// The container configuration for a separate (isolated) verifier, declared via
@@ -852,6 +1161,14 @@ fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
     reject_unsupported_task_os(&doc)?;
 
     let artifacts = parse_artifacts(&doc);
+    let steps = parse_steps(
+        &doc,
+        agent_timeout,
+        verifier_timeout,
+        agent_user.as_deref(),
+        verifier_user.as_deref(),
+    )?;
+    let reward_strategy = parse_reward_strategy(&doc)?;
 
     let mut environment = TaskEnvironment {
         image,
@@ -868,6 +1185,8 @@ fn task_environment(task_path: &Path) -> Result<TaskEnvironment, CliError> {
         verifier_user,
         verifier_environment: None,
         artifacts,
+        steps,
+        reward_strategy,
     };
     environment.verifier_environment = verifier_environment(&doc, &environment)?;
 
@@ -1102,6 +1421,170 @@ fn parse_network_mode(field: &str, value: &str) -> Result<DockerNetwork, CliErro
         ))),
         unknown => Err(CliError::usage(format!(
             "unsupported {field} `{unknown}`; use `public`, `no-network`, or `allowlist`"
+        ))),
+    }
+}
+
+/// How a multi-step task's trial-level reward is derived from its per-step
+/// rewards. Mirrors harbor's `multi_step_reward_strategy` (default `mean`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RewardStrategy {
+    /// Per-key mean across steps that produced a reward.
+    #[default]
+    Mean,
+    /// The final step's reward verbatim.
+    Final,
+}
+
+/// A per-step gate: abort the remaining steps when this step's reward falls
+/// below the threshold(s). A scalar gates the `reward` key (1-D convention); a
+/// keyed gate requires each named score to meet its threshold.
+#[derive(Clone, Debug, PartialEq)]
+enum MinReward {
+    Scalar(f64),
+    Keyed(Vec<(String, f64)>),
+}
+
+/// One sequential step of a multi-step task.
+#[derive(Clone, Debug)]
+struct StepConfig {
+    name: String,
+    agent_timeout: Duration,
+    verifier_timeout: Duration,
+    agent_user: Option<String>,
+    verifier_user: Option<String>,
+    min_reward: Option<MinReward>,
+    artifacts: Vec<ArtifactSpec>,
+}
+
+fn parse_reward_strategy(doc: &toml::Value) -> Result<RewardStrategy, CliError> {
+    match toml_doc::top_level_value(doc, "multi_step_reward_strategy").as_deref() {
+        None | Some("mean") => Ok(RewardStrategy::Mean),
+        Some("final") => Ok(RewardStrategy::Final),
+        Some(unknown) => Err(CliError::usage(format!(
+            "multi_step_reward_strategy must be `mean` or `final`, got `{unknown}`"
+        ))),
+    }
+}
+
+/// Parses the `[[steps]]` array-of-tables. Per-step agent/verifier timeouts and
+/// users default to the task-level values.
+fn parse_steps(
+    doc: &toml::Value,
+    agent_timeout: Duration,
+    verifier_timeout: Duration,
+    agent_user: Option<&str>,
+    verifier_user: Option<&str>,
+) -> Result<Vec<StepConfig>, CliError> {
+    let Some(items) = doc.get("steps").and_then(toml::Value::as_array) else {
+        return Ok(Vec::new());
+    };
+
+    let mut steps = Vec::with_capacity(items.len());
+    for item in items {
+        let table = item
+            .as_table()
+            .ok_or_else(|| CliError::usage("[[steps]] entries must be tables"))?;
+        let name = table
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| CliError::usage("each [[steps]] entry requires a `name`"))?
+            .to_owned();
+
+        let step_agent_timeout = step_phase_timeout(item, "agent", &name, agent_timeout)?;
+        let step_verifier_timeout = step_phase_timeout(item, "verifier", &name, verifier_timeout)?;
+        let step_agent_user =
+            step_phase_string(item, "agent", "user").or_else(|| agent_user.map(str::to_owned));
+        let step_verifier_user = step_phase_string(item, "verifier", "user")
+            .or_else(|| verifier_user.map(str::to_owned));
+        let min_reward = parse_min_reward(table.get("min_reward"), &name)?;
+        let artifacts = table
+            .get("artifacts")
+            .and_then(toml::Value::as_array)
+            .map(|items| items.iter().filter_map(parse_artifact_spec).collect())
+            .unwrap_or_default();
+
+        steps.push(StepConfig {
+            name,
+            agent_timeout: step_agent_timeout,
+            verifier_timeout: step_verifier_timeout,
+            agent_user: step_agent_user,
+            verifier_user: step_verifier_user,
+            min_reward,
+            artifacts,
+        });
+    }
+
+    Ok(steps)
+}
+
+/// Reads `[steps.<phase>].timeout_sec` for a step, defaulting to the task-level
+/// timeout when unset.
+fn step_phase_timeout(
+    step: &toml::Value,
+    phase: &str,
+    step_name: &str,
+    default: Duration,
+) -> Result<Duration, CliError> {
+    let Some(value) = step.get(phase).and_then(|phase| phase.get("timeout_sec")) else {
+        return Ok(default);
+    };
+
+    let seconds = value
+        .as_float()
+        .or_else(|| value.as_integer().map(|seconds| seconds as f64))
+        .ok_or_else(|| {
+            CliError::usage(format!(
+                "[steps.{phase}].timeout_sec for step `{step_name}` must be a number"
+            ))
+        })?;
+
+    if seconds <= 0.0 {
+        return Err(CliError::usage(format!(
+            "[steps.{phase}].timeout_sec for step `{step_name}` must be greater than zero"
+        )));
+    }
+
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+fn step_phase_string(step: &toml::Value, phase: &str, key: &str) -> Option<String> {
+    let value = step.get(phase)?.get(key)?;
+    match value {
+        toml::Value::String(value) => Some(value.clone()),
+        toml::Value::Integer(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn parse_min_reward(
+    value: Option<&toml::Value>,
+    step_name: &str,
+) -> Result<Option<MinReward>, CliError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    match value {
+        toml::Value::Float(threshold) => Ok(Some(MinReward::Scalar(*threshold))),
+        toml::Value::Integer(threshold) => Ok(Some(MinReward::Scalar(*threshold as f64))),
+        toml::Value::Table(table) => {
+            let mut thresholds = Vec::with_capacity(table.len());
+            for (key, threshold) in table {
+                let threshold = threshold
+                    .as_float()
+                    .or_else(|| threshold.as_integer().map(|value| value as f64))
+                    .ok_or_else(|| {
+                        CliError::usage(format!(
+                            "min_reward.{key} for step `{step_name}` must be a number"
+                        ))
+                    })?;
+                thresholds.push((key.clone(), threshold));
+            }
+            Ok(Some(MinReward::Keyed(thresholds)))
+        }
+        _ => Err(CliError::usage(format!(
+            "min_reward for step `{step_name}` must be a number or a table"
         ))),
     }
 }
@@ -1470,6 +1953,10 @@ struct StartTrialContainer<'a> {
     network: DockerNetwork,
     platform: Option<&'a str>,
     resources: &'a DockerResources,
+    /// When true, mount the task's `tests/` directory read-only at `/tests`
+    /// (single-step behavior). Multi-step tasks set this false and populate a
+    /// writable `/tests` in-container instead.
+    bind_tests: bool,
 }
 
 fn start_trial_container(start: StartTrialContainer<'_>, task_label: &str) -> Result<(), CliError> {
@@ -1551,22 +2038,31 @@ fn docker_start_command(start: &StartTrialContainer<'_>) -> Command {
         command.args(["--platform", platform]);
     }
 
+    command.arg("--mount").arg(format!(
+        "type=bind,source={},target=/logs",
+        start.logs_root.display()
+    ));
+
+    // The `/tests` and `/solution` read-only binds describe the single-step task
+    // layout. A multi-step task has no top-level `tests/` (it is populated
+    // writable in-container) or `solution/` (each step has its own under
+    // `steps/<name>/solution`), and the always-present `/seaport/task` mount
+    // already exposes those per-step paths, so both binds are skipped.
+    if start.bind_tests {
+        command
+            .arg("--mount")
+            .arg(format!(
+                "type=bind,source={},target=/tests,readonly",
+                start.task_path.join("tests").display()
+            ))
+            .arg("--mount")
+            .arg(format!(
+                "type=bind,source={},target=/solution,readonly",
+                start.task_path.join("solution").display()
+            ));
+    }
+
     command
-        .arg("--mount")
-        .arg(format!(
-            "type=bind,source={},target=/logs",
-            start.logs_root.display()
-        ))
-        .arg("--mount")
-        .arg(format!(
-            "type=bind,source={},target=/tests,readonly",
-            start.task_path.join("tests").display()
-        ))
-        .arg("--mount")
-        .arg(format!(
-            "type=bind,source={},target=/solution,readonly",
-            start.task_path.join("solution").display()
-        ))
         .arg("--mount")
         .arg(format!(
             "type=bind,source={},target=/seaport/task,readonly",
@@ -3097,6 +3593,7 @@ mod tests {
             network: DockerNetwork::None,
             platform: Some("linux/amd64"),
             resources: &DockerResources::default(),
+            bind_tests: true,
         });
         let args = command_args(command);
 
@@ -3169,6 +3666,7 @@ mod tests {
             network: DockerNetwork::None,
             platform: Some("linux/amd64"),
             resources: &resources,
+            bind_tests: true,
         });
         let args = command_args(command);
 
@@ -3195,6 +3693,7 @@ mod tests {
             network: DockerNetwork::None,
             platform: Some("linux/amd64"),
             resources: &resources,
+            bind_tests: true,
         });
         let args = command_args(command);
 
@@ -3284,6 +3783,8 @@ mod tests {
             verifier_user: None,
             verifier_environment: None,
             artifacts: Vec::new(),
+            steps: Vec::new(),
+            reward_strategy: RewardStrategy::Mean,
         };
         let command = docker_build_command(
             "seaport-task-test",
@@ -3382,6 +3883,8 @@ mod tests {
             verifier_user: None,
             verifier_environment: None,
             artifacts: Vec::new(),
+            steps: Vec::new(),
+            reward_strategy: RewardStrategy::Mean,
         };
         let task = temp_task_dir("docker-cache-key");
         let environment_dir = task.join("environment");
@@ -3933,6 +4436,7 @@ artifacts = [
             network: DockerNetwork::None,
             platform: Some("linux/amd64"),
             resources: &resources,
+            bind_tests: true,
         });
         let args = command_args(command);
 
@@ -3956,6 +4460,122 @@ artifacts = [
         assert!(args
             .iter()
             .any(|arg| arg == "type=bind,source=/tmp/logs,target=/logs"));
+    }
+
+    #[test]
+    fn parse_steps_reads_multi_step_task() {
+        let task = temp_task_dir("multi-step-parse");
+        fs::create_dir_all(&task).expect("task dir");
+        fs::write(
+            task.join("task.toml"),
+            r#"
+multi_step_reward_strategy = "final"
+
+[[steps]]
+name = "implement"
+artifacts = [{ source = "/app", destination = "app", exclude = [".git"] }]
+
+[steps.agent]
+timeout_sec = 900
+
+[[steps]]
+name = "verify"
+min_reward = { core_pass_rate = 0.0 }
+"#,
+        )
+        .expect("task toml");
+
+        let environment = task_environment(&task).expect("environment");
+
+        assert_eq!(environment.reward_strategy, RewardStrategy::Final);
+        assert_eq!(environment.steps.len(), 2);
+
+        let implement = &environment.steps[0];
+        assert_eq!(implement.name, "implement");
+        assert_eq!(implement.agent_timeout, Duration::from_secs(900));
+        assert!(implement.min_reward.is_none());
+        assert_eq!(
+            implement.artifacts,
+            vec![ArtifactSpec {
+                source: "/app".to_owned(),
+                destination: Some("app".to_owned()),
+                exclude: vec![".git".to_owned()],
+            }]
+        );
+
+        let verify = &environment.steps[1];
+        assert_eq!(verify.name, "verify");
+        assert_eq!(
+            verify.min_reward,
+            Some(MinReward::Keyed(vec![("core_pass_rate".to_owned(), 0.0)]))
+        );
+
+        let _ = fs::remove_dir_all(task);
+    }
+
+    #[test]
+    fn parse_reward_strategy_defaults_to_mean_and_rejects_unknown() {
+        let mean = toml_doc::parse("").expect("doc");
+        assert_eq!(
+            parse_reward_strategy(&mean).expect("strategy"),
+            RewardStrategy::Mean
+        );
+
+        let final_doc = toml_doc::parse("multi_step_reward_strategy = \"final\"").expect("doc");
+        assert_eq!(
+            parse_reward_strategy(&final_doc).expect("strategy"),
+            RewardStrategy::Final
+        );
+
+        let unknown = toml_doc::parse("multi_step_reward_strategy = \"median\"").expect("doc");
+        assert!(parse_reward_strategy(&unknown).is_err());
+    }
+
+    #[test]
+    fn min_reward_met_scalar_and_keyed() {
+        let rewards = crate::Rewards::single(0.5);
+        assert!(min_reward_met(&MinReward::Scalar(0.5), &rewards));
+        assert!(min_reward_met(&MinReward::Scalar(0.25), &rewards));
+        assert!(!min_reward_met(&MinReward::Scalar(0.75), &rewards));
+
+        let keyed = crate::Rewards::from_entries(vec![
+            ("core_pass_rate".to_owned(), 1.0),
+            ("strict_pass_rate".to_owned(), 0.5),
+        ]);
+        assert!(min_reward_met(
+            &MinReward::Keyed(vec![
+                ("core_pass_rate".to_owned(), 1.0),
+                ("strict_pass_rate".to_owned(), 0.5),
+            ]),
+            &keyed
+        ));
+        // A missing key counts as NEG_INFINITY and fails the gate.
+        assert!(!min_reward_met(
+            &MinReward::Keyed(vec![("missing".to_owned(), 0.0)]),
+            &keyed
+        ));
+    }
+
+    #[test]
+    fn aggregate_rewards_mean_and_final() {
+        let steps = vec![
+            crate::Rewards::from_entries(vec![("a".to_owned(), 1.0)]),
+            crate::Rewards::from_entries(vec![("a".to_owned(), 0.0)]),
+        ];
+
+        let mean = aggregate_rewards(RewardStrategy::Mean, &steps);
+        assert_eq!(mean.get("a"), Some(0.5));
+
+        let last = aggregate_rewards(RewardStrategy::Final, &steps);
+        assert_eq!(last.get("a"), Some(0.0));
+
+        // Empty step rewards are excluded from the mean.
+        let with_empty = vec![
+            crate::Rewards::from_entries(vec![("a".to_owned(), 1.0)]),
+            crate::Rewards::default(),
+        ];
+        let mean = aggregate_rewards(RewardStrategy::Mean, &with_empty);
+        assert_eq!(mean.get("a"), Some(1.0));
     }
 
     fn command_args(command: Command) -> Vec<String> {

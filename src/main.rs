@@ -28,8 +28,8 @@ use registry::{
 use sandbox::{
     cleanup_orphaned_trial_containers, ensure_sandbox_backend_available,
     prepare_container_writable_dir, run_task_scripts, set_log_mode as set_sandbox_log_mode,
-    AgentStep, ExternalAgent, PhaseEnvs, SandboxAgent, SandboxBackend, ScriptOutputs,
-    TaskScriptRequest, TimeoutMultipliers,
+    AgentStep, ExternalAgent, PhaseEnvs, SandboxAgent, SandboxBackend, ScriptOutputs, StepOutcome,
+    TaskScriptRequest, TimeoutMultipliers, TrialScripts,
 };
 use target::{RunTarget, TaskRef, TaskSelection};
 
@@ -580,6 +580,9 @@ fn run_trial(
     let verifier_dir = trial_dir.join("verifier");
     // Created lazily by the backend only when artifacts are actually collected.
     let artifacts_dir = trial_dir.join("artifacts");
+    // Per-step output root for multi-step tasks; per-step artifacts are written
+    // here by the sandbox, per-step agent/verifier logs by `record_multi_step_trial`.
+    let steps_dir = trial_dir.join("steps");
     let workspace = env::temp_dir().join(format!(
         "seaport-{}-{run_id}-{}",
         agent.as_str(options),
@@ -601,40 +604,64 @@ fn run_trial(
 
     let sandbox_agent = agent.sandbox_agent(options)?;
     let phase_envs = options.phase_envs();
-    let execution: Result<(ScriptOutputs, Rewards), CliError> = (|| {
-        let outputs = run_task_scripts(TaskScriptRequest {
-            task_label: task_name,
-            task_path: &task.path,
-            run_id: &trial_run_id,
-            app_dir: &app_dir,
-            logs_dir: &logs_dir,
-            artifacts_dir: &artifacts_dir,
-            agent: &sandbox_agent,
-            envs: &phase_envs,
-            backend: options.backend,
-            strict_resources: options.strict_resources,
-            concurrency,
-            timeout_multipliers: options.timeout_multipliers(),
-        })?;
-        let reward = read_reward(&logs_dir)?;
-
-        Ok((outputs, reward))
-    })();
+    let execution: Result<TrialScripts, CliError> = run_task_scripts(TaskScriptRequest {
+        task_label: task_name,
+        task_path: &task.path,
+        run_id: &trial_run_id,
+        app_dir: &app_dir,
+        logs_dir: &logs_dir,
+        artifacts_dir: &artifacts_dir,
+        steps_dir: &steps_dir,
+        agent: &sandbox_agent,
+        envs: &phase_envs,
+        backend: options.backend,
+        strict_resources: options.strict_resources,
+        concurrency,
+        timeout_multipliers: options.timeout_multipliers(),
+    });
 
     // `elapsed` is assigned by the caller as trials finish, so each trial's
     // reported duration is its share of the execution timeline.
     let outcome = match execution {
-        Ok((outputs, reward)) => record_completed_trial(TrialRecord {
-            task_name,
-            attempt,
-            agent,
-            options,
-            trial_dir: &trial_dir,
-            agent_dir: &agent_dir,
-            verifier_dir: &verifier_dir,
-            outputs,
-            reward,
-        })?,
+        Ok(TrialScripts::Single(outputs)) => match read_reward(&logs_dir) {
+            Ok(reward) => record_completed_trial(TrialRecord {
+                task_name,
+                attempt,
+                agent,
+                options,
+                trial_dir: &trial_dir,
+                agent_dir: &agent_dir,
+                verifier_dir: &verifier_dir,
+                outputs,
+                reward,
+            })?,
+            // A verifier that wrote no reward is a per-trial failure (recorded,
+            // dataset continues), not a fatal run error.
+            Err(error) if error.is_task_failure() => record_failed_trial(TrialFailure {
+                task_name,
+                attempt,
+                agent,
+                options,
+                trial_dir: &trial_dir,
+                agent_dir: &agent_dir,
+                verifier_dir: &verifier_dir,
+                logs_dir: &logs_dir,
+                message: error.to_string(),
+            })?,
+            Err(error) => return Err(error),
+        },
+        Ok(TrialScripts::MultiStep { steps, reward }) => {
+            record_multi_step_trial(MultiStepRecord {
+                task_name,
+                attempt,
+                agent,
+                options,
+                trial_dir: &trial_dir,
+                steps_dir: &steps_dir,
+                steps,
+                reward,
+            })?
+        }
         Err(error) if error.is_task_failure() => record_failed_trial(TrialFailure {
             task_name,
             attempt,
@@ -1062,7 +1089,29 @@ fn validate_task_path(task_path: &Path) -> Result<(), CliError> {
         )));
     }
 
-    for relative in ["instruction.md", "task.toml", "tests/test.sh"] {
+    let task_toml = task_path.join("task.toml");
+    if !task_toml.is_file() {
+        return Err(CliError::usage(format!(
+            "task is missing required file: {}",
+            task_toml.display()
+        )));
+    }
+
+    // A multi-step task ([[steps]]) carries its instruction and verifier per
+    // step under steps/<name>/, so the top-level instruction.md / tests/test.sh
+    // are not required; a single-step task requires both.
+    if task_is_multi_step(&task_toml) {
+        let steps_dir = task_path.join("steps");
+        if !steps_dir.is_dir() {
+            return Err(CliError::usage(format!(
+                "multi-step task is missing its steps directory: {}",
+                steps_dir.display()
+            )));
+        }
+        return Ok(());
+    }
+
+    for relative in ["instruction.md", "tests/test.sh"] {
         let path = task_path.join(relative);
 
         if !path.is_file() {
@@ -1074,6 +1123,21 @@ fn validate_task_path(task_path: &Path) -> Result<(), CliError> {
     }
 
     Ok(())
+}
+
+/// Whether `task.toml` declares `[[steps]]` (a multi-step task). Best-effort: a
+/// malformed manifest is treated as single-step here; `task_environment`
+/// surfaces the parse error authoritatively.
+fn task_is_multi_step(task_toml: &Path) -> bool {
+    fs::read_to_string(task_toml)
+        .ok()
+        .and_then(|contents| toml_doc::parse(&contents).ok())
+        .and_then(|doc| {
+            doc.get("steps")
+                .and_then(|steps| steps.as_array())
+                .map(|steps| !steps.is_empty())
+        })
+        .unwrap_or(false)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1242,6 +1306,129 @@ fn record_completed_trial(record: TrialRecord<'_>) -> Result<TrialOutcome, CliEr
     })
 }
 
+struct MultiStepRecord<'a> {
+    task_name: &'a str,
+    attempt: usize,
+    agent: AgentKind,
+    options: &'a RunOptions,
+    trial_dir: &'a Path,
+    steps_dir: &'a Path,
+    steps: Vec<StepOutcome>,
+    reward: Rewards,
+}
+
+/// Records a completed multi-step trial: per-step agent/verifier logs under
+/// `<trial_dir>/steps/<name>/`, plus a trial-level `config.json`/`result.json`
+/// whose `result.json` carries the aggregated reward and a `steps` array.
+fn record_multi_step_trial(record: MultiStepRecord<'_>) -> Result<TrialOutcome, CliError> {
+    let rewards = record.reward;
+    let reward = rewards.display();
+    let passed = rewards.passed();
+
+    for step in &record.steps {
+        let step_dir = record.steps_dir.join(&step.name);
+        let step_agent_dir = step_dir.join("agent");
+        let step_verifier_dir = step_dir.join("verifier");
+        fs::create_dir_all(&step_agent_dir)?;
+        fs::create_dir_all(&step_verifier_dir)?;
+
+        fs::write(
+            step_agent_dir.join("trajectory.json"),
+            trajectory_json(&step.agent),
+        )?;
+        fs::write(
+            step_verifier_dir.join("test-stdout.txt"),
+            &step.verifier.stdout,
+        )?;
+        fs::write(
+            step_verifier_dir.join("test-stderr.txt"),
+            &step.verifier.stderr,
+        )?;
+        fs::write(step_verifier_dir.join("reward.txt"), step.rewards.display())?;
+        fs::write(
+            step_verifier_dir.join("reward.json"),
+            step.rewards.to_json(),
+        )?;
+    }
+
+    fs::write(
+        record.trial_dir.join("config.json"),
+        trial_config_json(
+            record.task_name,
+            record.attempt,
+            record.agent,
+            record.options,
+        ),
+    )?;
+    fs::write(
+        record.trial_dir.join("result.json"),
+        multi_step_result_json(passed, &reward, &rewards, &record.steps),
+    )?;
+
+    // The trial's surfaced tail comes from the last step's verifier, the step
+    // that decided the final/last reward.
+    let (stdout_tail, stderr_tail) = record
+        .steps
+        .last()
+        .map(|step| {
+            (
+                tail_lines_bytes(&step.verifier.stdout, FAILURE_TAIL_LINES),
+                tail_lines_bytes(&step.verifier.stderr, FAILURE_TAIL_LINES),
+            )
+        })
+        .unwrap_or_default();
+
+    let error = if passed {
+        None
+    } else {
+        Some(format!("multi-step reward {reward}"))
+    };
+
+    Ok(TrialOutcome {
+        task_name: record.task_name.to_owned(),
+        attempt: record.attempt,
+        reward,
+        rewards,
+        passed,
+        error,
+        stdout_tail,
+        stderr_tail,
+        trial_dir: record.trial_dir.to_path_buf(),
+        elapsed: Duration::ZERO,
+    })
+}
+
+/// Renders a multi-step trial's `result.json`: the aggregated pass/reward/rewards
+/// plus a per-step breakdown.
+fn multi_step_result_json(
+    passed: bool,
+    reward: &str,
+    rewards: &Rewards,
+    steps: &[StepOutcome],
+) -> String {
+    let steps_json = steps
+        .iter()
+        .map(|step| {
+            format!(
+                "{{\"name\":\"{}\",\"passed\":{},\"reward\":\"{}\",\"rewards\":{}}}",
+                json_escape(&step.name),
+                step.rewards.passed(),
+                json_escape(&step.rewards.display()),
+                step.rewards.to_json()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "{{\n  \"passed\": {},\n  \"reward\": \"{}\",\n  \"rewards\": {},\n  \"steps\": [{}]\n}}\n",
+        passed,
+        json_escape(reward),
+        rewards.to_json(),
+        steps_json
+    )
+}
+
 fn record_failed_trial(failure: TrialFailure<'_>) -> Result<TrialOutcome, CliError> {
     let rewards = Rewards::single(0.0);
     let reward = rewards.display();
@@ -1327,19 +1514,30 @@ fn write_trial_metadata(metadata: TrialMetadata<'_>) -> Result<(), CliError> {
 /// example `{core_pass_rate, strict_pass_rate}`) are preserved whole for output
 /// fidelity and per-key gating.
 #[derive(Clone, Debug, Default, PartialEq)]
-struct Rewards {
+pub(crate) struct Rewards {
     entries: Vec<(String, f64)>,
 }
 
 impl Rewards {
     /// The 1-D reward: a single `reward` score.
-    fn single(value: f64) -> Self {
+    pub(crate) fn single(value: f64) -> Self {
         Self {
             entries: vec![("reward".to_owned(), value)],
         }
     }
 
-    fn get(&self, key: &str) -> Option<f64> {
+    /// Builds a reward map from explicit `(key, value)` entries, used by
+    /// multi-step aggregation.
+    pub(crate) fn from_entries(entries: Vec<(String, f64)>) -> Self {
+        Self { entries }
+    }
+
+    /// The named scores in stable order, used by multi-step aggregation.
+    pub(crate) fn entries(&self) -> &[(String, f64)] {
+        &self.entries
+    }
+
+    pub(crate) fn get(&self, key: &str) -> Option<f64> {
         self.entries
             .iter()
             .find(|(name, _)| name == key)
@@ -1349,7 +1547,7 @@ impl Rewards {
     /// The scalar reward used for display and cross-trial aggregation: the
     /// `reward` key when present (the 1-D convention), otherwise the mean of all
     /// named scores.
-    fn primary(&self) -> f64 {
+    pub(crate) fn primary(&self) -> f64 {
         if let Some(value) = self.get("reward") {
             return value;
         }
@@ -1363,7 +1561,7 @@ impl Rewards {
 
     /// A reward passes only at full credit: the `reward` key equals 1.0, or, for
     /// a multi-key reward with no `reward` key, every named score equals 1.0.
-    fn passed(&self) -> bool {
+    pub(crate) fn passed(&self) -> bool {
         if let Some(value) = self.get("reward") {
             return reward_is_full(value);
         }
@@ -1372,12 +1570,12 @@ impl Rewards {
     }
 
     /// The reward rendered for display/storage (the primary scalar).
-    fn display(&self) -> String {
+    pub(crate) fn display(&self) -> String {
         format_reward(self.primary())
     }
 
     /// The full reward map as a JSON object, for trial result output.
-    fn to_json(&self) -> String {
+    pub(crate) fn to_json(&self) -> String {
         let body = self
             .entries
             .iter()
@@ -1389,7 +1587,7 @@ impl Rewards {
     }
 }
 
-fn read_reward(logs_dir: &Path) -> Result<Rewards, CliError> {
+pub(crate) fn read_reward(logs_dir: &Path) -> Result<Rewards, CliError> {
     let json_path = logs_dir.join("reward.json");
     let text_path = logs_dir.join("reward.txt");
 
