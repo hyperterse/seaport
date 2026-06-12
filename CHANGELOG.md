@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.4.0](https://github.com/hyperterse/seaport/compare/v0.3.0...v0.4.0) (2026-06-12)
+
+### Features
+
+* add timeout multiplier flags for slow hosts ([7be54a0](https://github.com/hyperterse/seaport/commit/7be54a08c54faac1258540866c6bc260a9a3f24d))
+* agent setup hook and host-credential passthrough ([374b68f](https://github.com/hyperterse/seaport/commit/374b68f18bf1facb6453ba57d9eec6119fc9db7e))
+* collect task-declared artifacts from the trial container ([5cfa485](https://github.com/hyperterse/seaport/commit/5cfa48585267a4191860728d1cd35a2b8e123462))
+* curated clean-room verifier, per-step separate verifier and setup.sh ([df75edb](https://github.com/hyperterse/seaport/commit/df75edbf667dceaf78d599ec0cf434729cb42ddf))
+* emit harbor-compatible per-key reward stats in the job result ([286fd81](https://github.com/hyperterse/seaport/commit/286fd81ce338a4e53dad545f10df444aedc95012))
+* environment and per-step healthcheck ([d5fd189](https://github.com/hyperterse/seaport/commit/d5fd189c629d78217e35aa5f8681311879841ed0))
+* honor task-configured agent/verifier user ([46c5aa2](https://github.com/hyperterse/seaport/commit/46c5aa2153f74642fc4253772e4cfccd7589ad5f))
+* make --strict-resources mirror harbor cpu/memory limits ([76a08c7](https://github.com/hyperterse/seaport/commit/76a08c7be7cee6cead8287b6010877290da99963))
+* model verifier rewards as a named map ([6e508a6](https://github.com/hyperterse/seaport/commit/6e508a63f8acdcf22ad43920db09874c61dbb737))
+* run multi-step tasks ([86277f3](https://github.com/hyperterse/seaport/commit/86277f366c59c4c8a6fb922aefdb8482ca71589c))
+* run the verifier in a separate environment when declared ([f8519ed](https://github.com/hyperterse/seaport/commit/f8519ed92590f0422ac05d794b685f458674d8d4))
+* support reward.json and fractional rewards ([bdc9ad6](https://github.com/hyperterse/seaport/commit/bdc9ad62b0fd1b0814f388392ae211e4e6f13f61))
+* whole-trial retries with a non-retryable default set ([cadba66](https://github.com/hyperterse/seaport/commit/cadba6637e2701870fde99eef765004ba8ad2110))
+
+### Bug Fixes
+
+* give image pulls at least 30 minutes ([19ca62e](https://github.com/hyperterse/seaport/commit/19ca62ec0641cf2ef51d6cd1e340f4fc83c02141))
+* honor image WORKDIR and mount task solution at /solution ([36e3659](https://github.com/hyperterse/seaport/commit/36e3659dff5c46cf31162cc4d7f94e3f440247a6))
+* let the verifier reward decide the trial, not the script exit code ([1a9a105](https://github.com/hyperterse/seaport/commit/1a9a10513b35bf2a665a1633d9875eb06943d175))
+* request explicit platform for prebuilt foreign-arch images ([a9837b9](https://github.com/hyperterse/seaport/commit/a9837b95ffba41ac1a8bae352b48fd3c75884a4b))
+* sweep orphaned trial containers and quiet cleanup races ([f01f4f7](https://github.com/hyperterse/seaport/commit/f01f4f78a818ce82d0fc5f44564ca64d1fd575cc))
+
+### Performance Improvements
+
+* give each trial a fair share of host CPUs; lower default concurrency ([d9c40d4](https://github.com/hyperterse/seaport/commit/d9c40d4d3031361e144dbee6a849581656d4cc3d))
+* move /app to docker volumes, boost task resource caps, drop preflight barrier ([079c957](https://github.com/hyperterse/seaport/commit/079c957c79495dc4d6bf8cc83e0c7a4b201c4833))
+
 ## [0.3.0](https://github.com/hyperterse/seaport/compare/v0.2.0...v0.3.0) (2026-06-09)
 
 ### Features
