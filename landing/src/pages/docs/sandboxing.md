@@ -10,15 +10,16 @@ You are handing real code to an AI and letting it run. Seaport keeps every run s
 
 ## The Docker backend
 
-Docker is the default. Pick it explicitly with `--backend docker`. The agent and verifier phases each run in their own container, with:
+Docker is the default. Pick it explicitly with `--backend docker`. Each trial gets one long-lived container: the agent phase runs in it, then the verifier phase runs in the same container via `docker exec`. State the agent creates — installed packages, files in `$HOME`, files anywhere on disk — persists into the verifier, matching how Harbor runs. The setup is:
 
-- A read-only task mount, so the task inputs cannot be modified.
-- Writable `/app`, `/logs`, `/tmp`, and `/run`, and nothing else.
-- Dropped Linux capabilities and `no-new-privileges`.
-- A read-only container root filesystem.
-- A non-root user.
-- Limits on CPU, memory, swap, PID count, and wall-clock time.
+- One container per trial, isolated from your machine and from other trials, swept away when the run ends.
+- A writable root filesystem with the image's default Linux capabilities, so tasks can install packages and write anywhere they need at runtime. This is a deliberate trade-off for task-environment fidelity and Harbor parity, not a hardened jail.
+- Read-only mounts for task inputs: `/seaport/task` (the whole task directory), `/tests` (the task's tests; writable for multi-step tasks), and `/solution` when the task ships a `solution/` directory. `/logs` is writable; artifacts conventionally land in `/logs/artifacts`.
+- A `--pids-limit` of 4096, plus limits on CPU and memory.
 - A per-phase network mode taken from `task.toml`.
+- Per-phase and per-trial wall-clock timeouts.
+
+Scripts run as the image's default user; an internal prep step runs as root.
 
 ## Network policy
 

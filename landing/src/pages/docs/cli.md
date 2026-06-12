@@ -51,17 +51,26 @@ Provide exactly one task source: `-p`, `-d`, `-t`, or `--task-git-url`. Combinin
 | Flag | Description |
 | --- | --- |
 | `-a`, `--agent <agent>` | Agent adapter name. Defaults to `oracle`. |
+| `--agent-setup <shell>` | Command run in the container before the agent, e.g. to install the agent CLI. Runs as the agent user. |
 | `--agent-command <shell>` | Shell command for a custom or not-yet-native agent. |
 | `-m`, `--model <model>` | Model identifier. Required for model-backed agents. |
-| `--ae`, `--agent-env KEY=VALUE` | Environment variable for the agent phase. Repeatable. |
-| `--ve`, `--verifier-env KEY=VALUE` | Environment variable for the verifier phase. Repeatable. |
+| `--ae`, `--agent-env KEY=VALUE` | Environment variable for the agent phase. Accepts `KEY=VALUE`, or a bare `KEY` to forward that variable from the host environment (keeps secrets off the command line). Repeatable. |
+| `--ve`, `--verifier-env KEY=VALUE` | Environment variable for the verifier phase. Accepts `KEY=VALUE`, or a bare `KEY` to forward that variable from the host environment (keeps secrets off the command line). Repeatable. |
 
 ### Execution
 
 | Flag | Description |
 | --- | --- |
-| `-n <count>` | How many trials run at once. Defaults to the machine's parallelism, clamped to 1 through 16. |
+| `-n <count>` | How many trials run at once. Defaults to about the host's CPU count divided by 3, clamped to 2 through 16. |
 | `-k`, `--n-attempts <count>` | Number of attempts per task. Defaults to `1`. |
+| `--strict-resources` | Enforce the task's declared `cpus`/`memory_mb` exactly, instead of the default fair CPU share. |
+| `--max-retries <count>` | Retry an errored trial up to this many times. Defaults to `0`. Timeouts and reward-file errors are never retried. |
+| `--retry-include <substr>` | Only retry errors whose message contains this string. Repeatable. |
+| `--retry-exclude <substr>` | Never retry errors whose message contains this string. Repeatable. Defaults to a set covering timeout and reward-file errors. |
+| `--timeout-multiplier <factor>` | Scale all phase timeouts for slow or emulated hosts. Defaults to `1.0`. |
+| `--agent-timeout-multiplier <factor>` | Scale only the agent timeout. Falls back to `--timeout-multiplier`. |
+| `--verifier-timeout-multiplier <factor>` | Scale only the verifier timeout. Falls back to `--timeout-multiplier`. |
+| `--build-timeout-multiplier <factor>` | Scale only the build and image-pull timeout. Falls back to `--timeout-multiplier`. |
 | `--backend <name>` | Execution backend: `docker` or `unsafe-local`. Defaults to `docker`. |
 | `--env <name>` | Alias for `--backend`. |
 | `--jobs-dir <path>` | Directory where job results are written. Defaults to `jobs/`. |

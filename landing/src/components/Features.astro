@@ -11,13 +11,13 @@ const features = [
     icon: "bolt",
   },
   {
-    title: "Prepares, then runs",
-    body: "A preflight phase resolves, pulls, and builds every environment up front and in parallel, so the run itself is spent on agents, not setup.",
+    title: "Lean by design",
+    body: "Each trial builds or pulls its environment on demand, with identical images deduplicated and cached, then runs in one lean container. No heavy harness between you and the agent.",
     icon: "layers",
   },
   {
     title: "Sandboxed by default",
-    body: "Agents run fully isolated, so untrusted code can't touch your machine. Test boldly without worrying about what your agent might do.",
+    body: "Each trial runs in its own throwaway Docker container, isolated from your machine and from other trials. Test boldly without cleaning up after every run.",
     icon: "shield",
   },
   {

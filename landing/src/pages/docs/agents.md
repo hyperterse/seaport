@@ -54,6 +54,16 @@ seaport run -p path/to/task -a codex -m openai/gpt-5 \
 Model-backed agents require a model with `-m/--model`, unless you supply your own `--agent-command`. In Docker mode the agent CLI must already exist inside the task image.
 :::
 
+## Provisioning an agent CLI
+
+When the agent CLI is not baked into the task image, install it at trial time with `--agent-setup`. It is a command run inside the trial container before the agent runs, as the agent user, with the agent environment. It runs once per trial, and a non-zero exit fails the trial:
+
+```sh
+seaport run -p path/to/task -a claude-code -m sonnet \
+  --agent-setup 'npm install -g @anthropic-ai/claude-code' \
+  --ae ANTHROPIC_API_KEY
+```
+
 ## Passing secrets and config
 
 Use `--ae/--agent-env` for the agent phase and `--ve/--verifier-env` for the verifier phase. Each takes a `KEY=VALUE` pair and can be repeated:
@@ -65,6 +75,13 @@ seaport run -p path/to/task \
   -m provider/model \
   --ae API_KEY="$API_KEY" \
   --ve EXPECTED_OUTPUT=ok
+```
+
+Either flag also accepts a bare `KEY`, which forwards that variable from the host environment. This keeps secrets like `ANTHROPIC_API_KEY` off the command line:
+
+```sh
+ANTHROPIC_API_KEY=sk-... seaport run -p path/to/task -a claude-code -m sonnet \
+  --ae ANTHROPIC_API_KEY
 ```
 
 :::tip

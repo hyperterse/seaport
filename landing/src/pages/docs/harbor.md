@@ -23,8 +23,12 @@ Everything you use to specify and run a task carries over.
 | --- | --- |
 | Task layout | The `instruction.md`, `task.toml`, `environment/`, `solution/`, and `tests/` folder structure |
 | `task.toml` | The `[task]`, `[agent]`, `[verifier]`, and `[environment]` sections |
+| Multi-step tasks | `[[steps]]` with the `steps/<name>/` layout and `min_reward` gating |
 | Filesystem contract | The `/app` workspace and `/logs/verifier` output directory, with the task mounted read-only |
-| Verifier contract | A reward of `1` or `0` written to `reward.txt` |
+| Verifier contract | A reward written to `reward.txt` or `reward.json`, scalar or named scores |
+| Artifacts | The `artifacts` array and a clean-room separate verifier seeded from declared artifacts |
+| Healthcheck | `[environment.healthcheck]` with Docker `HEALTHCHECK` semantics |
+| Stats | A Harbor-compatible `stats` block with per-eval `metrics`, `pass_at_k`, `reward_stats`, and `exception_stats` |
 | CLI verbs | `run -p <path>`, `run -d <dataset>`, and agent selection with `-a` |
 | Datasets | The same dataset names, resolved locally or from a registry |
 | Agents | The `oracle` and `nop` baselines, plus external commands |
@@ -38,10 +42,12 @@ A task is the same directory it always was. See [Writing tasks](/docs/tasks) for
 Inside the sandbox, a task sees the same filesystem it expects:
 
 - `/app` is the writable workspace.
-- `/logs/verifier` is where the verifier writes its output and `reward.txt`.
+- `/logs/verifier` is where the verifier writes its output and reward (`reward.txt` or `reward.json`).
 - The task directory itself is mounted read-only.
 
 Scripts that hardcode those paths work as written.
+
+Like Harbor, Seaport runs the whole trial in **one long-lived container**: the agent phase and then the verifier phase run inside it via `docker exec`. State the agent leaves behind — installed packages, `$HOME`, files anywhere on the filesystem, not just `/app` — persists into the verifier. A separate clean-room verifier is opt-in via a [verifier environment](/docs/tasks#separate-verifier), matching Harbor's behavior of seeding a fresh verifier container from declared artifacts.
 
 :::tip
 If a script reads `APP_DIR` and `LOGS_DIR` instead of hardcoding `/app` and `/logs/verifier`, it runs identically under both tools and under Seaport's local backend. See the [environment variables](/docs/tasks#environment-variables).
@@ -58,14 +64,25 @@ Same inputs and outputs, different engine underneath.
 | Area | Harbor | Seaport |
 | --- | --- | --- |
 | Distribution | Installed as a Python package | A single self-contained Rust binary, installed in one line |
-| Setup | Resolves and builds environments during the run | A preflight phase builds, pulls, and caches every environment up front |
-| Sandbox | Docker-backed execution | Hardened Docker by default: no network, dropped capabilities, a read-only root filesystem, non-root execution, and CPU, memory, PID, and wall-clock limits |
+| Setup | Resolves and builds environments during the run | Same: each trial builds or pulls its environment on demand, with identical builds deduplicated so the first trial starts immediately |
+| Container | Docker-backed execution | Docker-backed, with a writable root filesystem and default Linux capabilities so tasks can install packages and write anywhere, plus CPU, memory, PID, and wall-clock limits |
+| Retry matching | Retries by exception type | Retries by error-message substring (`--retry-include` / `--retry-exclude`) |
+| Concurrency | One trial per core | About `host_cpus / 3`, clamped to 2–16, override with `-n` |
+| Networking | Allowlist networking | The local Docker backend has no allowlist; `network_mode` is `no-network` or `public` |
 
-Seaport also adds a few things on top of the shared format:
+Seaport adds a few things on top of the shared format:
 
 - **Deterministic core.** Stable task ordering and run identity, so results stay comparable across runs.
 - **Structured output.** Every job, trial, trajectory, and reward lands as plain JSON. See [Job output](/docs/output).
 - **A local fast path.** The `unsafe-local` backend runs scripts directly for trusted debugging, with no container overhead.
+
+### Retries
+
+Both tools retry trials that fail for infrastructure reasons. `--max-retries <n>` (default `0`) retries an errored trial up to `n` times, discarding the failed attempt. Where Harbor matches on exception type, Seaport matches on the error message: `--retry-exclude <substr>` never retries errors containing the substring (the defaults already cover pointless retries like timeouts and reward-file errors), and `--retry-include <substr>`, when set, retries only matching errors.
+
+### Resource parity
+
+By default Seaport gives each trial a fair share of host CPUs rather than the task's declared `cpus`, since trials are heavy and often emulated. Pass `--strict-resources` to enforce the task's exact `cpus` and `memory_mb`, matching Harbor.
 
 ## Not at parity yet
 

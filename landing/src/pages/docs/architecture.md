@@ -13,12 +13,12 @@ Seaport is a small, deterministic core with a sandboxed execution layer around i
 A single `run` flows through a few clear stages:
 
 1. **Resolve the target.** A local path, a registered dataset or task, or a git source becomes a concrete set of tasks.
-2. **Preflight.** Before any agent runs, Seaport resolves, pulls, and builds every task environment up front, several at a time. Images are cached and reused, and identical images are never pulled twice. A preflight failure is not fatal: that task simply retries during execution.
-3. **Plan the trials.** Each task is expanded into one trial per attempt. Trials are scheduled longest-looking first, so slow tasks start early and the run finishes sooner.
-4. **Execute.** Trials run across a worker pool sized to the machine. Each trial runs the agent phase, then the verifier phase, inside the sandbox, restoring a fresh workspace from a snapshot rather than rebuilding it.
+2. **Plan the trials.** Each task is expanded into one trial per attempt. Trials are scheduled longest-looking first, so slow tasks start early and the run finishes sooner.
+3. **Execute.** Trials run across a worker pool sized to the machine. There is no preflight barrier: each trial pulls or builds its own environment on demand, then runs in one long-lived container. Identical image builds and pulls are deduplicated, so tasks sharing an image only pay for it once, and the first trial starts as soon as its image is ready rather than waiting for the rest.
+4. **Run the phases.** Inside that container, the agent phase runs first, then the verifier phase runs in the same container via `docker exec`. State the agent creates — installed packages, `$HOME`, files anywhere — carries into the verifier.
 5. **Record.** Each trial writes its trajectory, verifier output, and reward. The job then writes an aggregate result.
 
-Splitting preflight from execution is what keeps runs fast: all the slow, cacheable Docker work happens once, in parallel, before the clock that matters starts. See [Performance](/docs/performance) for the details.
+Caching the slow Docker work and reusing it across trials, attempts, and runs is what keeps things fast. See [Performance](/docs/performance) for the details.
 
 ## Determinism
 

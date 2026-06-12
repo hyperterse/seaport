@@ -17,9 +17,11 @@ with Markdown instructions, shell scripts, and a small TOML config.
 - `oracle`, `nop`, and sandboxed external command agents
 - task filtering with include/exclude glob patterns
 - multiple attempts per task with bounded concurrency
+- multi-step tasks, declared artifacts, healthchecks, and clean-room verifiers
+- retries and timeout multipliers for slow or emulated hosts
 - Docker sandbox by default, with explicit `unsafe-local` mode for trusted development
-- phase-specific agent and verifier environment variables
-- JSON job, trial, trajectory, verifier, and reward output
+- phase-specific agent and verifier environment variables, with host-env passthrough
+- JSON job, trial, trajectory, verifier, and reward output with harbor-compatible stats
 - CI, release builds, installer script, unit tests, integration tests, and benchmarks
 
 ## Install
@@ -141,8 +143,8 @@ build_timeout_sec = 600.0
 `solution/solve.sh` is used by the `oracle` agent. It is optional for `nop` and
 external agents.
 
-`tests/test.sh` verifies the workspace after the agent phase. It should write
-`1` or `0` to `$LOGS_DIR/reward.txt`:
+`tests/test.sh` verifies the workspace after the agent phase. It writes a reward
+into `$LOGS_DIR` as either `reward.json` (preferred) or `reward.txt`:
 
 ```sh
 #!/bin/bash
@@ -157,6 +159,25 @@ else
 fi
 ```
 
+### Reward model
+
+The verifier writes its reward into `$LOGS_DIR` (`/logs/verifier`):
+
+- `reward.txt`: a single number, the 1-D `reward`.
+- `reward.json`: a bare number, or an object of named scores, for example:
+
+  ```json
+  { "core_pass_rate": 1.0, "strict_pass_rate": 1.0, "verbosity": 0.18 }
+  ```
+
+A trial passes at full credit when the `reward` key equals `1.0`, or — for a
+multi-key reward with no `reward` key — when every named score equals `1.0`.
+Fractional rewards are preserved, not collapsed to pass/fail.
+
+A non-zero exit from the agent or verifier script does not by itself fail the
+trial; the reward decides. Fatal failures are a timeout, a verifier that writes
+no reward, or a container that will not start.
+
 During execution, Seaport provides:
 
 - `APP_DIR`: writable application workspace, mounted as `/app` in Docker
@@ -165,6 +186,135 @@ During execution, Seaport provides:
 - `SEAPORT_INSTRUCTION_PATH`: path to `instruction.md`
 - `SEAPORT_AGENT_NAME`: set for external command agents
 - `SEAPORT_MODEL`: set when `-m/--model` is provided
+
+### Multi-step tasks
+
+A task that declares one or more `[[steps]]` entries runs as an ordered
+sequence of named steps inside a single persistent container, so state carries
+across steps. The on-disk layout is:
+
+```text
+multi-step-task/
+|-- task.toml
+|-- tests/                       # shared test files, mounted writable at /tests
+`-- steps/
+    |-- first/
+    |   |-- instruction.md
+    |   |-- solution/
+    |   |   `-- solve.sh         # oracle solution for this step
+    |   |-- tests/
+    |   |   `-- test.sh          # this step's verifier
+    |   `-- workdir/
+    |       `-- setup.sh         # optional, runs before the step's agent
+    `-- second/
+        |-- instruction.md
+        |-- solution/
+        |   `-- solve.sh
+        `-- tests/
+            `-- test.sh
+```
+
+For each step, in order: the optional `workdir/setup.sh` runs first (a non-zero
+exit aborts the remaining steps), then the optional per-step healthcheck, then
+the agent (the oracle runs that step's `solve.sh`), then per-step artifact
+collection into `steps/<name>/artifacts/`, then the step verifier. The step's
+reward is read and a `min_reward` gate aborts the remaining steps if unmet.
+
+```toml
+schema_version = "1.0"
+
+[task]
+name = "acme/multi-step"
+description = "Build, then test."
+
+multi_step_reward_strategy = "mean"   # "mean" (default) or "final"
+
+[[steps]]
+name = "build"
+min_reward = 1.0                       # gates the `reward` key
+
+[steps.agent]
+timeout_sec = 300.0
+user = "agent"
+
+[steps.verifier]
+timeout_sec = 120.0
+
+[[steps]]
+name = "test"
+min_reward = { core_pass_rate = 1.0, strict_pass_rate = 0.5 }
+```
+
+- `min_reward` is a number (gates the `reward` key) or a table of per-key
+  thresholds; each named score must meet its threshold, and a missing key fails.
+- `multi_step_reward_strategy` (task top level) selects the trial-level reward:
+  `"mean"` (default — per-key mean across steps that produced a reward) or
+  `"final"` (the last step's reward verbatim).
+- Each `[[steps]]` entry takes `name`, optional `[steps.agent]` and
+  `[steps.verifier]` blocks (`timeout_sec`, `user`), optional `min_reward`,
+  optional `artifacts`, and an optional `healthcheck`.
+
+### Artifacts
+
+The `artifacts` array declares paths to copy out of the container after the
+agent runs. It can appear at the task top level and/or per step. Each entry is
+either a source-path string or a table:
+
+```toml
+artifacts = [
+  "/app/build.log",
+  { source = "/app", destination = "app", exclude = ["**/node_modules", "**/.git"] },
+]
+```
+
+`destination` defaults to the source's basename, and `exclude` is a list of glob
+patterns applied to directories via `tar --exclude` inside the container.
+Collected artifacts land in the trial's `artifacts/` directory (per-step:
+`steps/<name>/artifacts/`), and a `manifest.json` records what was collected.
+The conventional `/logs/artifacts` drop directory is always collected when
+non-empty. Tasks that declare no artifacts and leave `/logs/artifacts` empty
+produce no `artifacts/` directory.
+
+### Healthcheck
+
+`[environment.healthcheck]` (and a per-step `healthcheck`) polls a command until
+the environment is ready, with Docker `HEALTHCHECK` semantics:
+
+```toml
+[environment.healthcheck]
+command = "curl -fsS http://localhost:8080/healthz"
+interval_sec = 5         # default 5
+timeout_sec = 30         # default 30
+start_period_sec = 0     # default 0
+start_interval_sec = 5   # default 5
+retries = 3              # default 3
+```
+
+`command` is required. The command is polled until it exits `0`; failures during
+the start period do not count toward retries, and after it consecutive failures
+count, failing the check once `retries` is reached. The environment healthcheck
+runs after the container starts and before the agent; a per-step healthcheck
+runs before each step's agent. Failure fails the trial (per-step: aborts the
+remaining steps).
+
+### Separate verifier
+
+By default the verifier runs in the agent's container, sharing its installed
+packages and filesystem changes. Declaring `[verifier.environment]` (or
+`[verifier].environment_mode = "separate"`) instead runs the verifier in a
+fresh clean-room container with its own image, platform, and resources:
+
+```toml
+[verifier.environment]
+docker_image = "ubuntu:24.04"
+network_mode = "no-network"
+```
+
+The clean-room verifier is seeded with only the task-declared artifacts (plus
+the conventional `/logs/artifacts`), uploaded back at their source paths. It is
+isolated from the agent's installed packages, `$HOME`, and any filesystem
+changes outside those artifacts, so separate-verifier tasks must declare their
+work product (e.g. `/app`) as an artifact.
 
 ## Run Tasks
 
@@ -195,10 +345,57 @@ Run two attempts per task with two workers:
 seaport run -p path/to/dataset -k 2 -n 2
 ```
 
+`-n` sets concurrency. It defaults to roughly `host_cpus / 3`, clamped to the
+range `2..16` — deliberately conservative, since trials are heavy and often run
+emulated containers.
+
 Write results somewhere other than `jobs/`:
 
 ```sh
 seaport run -p path/to/task --jobs-dir /tmp/seaport-jobs
+```
+
+### Retries
+
+Retry trials that error on infrastructure failures (build, pull, agent, or
+verifier setup), discarding the failed attempt:
+
+```sh
+seaport run -p path/to/dataset --max-retries 2
+```
+
+`--max-retries` defaults to `0`. Timeouts and reward-file errors (a verifier
+that did not write a reward, or an unparseable reward) are never retried,
+because retrying is pointless. Narrow what is retried with substring matches on
+the error message:
+
+```sh
+seaport run -p path/to/dataset --max-retries 2 \
+  --retry-include 'connection reset' \
+  --retry-exclude 'out of disk'
+```
+
+`--retry-include` (repeatable) limits retries to errors matching one of the
+substrings; `--retry-exclude` (repeatable) suppresses retries for matching
+errors, and already covers the timeout/reward-file cases by default.
+
+### Timeout multipliers
+
+Scale phase timeouts for slow or emulated hosts:
+
+```sh
+seaport run -p path/to/dataset --timeout-multiplier 2.0
+```
+
+`--timeout-multiplier` (default `1.0`) scales all phase timeouts. Per-phase
+multipliers scale a single phase and fall back to the global multiplier; the
+build multiplier also covers image pulls:
+
+```sh
+seaport run -p path/to/dataset \
+  --agent-timeout-multiplier 3.0 \
+  --verifier-timeout-multiplier 1.5 \
+  --build-timeout-multiplier 2.0
 ```
 
 ## Agents
@@ -225,17 +422,33 @@ seaport run -p path/to/task \
   --agent-command 'my-agent --task "$SEAPORT_INSTRUCTION_PATH" --workdir "$APP_DIR"'
 ```
 
+Provision the container before the agent runs with `--agent-setup`, for example
+to install the agent CLI or its dependencies. The command runs once per trial,
+as the agent user with the agent environment; a non-zero exit fails the trial:
+
+```sh
+seaport run -p path/to/task \
+  -a custom \
+  --agent-setup 'pip install --quiet my-agent-cli' \
+  --agent-command 'my-agent --task "$SEAPORT_INSTRUCTION_PATH"'
+```
+
 Pass phase-specific environment variables with `--ae/--agent-env` and
-`--ve/--verifier-env`:
+`--ve/--verifier-env`. Each accepts `KEY=VALUE`, or a bare `KEY` that forwards
+that variable from the host environment, so secrets need not appear on the
+command line:
 
 ```sh
 seaport run -p path/to/task \
   -a custom \
   --agent-command 'my-agent --model "$SEAPORT_MODEL"' \
   -m provider/model \
+  --ae ANTHROPIC_API_KEY \
   --ae API_KEY="$API_KEY" \
   --ve EXPECTED_OUTPUT=ok
 ```
+
+Both flags are repeatable.
 
 Seaport also includes default external command templates for `codex` and
 `claude-code`. In Docker mode, those CLIs must be available inside the task image:
@@ -313,10 +526,13 @@ Docker execution uses:
   is still present for the verifier
 - a writable container filesystem with default Linux capabilities, so tasks
   can install packages at runtime
-- read-only task mounts at `/seaport/task` and `/tests`
-- CPU, memory, swap, PID, and wall-clock limits (task limits are boosted to
-  use idle host resources by default; pass `--strict-resources` to enforce
-  the task's own `cpus`/`memory_mb` exactly)
+- a read-only task mount at `/seaport/task`, the test directory at `/tests`
+  (read-only for single-step, a writable copy for multi-step), an optional
+  read-only `/solution` (when the task ships one), and a writable `/logs`
+- CPU, memory, swap, PID, and wall-clock limits; by default each trial gets a
+  fair share of host CPUs (`host_cpus / concurrency`, capped) rather than the
+  task's declared `cpus`, while memory stays at the task's `memory_mb`. Pass
+  `--strict-resources` to enforce the task's exact `cpus`/`memory_mb`
 - phase-specific network mode from `task.toml`, switched between phases when
   they differ
 
@@ -359,9 +575,25 @@ jobs/seaport-<run-id>/
 `-- acme-task-attempt-2/
 ```
 
-`result.json` contains aggregate pass/fail counts, average reward, and per-task
-attempt records. `trajectory.json` records the command, exit status, stdout, and
-stderr for the agent phase.
+The job `result.json` contains aggregate pass/fail counts, average reward, and
+per-task attempt records (`passed`, `reward`, `tasks_total`, `tasks_passed`,
+`tasks_failed`, `tasks[]`). `trajectory.json` records the command, exit status,
+stdout, and stderr for the agent phase.
+
+Each per-trial `result.json` includes `passed`, `reward` (a scalar display
+string), `rewards` (the full named-score map as a JSON object), and `error`
+when the trial failed. A multi-step trial also has a `steps` array (`name`,
+`passed`, `reward`, `rewards` per step) and per-step directories
+`steps/<name>/{agent,verifier,artifacts}`.
+
+The job `result.json` also carries a harbor-compatible `stats` block with
+trial counts (`n_completed_trials`, `n_errored_trials`, `n_running_trials`,
+`n_pending_trials`, `n_cancelled_trials`, `n_retries`) and an `evals` map keyed
+by `"<agent>[__<model>]__<dataset>"`. Each eval reports `n_trials`, `n_errors`,
+`metrics` (per-key reward means), `pass_at_k` (an unbiased estimate, only for
+single-key binary `0`/`1` rewards), `reward_stats` (per reward key, each
+observed value mapped to the trials that produced it), and `exception_stats`
+(errored trials grouped by the first line of their error).
 
 ## Benchmarks
 

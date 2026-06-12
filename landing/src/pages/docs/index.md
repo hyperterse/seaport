@@ -26,9 +26,9 @@ Harbor got the hard part right. Specifying an eval as a plain folder, with an in
 
 Seaport keeps the format and rebuilds the runner. It adopts Harbor's task layout wholesale, so your existing tasks and datasets run unchanged, then makes the parts you wait on fast:
 
-- **Setup happens once, in parallel.** A preflight phase resolves, pulls, and builds every environment up front, so the run itself is spent on agents, not Docker.
-- **Nothing is rebuilt twice.** Environments are cached and reused across trials, attempts, and runs, identical images are pulled once, and workspaces are restored from snapshots rather than rebuilt.
-- **The slow tasks start first.** Trials are scheduled longest-looking first and run across a worker pool sized to your machine, so the run finishes sooner.
+- **Setup is on-demand, never a barrier.** Each trial builds or pulls its environment as it starts, with identical images built once and shared, so the first trial begins on a cold cache instead of waiting behind a setup phase.
+- **Nothing is built twice.** Environments are cached and reused across trials, attempts, and runs, and identical images are built or pulled only once.
+- **One lean container per trial.** The agent and verifier run in a single long-lived container over `docker exec`, with no per-phase container churn, across a worker pool sized to your machine.
 
 Two more things follow from being written in Rust:
 
