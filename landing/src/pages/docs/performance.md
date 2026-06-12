@@ -46,11 +46,11 @@ Three datasets of increasing size, run through both tools on the same machine. T
 | `factory-ai/legacy-bench` | 10 | **39.0s** | 60.8s | **1.6×** | **28 MB** | 232 MB | **8.2×** | 0.9s → 11.1s |
 | `terminal-bench/terminal-bench-2` | 89 | **102 min** | 150 min | **1.5×** | **28 MB** | 234 MB | **8.3×** | 24s → 79s |
 
-Wall-clock is the mean across iterations (oracle ×8, legacy-bench ×3, terminal-bench-2 ×1), each after a discarded warm-up except terminal-bench-2, which is a single cold pass of all 89 tasks. Measured on macOS arm64, Docker via OrbStack, Harbor 0.13.1, against Seaport's Docker backend.
+Wall-clock is the mean across iterations (oracle ×8, legacy-bench ×3, terminal-bench-2 ×1), each after a discarded warm-up except terminal-bench-2, which is a single cold pass of all 89 tasks. Across every dataset Seaport installs as a single **2 MB** binary versus Harbor's **647 MB** Python environment (**411× smaller**). Measured on macOS arm64, Docker via OrbStack, Harbor 0.13.1, against Seaport's Docker backend.
 
-### Harness overhead, in detail
+### `basic-oracle` — pure harness overhead (1 task)
 
-The oracle task is a single trivial task, so it isolates pure harness overhead — startup, orchestration, memory, CPU — with no real image or agent work to share. This is where a static Rust binary pulls furthest ahead of a Python CLI.
+A single trivial task, so there is no real image or agent work to share. This isolates what each harness itself spends, and is where a static Rust binary pulls furthest ahead of a Python CLI.
 
 | Factor | Seaport | Harbor | Seaport advantage |
 | --- | ---: | ---: | ---: |
@@ -59,7 +59,32 @@ The oracle task is a single trivial task, so it isolates pure harness overhead �
 | CPU time consumed | **0.07s** | 2.07s | **29× less** |
 | Instructions retired | **0.05 B** | 12.7 B | **262× fewer** |
 | Cold first run | **4.7s** | 13.5s | **2.8× faster** |
-| Install footprint | **2 MB** | 647 MB | **411× smaller** |
+| Clean exits | 8 / 8 | 8 / 8 | — |
+
+### `factory-ai/legacy-bench` (10 tasks)
+
+Ten real tasks, several emulated under amd64. The build, agent, and verifier work now runs in the shared Docker daemon for both tools, so the wall-clock gap shrinks while memory stays flat.
+
+| Factor | Seaport | Harbor | Seaport advantage |
+| --- | ---: | ---: | ---: |
+| Wall-clock (mean) | **39.0s** | 60.8s | **1.6× faster** |
+| Peak memory (RSS) | **28 MB** | 232 MB | **8.2× lighter** |
+| CPU time consumed | **0.9s** | 11.1s | **12× less** |
+| Instructions retired | **0.46 B** | 15.7 B | **34× fewer** |
+| Cold first run | **37.3s** | 64.2s | **1.7× faster** |
+| Clean exits | 3 / 3 | 3 / 3 | — |
+
+### `terminal-bench/terminal-bench-2` (89 tasks)
+
+A single cold pass of all 89 tasks — the heaviest real workload, dominated by image builds and task execution. The wall-clock gap is at its narrowest here, yet Seaport's footprint is unchanged.
+
+| Factor | Seaport | Harbor | Seaport advantage |
+| --- | ---: | ---: | ---: |
+| Wall-clock (cold pass) | **102 min** | 150 min | **1.5× faster** |
+| Peak memory (RSS) | **28 MB** | 234 MB | **8.3× lighter** |
+| CPU time consumed | **24s** | 79s | **3.3× less** |
+| Instructions retired | **23.6 B** | 47.3 B | **2.0× fewer** |
+| Clean exits | 0 / 1 | 1 / 1 | see caveats |
 
 ### Caveats
 
