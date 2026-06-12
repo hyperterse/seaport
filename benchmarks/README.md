@@ -27,9 +27,53 @@ The scripts support both environments:
 - Harbor-style container paths: `/app` and `/logs/verifier`
 - Seaport local benchmark paths: `APP_DIR` and `LOGS_DIR`
 
+## Rich comparison (recommended)
+
+`benchmarks/measure.ts` runs one or more datasets through both tools and reports
+the factors that distinguish a static Rust binary from a Python CLI, not just
+time:
+
+- wall-clock (mean / median / min / max / stddev)
+- CLI-process peak memory (RSS) and peak memory footprint
+- CPU time consumed and CPU utilisation
+- instructions retired and cycles elapsed (Apple Silicon perf counters)
+- clean-exit rate, install footprint, and cold first-run cost
+
+```sh
+bun run benchmark -- \
+  -p benchmarks/tasks/basic-oracle@8 \
+  -d factory-ai/legacy-bench@3 \
+  -d terminal-bench/terminal-bench-2@1@0
+```
+
+Each target is `<spec>[@iterations[@warmup]]`: `-p` is a local task/dataset path,
+`-d` is a registered dataset name. The trailing numbers set per-target iteration
+and warm-up counts (`-i` / `--warmup` set the defaults). So `legacy-bench@3` runs
+three measured iterations after one discarded warm-up, and `terminal-bench-2@1@0`
+runs a single cold pass with no warm-up (handy for an 89-task dataset).
+
+Each invocation is wrapped in `/usr/bin/time -l`; warm-up runs are discarded so
+the numbers are steady-state rather than first-run cold builds. The heavy
+container work runs in the shared Docker daemon for both tools, so the rusage of
+each CLI process isolates harness overhead — the part each tool controls. Results
+are written to a dated `benchmarks/results/<date>-datasets.{json,md}`.
+
+A representative run (macOS arm64, Harbor 0.13.1):
+
+| Dataset | Tasks | Seaport wall | Harbor wall | Speedup | Seaport RSS | Harbor RSS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `basic-oracle` (harness overhead) | 1 | 0.40s | 16.67s | 41× | 28 MB | 231 MB |
+| `factory-ai/legacy-bench` | 10 | 39.0s | 60.8s | 1.6× | 28 MB | 232 MB |
+| `terminal-bench/terminal-bench-2` | 89 | 102 min | 150 min | 1.5× | 28 MB | 234 MB |
+
+The wall-clock advantage shrinks as real task work (shared by both tools via the
+Docker daemon) dominates, but Seaport's peak memory stays ~8× lighter at every
+dataset size. Its install footprint is a single 2 MB binary versus Harbor's
+~647 MB Python environment.
+
 ## Run
 
-Build Seaport and run five sandboxed Docker-backend iterations:
+Build Seaport and run five sandboxed Docker-backend iterations (wall-clock only):
 
 ```sh
 python3 benchmarks/run.py --iterations 5
@@ -86,9 +130,10 @@ The runner writes:
 - `benchmarks/results/latest.json`
 - `benchmarks/results/latest.md`
 
-The latest committed local report is:
+The latest committed local reports are:
 
-- `benchmarks/results/2026-06-05-oracle.md`
+- `benchmarks/results/2026-06-12-rich.md` (full memory/CPU/footprint comparison)
+- `benchmarks/results/2026-06-05-oracle.md` (earlier wall-clock-only run)
 
 ## Interpreting Results
 

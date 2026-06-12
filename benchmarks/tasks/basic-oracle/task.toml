@@ -6,7 +6,6 @@ description = "Minimal oracle task used to compare Seaport and Harbor harness ov
 
 [agent]
 timeout_sec = 120.0
-user = "agent"
 
 [verifier]
 timeout_sec = 120.0

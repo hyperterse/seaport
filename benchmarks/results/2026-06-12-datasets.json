@@ -1,0 +1,247 @@
+{
+  "date": "2026-06-12",
+  "env": {
+    "os": "Darwin arm64",
+    "harbor_version": "0.13.1"
+  },
+  "global": {
+    "seaport_install_bytes": 1575424,
+    "harbor_install_bytes": 647270400,
+    "footprint_ratio": 410.8547286317842
+  },
+  "datasets": [
+    {
+      "label": "basic-oracle",
+      "kind": "path",
+      "spec": "/Users/samrith/Work/hyperterse/seaport/benchmarks/tasks/basic-oracle",
+      "iterations": 8,
+      "tools": {
+        "seaport": {
+          "name": "seaport",
+          "command": [
+            "/Users/samrith/Work/hyperterse/seaport/target/release/seaport",
+            "run",
+            "-p",
+            "/Users/samrith/Work/hyperterse/seaport/benchmarks/tasks/basic-oracle",
+            "-a",
+            "oracle",
+            "--backend",
+            "docker",
+            "--jobs-dir",
+            "/var/folders/8p/1c0tr5sn66g63nxcf6r392040000gn/T/seaport-measure-IndOr5/jobs"
+          ],
+          "attempts": 8,
+          "clean_exits": 8,
+          "cold_wall_sec": 4.73,
+          "wall_sec": {
+            "mean": 0.40499999999999997,
+            "median": 0.41000000000000003,
+            "min": 0.36,
+            "max": 0.46,
+            "stddev": 0.0316227766016838
+          },
+          "mean_max_rss_bytes": 27860992,
+          "mean_peak_footprint_bytes": 1419582,
+          "mean_cpu_sec": 0.07125000000000001,
+          "mean_cpu_pct": 17.58274762994443,
+          "mean_instructions": 48457793.625,
+          "binary_bytes": 1575424,
+          "install_bytes": 1575424,
+          "failures": []
+        },
+        "harbor": {
+          "name": "harbor",
+          "command": [
+            "/Users/samrith/.local/bin/harbor",
+            "run",
+            "-p",
+            "/Users/samrith/Work/hyperterse/seaport/benchmarks/tasks/basic-oracle",
+            "-a",
+            "oracle"
+          ],
+          "attempts": 8,
+          "clean_exits": 8,
+          "cold_wall_sec": 13.48,
+          "wall_sec": {
+            "mean": 16.66875,
+            "median": 16.759999999999998,
+            "min": 15.58,
+            "max": 17.69,
+            "stddev": 0.9697192156200974
+          },
+          "mean_max_rss_bytes": 230723584,
+          "mean_peak_footprint_bytes": 207407818,
+          "mean_cpu_sec": 2.07375,
+          "mean_cpu_pct": 12.46521633098662,
+          "mean_instructions": 12702343134.75,
+          "binary_bytes": null,
+          "install_bytes": 647270400,
+          "failures": []
+        }
+      },
+      "comparison": {
+        "wall_speedup": 41.15740740740741,
+        "rss_ratio": 8.281240811526022,
+        "cpu_ratio": 29.105263157894733,
+        "instr_ratio": 262.1320985649808,
+        "cold_ratio": 2.8498942917547567
+      }
+    },
+    {
+      "label": "factory-ai/legacy-bench",
+      "kind": "dataset",
+      "spec": "factory-ai/legacy-bench",
+      "iterations": 3,
+      "tools": {
+        "seaport": {
+          "name": "seaport",
+          "command": [
+            "/Users/samrith/Work/hyperterse/seaport/target/release/seaport",
+            "run",
+            "-d",
+            "factory-ai/legacy-bench",
+            "-a",
+            "oracle",
+            "--backend",
+            "docker",
+            "--jobs-dir",
+            "/var/folders/8p/1c0tr5sn66g63nxcf6r392040000gn/T/seaport-measure-NhidUR/jobs"
+          ],
+          "attempts": 3,
+          "clean_exits": 3,
+          "cold_wall_sec": 37.29,
+          "wall_sec": {
+            "mean": 38.97666666666667,
+            "median": 37.9,
+            "min": 35.97,
+            "max": 43.06,
+            "stddev": 3.6655740796406433
+          },
+          "mean_max_rss_bytes": 28136789.333333332,
+          "mean_peak_footprint_bytes": 3206178.6666666665,
+          "mean_cpu_sec": 0.9233333333333333,
+          "mean_cpu_pct": 2.385850636728509,
+          "mean_instructions": 455982806.6666667,
+          "binary_bytes": 1575424,
+          "install_bytes": 1575424,
+          "failures": []
+        },
+        "harbor": {
+          "name": "harbor",
+          "command": [
+            "/Users/samrith/.local/bin/harbor",
+            "run",
+            "-d",
+            "factory-ai/legacy-bench",
+            "-a",
+            "oracle"
+          ],
+          "attempts": 3,
+          "clean_exits": 3,
+          "cold_wall_sec": 64.23,
+          "wall_sec": {
+            "mean": 60.76666666666667,
+            "median": 60.1,
+            "min": 58.53,
+            "max": 63.67,
+            "stddev": 2.634052644373938
+          },
+          "mean_max_rss_bytes": 232073898.66666666,
+          "mean_peak_footprint_bytes": 208519920,
+          "mean_cpu_sec": 11.123333333333335,
+          "mean_cpu_pct": 18.326433833040596,
+          "mean_instructions": 15680609307,
+          "binary_bytes": null,
+          "install_bytes": 647270400,
+          "failures": []
+        }
+      },
+      "comparison": {
+        "wall_speedup": 1.5590524245274953,
+        "rss_ratio": 8.24805900621118,
+        "cpu_ratio": 12.04693140794224,
+        "instr_ratio": 34.388597722858584,
+        "cold_ratio": 1.7224456958970236
+      }
+    },
+    {
+      "label": "terminal-bench/terminal-bench-2",
+      "kind": "dataset",
+      "spec": "terminal-bench/terminal-bench-2",
+      "iterations": 1,
+      "tools": {
+        "seaport": {
+          "name": "seaport",
+          "command": [
+            "/Users/samrith/Work/hyperterse/seaport/target/release/seaport",
+            "run",
+            "-d",
+            "terminal-bench/terminal-bench-2",
+            "-a",
+            "oracle",
+            "--backend",
+            "docker",
+            "--jobs-dir",
+            "/var/folders/8p/1c0tr5sn66g63nxcf6r392040000gn/T/seaport-measure-G2pOZ8/jobs"
+          ],
+          "attempts": 1,
+          "clean_exits": 0,
+          "cold_wall_sec": null,
+          "wall_sec": {
+            "mean": 6123.77,
+            "median": 6123.77,
+            "min": 6123.77,
+            "max": 6123.77,
+            "stddev": 0
+          },
+          "mean_max_rss_bytes": 28246016,
+          "mean_peak_footprint_bytes": 10289560,
+          "mean_cpu_sec": 24.14,
+          "mean_cpu_pct": 0.39420161109904517,
+          "mean_instructions": 23636092476,
+          "binary_bytes": 1575424,
+          "install_bytes": 1575424,
+          "failures": [
+            "iteration 1 exited 4 seaport: 18/89 tasks failed"
+          ]
+        },
+        "harbor": {
+          "name": "harbor",
+          "command": [
+            "/Users/samrith/.local/bin/harbor",
+            "run",
+            "-d",
+            "terminal-bench/terminal-bench-2",
+            "-a",
+            "oracle"
+          ],
+          "attempts": 1,
+          "clean_exits": 1,
+          "cold_wall_sec": null,
+          "wall_sec": {
+            "mean": 9019.95,
+            "median": 9019.95,
+            "min": 9019.95,
+            "max": 9019.95,
+            "stddev": 0
+          },
+          "mean_max_rss_bytes": 233848832,
+          "mean_peak_footprint_bytes": 212370176,
+          "mean_cpu_sec": 78.78,
+          "mean_cpu_pct": 0.8733973026458017,
+          "mean_instructions": 47285506578,
+          "binary_bytes": null,
+          "install_bytes": 647270400,
+          "failures": []
+        }
+      },
+      "comparison": {
+        "wall_speedup": 1.4729406884974452,
+        "rss_ratio": 8.279002320185615,
+        "cpu_ratio": 3.263463131731566,
+        "instr_ratio": 2.0005636137197182,
+        "cold_ratio": null
+      }
+    }
+  ]
+}

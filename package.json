@@ -4,6 +4,7 @@
   "private": true,
   "packageManager": "bun@1.3.13",
   "scripts": {
+    "benchmark": "bun benchmarks/measure.ts",
     "release:prepare": "release-it --ci",
     "release:dry-run": "release-it --dry-run --ci",
     "release:metadata": "bun .github/scripts/release-metadata.ts"
